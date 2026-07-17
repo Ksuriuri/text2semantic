@@ -136,9 +136,6 @@ def train():
             talker_config["spk_id"] = {
                 args.speaker_name: 3000
             }
-            talker_config["spk_is_dialect"] = {
-                args.speaker_name: False
-            }
             config_dict["talker_config"] = talker_config
 
             with open(output_config_file, 'w', encoding='utf-8') as f:

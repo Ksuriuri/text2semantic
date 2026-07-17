@@ -1828,11 +1828,6 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         self.generate_config = None
 
         self.supported_speakers = self.config.talker_config.spk_id.keys()
-        self.supported_languages = ["auto"]
-        for language_id in self.config.talker_config.codec_language_id.keys():
-            if "dialect" not in language_id:
-                self.supported_languages.append(language_id)
-        
         self.speaker_encoder_sample_rate = self.config.speaker_encoder_config.sample_rate
         self.tokenizer_type = self.config.tokenizer_type
         self.tts_model_size = self.config.tts_model_size
@@ -1848,9 +1843,6 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
     
     def get_supported_speakers(self):
         return self.supported_speakers
-    
-    def get_supported_languages(self):
-        return self.supported_languages
     
     @classmethod
     def from_pretrained(
@@ -2025,7 +2017,6 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         instruct_ids: Optional[list[torch.Tensor]] = None,
         ref_ids: Optional[list[torch.Tensor]] = None,
         voice_clone_prompt: list[dict] = None,
-        languages: list[str] = None,
         speakers: list[str] = None,
         non_streaming_mode = False,
         max_new_tokens: int = 4096,
@@ -2083,7 +2074,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         trailing_text_hiddens = []
         if speakers is None:
             speakers = [None] * len(input_ids)
-        for index, (input_id, language, speaker) in enumerate(zip(input_ids, languages, speakers)):
+        for index, (input_id, speaker) in enumerate(zip(input_ids, speakers)):
             if voice_clone_spk_embeds is None:
                 if speaker == "" or speaker == None: # Instruct create speaker
                     speaker_embed = None
@@ -2105,22 +2096,6 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 else:
                     speaker_embed = None
 
-            assert language is not None
-
-            if language.lower() == "auto":
-                language_id = None
-            else:
-                if language.lower() not in self.config.talker_config.codec_language_id:
-                    raise NotImplementedError(f"Language {language} not implemented")
-                else:
-                    language_id = self.config.talker_config.codec_language_id[language.lower()]
-            
-            if (language.lower() in ["chinese", "auto"] and \
-                   speaker != "" and speaker is not None and \
-                     self.config.talker_config.spk_is_dialect[speaker.lower()] != False):
-                dialect = self.config.talker_config.spk_is_dialect[speaker.lower()]
-                language_id = self.config.talker_config.codec_language_id[dialect]
-            
             tts_bos_embed, tts_eos_embed, tts_pad_embed = self.talker.text_projection(
                 self.talker.get_text_embeddings()(
                     torch.tensor(
@@ -2131,20 +2106,12 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 )
             ).chunk(3, dim=1)  # 3 * [1 1 d]
             
-            # codec: tag and speaker
-            if language_id is None:
-                codec_prefill_list = [[
-                                        self.config.talker_config.codec_nothink_id,
-                                        self.config.talker_config.codec_think_bos_id,
-                                        self.config.talker_config.codec_think_eos_id,
-                                    ]]
-            else:
-                codec_prefill_list = [[
-                                        self.config.talker_config.codec_think_id,
-                                        self.config.talker_config.codec_think_bos_id,
-                                        language_id,
-                                        self.config.talker_config.codec_think_eos_id,
-                                    ]]
+            # Codec control prefix is language-agnostic.
+            codec_prefill_list = [[
+                                    self.config.talker_config.codec_nothink_id,
+                                    self.config.talker_config.codec_think_bos_id,
+                                    self.config.talker_config.codec_think_eos_id,
+                                ]]
 
             codec_input_emebdding_0 = self.talker.get_input_embeddings()(
                                                     torch.tensor(

@@ -391,15 +391,12 @@ class Qwen3TTSTalkerConfig(PretrainedConfig):
         num_code_groups=32,
         text_hidden_size=2048,
         codec_eos_token_id=4198,
-        codec_think_id=4202,
         codec_nothink_id=4203,
         codec_think_bos_id=4204,
         codec_think_eos_id=4205,
         codec_pad_id=4196,
         codec_bos_id=4197,
         spk_id=None,
-        spk_is_dialect=None,
-        codec_language_id=None,
         **kwargs,
     ):
         super().__init__(
@@ -440,15 +437,12 @@ class Qwen3TTSTalkerConfig(PretrainedConfig):
         self.num_code_groups = num_code_groups
         self.text_hidden_size = text_hidden_size
         self.codec_eos_token_id = codec_eos_token_id
-        self.codec_think_id = codec_think_id
-        self.codec_language_id = codec_language_id
         self.codec_nothink_id = codec_nothink_id
         self.codec_think_bos_id = codec_think_bos_id
         self.codec_think_eos_id = codec_think_eos_id
         self.codec_pad_id = codec_pad_id
         self.codec_bos_id = codec_bos_id
         self.spk_id = spk_id
-        self.spk_is_dialect = spk_is_dialect
 
 
 class Qwen3TTSConfig(PretrainedConfig):

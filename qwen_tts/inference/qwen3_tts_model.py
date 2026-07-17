@@ -63,8 +63,7 @@ class Qwen3TTSModel:
 
     Notes:
       - This wrapper expects the underlying model class to be `Qwen3TTSForConditionalGeneration`
-      - Language / speaker validation is done via model methods:
-          model.get_supported_languages(), model.get_supported_speakers()
+      - Speaker validation is done via `model.get_supported_speakers()`.
     """
 
     def __init__(self, model: Qwen3TTSForConditionalGeneration, processor, generate_defaults: Optional[Dict[str, Any]] = None):
@@ -120,15 +119,6 @@ class Qwen3TTSModel:
         generate_defaults = model.generate_config
         return cls(model=model, processor=processor, generate_defaults=generate_defaults)
 
-    def _supported_languages_set(self) -> Optional[set]:
-        langs = getattr(self.model, "get_supported_languages", None)
-        if callable(langs):
-            v = langs()
-            if v is None:
-                return None
-            return set([str(x).lower() for x in v])
-        return None
-
     def _supported_speakers_set(self) -> Optional[set]:
         spks = getattr(self.model, "get_supported_speakers", None)
         if callable(spks):
@@ -137,30 +127,6 @@ class Qwen3TTSModel:
                 return None
             return set([str(x).lower() for x in v])
         return None
-
-    def _validate_languages(self, languages: List[str]) -> None:
-        """
-        Validate that requested languages are supported by the model.
-
-        Args:
-            languages (List[str]): Language names for each sample.
-
-        Raises:
-            ValueError: If any language is not supported.
-        """
-        supported = self._supported_languages_set()
-        if supported is None:
-            return
-
-        bad = []
-        for lang in languages:
-            if lang is None:
-                bad.append(lang)
-                continue
-            if str(lang).lower() not in supported:
-                bad.append(lang)
-        if bad:
-            raise ValueError(f"Unsupported languages: {bad}. Supported: {sorted(supported)}")
 
     def _validate_speakers(self, speakers: List[Optional[str]]) -> None:
         """
@@ -470,7 +436,6 @@ class Qwen3TTSModel:
     def generate_voice_clone(
         self,
         text: Union[str, List[str]],
-        language: Union[str, List[str]] = None,
         ref_audio: Optional[Union[AudioLike, List[AudioLike]]] = None,
         ref_text: Optional[Union[str, List[Optional[str]]]] = None,
         x_vector_only_mode: Union[bool, List[bool]] = False,
@@ -492,15 +457,13 @@ class Qwen3TTSModel:
         - list of the above
 
         Input flexibility:
-          - text/language can be scalar or list.
+          - text can be a scalar or list.
           - prompt can be single or batch.
           - If batch mode (len(text)>1), lengths must match.
 
         Args:
             text:
                 Text(s) to synthesize.
-            language:
-                Language(s) for each sample.
             ref_audio:
                 Reference audio(s) for prompt building. Required if voice_clone_prompt is not provided.
             ref_text:
@@ -554,13 +517,6 @@ class Qwen3TTSModel:
             )
         
         texts = self._ensure_list(text)
-        languages = self._ensure_list(language) if isinstance(language, list) else ([language] * len(texts) if language is not None else ["Auto"] * len(texts))
-        if len(languages) == 1 and len(texts) > 1:
-            languages = languages * len(texts)
-        if len(texts) != len(languages):
-            raise ValueError(f"Batch size mismatch: text={len(texts)}, language={len(languages)}")
-
-        self._validate_languages(languages)
 
         if voice_clone_prompt is None:
             if ref_audio is None:
@@ -604,7 +560,6 @@ class Qwen3TTSModel:
             input_ids=input_ids,
             ref_ids=ref_ids,
             voice_clone_prompt=voice_clone_prompt_dict,
-            languages=languages,
             non_streaming_mode=non_streaming_mode,
             **gen_kwargs,
         )
@@ -638,7 +593,6 @@ class Qwen3TTSModel:
         self,
         text: Union[str, List[str]],
         instruct: Union[str, List[str]],
-        language: Union[str, List[str]] = None,
         non_streaming_mode: bool = True,
         **kwargs,
     ) -> Tuple[List[np.ndarray], int]:
@@ -648,8 +602,6 @@ class Qwen3TTSModel:
         Args:
             text:
                 Text(s) to synthesize.
-            language:
-                Language(s) for each sample.
             instruct:
                 Instruction(s) describing desired voice/style. Empty string is allowed (treated as no instruction).
             non_streaming_mode:
@@ -692,18 +644,13 @@ class Qwen3TTSModel:
             )
         
         texts = self._ensure_list(text)
-        languages = self._ensure_list(language) if isinstance(language, list) else ([language] * len(texts) if language is not None else ["Auto"] * len(texts))
         instructs = self._ensure_list(instruct)
 
-        if len(languages) == 1 and len(texts) > 1:
-            languages = languages * len(texts)
         if len(instructs) == 1 and len(texts) > 1:
             instructs = instructs * len(texts)
 
-        if not (len(texts) == len(languages) == len(instructs)):
-            raise ValueError(f"Batch size mismatch: text={len(texts)}, language={len(languages)}, instruct={len(instructs)}")
-
-        self._validate_languages(languages)
+        if len(texts) != len(instructs):
+            raise ValueError(f"Batch size mismatch: text={len(texts)}, instruct={len(instructs)}")
 
         input_ids = self._tokenize_texts([self._build_assistant_text(t) for t in texts])
 
@@ -719,7 +666,6 @@ class Qwen3TTSModel:
         talker_codes_list, _ = self.model.generate(
             input_ids=input_ids,
             instruct_ids=instruct_ids,
-            languages=languages,
             non_streaming_mode=non_streaming_mode,
             **gen_kwargs,
         )
@@ -733,7 +679,6 @@ class Qwen3TTSModel:
         self,
         text: Union[str, List[str]],
         speaker: Union[str, List[str]],
-        language: Union[str, List[str]] = None,
         instruct: Optional[Union[str, List[str]]] = None,
         non_streaming_mode: bool = True,
         **kwargs,
@@ -744,8 +689,6 @@ class Qwen3TTSModel:
         Args:
             text:
                 Text(s) to synthesize.
-            language:
-                Language(s) for each sample.
             speaker:
                 Speaker name(s). Will be validated against `model.get_supported_speakers()` (case-insensitive).
             instruct:
@@ -783,7 +726,7 @@ class Qwen3TTSModel:
 
         Raises:
             ValueError:
-                If any speaker/language is unsupported or batch sizes mismatch.
+                If any speaker is unsupported or batch sizes mismatch.
         """
         if self.model.tts_model_type != "custom_voice":
             raise ValueError(
@@ -794,25 +737,21 @@ class Qwen3TTSModel:
             )
 
         texts = self._ensure_list(text)
-        languages = self._ensure_list(language) if isinstance(language, list) else ([language] * len(texts) if language is not None else ["Auto"] * len(texts))
         speakers = self._ensure_list(speaker)
         if self.model.tts_model_size in "0b6": # for 0b6 model, instruct is not supported
             instruct = None
         instructs = self._ensure_list(instruct) if isinstance(instruct, list) else ([instruct] * len(texts) if instruct is not None else [""] * len(texts))
 
-        if len(languages) == 1 and len(texts) > 1:
-            languages = languages * len(texts)
         if len(speakers) == 1 and len(texts) > 1:
             speakers = speakers * len(texts)
         if len(instructs) == 1 and len(texts) > 1:
             instructs = instructs * len(texts)
 
-        if not (len(texts) == len(languages) == len(speakers) == len(instructs)):
+        if not (len(texts) == len(speakers) == len(instructs)):
             raise ValueError(
-                f"Batch size mismatch: text={len(texts)}, language={len(languages)}, speaker={len(speakers)}, instruct={len(instructs)}"
+                f"Batch size mismatch: text={len(texts)}, speaker={len(speakers)}, instruct={len(instructs)}"
             )
 
-        self._validate_languages(languages)
         self._validate_speakers(speakers)
 
         input_ids = self._tokenize_texts([self._build_assistant_text(t) for t in texts])
@@ -829,7 +768,6 @@ class Qwen3TTSModel:
         talker_codes_list, _ = self.model.generate(
             input_ids=input_ids,
             instruct_ids=instruct_ids,
-            languages=languages,
             speakers=speakers,
             non_streaming_mode=non_streaming_mode,
             **gen_kwargs,
@@ -853,25 +791,6 @@ class Qwen3TTSModel:
                 - None if the model does not provide supported speakers.
         """
         supported = self._supported_speakers_set()
-        if supported is None:
-            return None
-        return sorted(supported)
-
-
-    def get_supported_languages(self) -> Optional[List[str]]:
-        """
-        List supported language names for the current model.
-
-        This is a convenience wrapper around `model.get_supported_languages()`.
-        If the underlying model does not expose language constraints (returns None),
-        this method also returns None.
-
-        Returns:
-            Optional[List[str]]:
-                - A sorted list of supported language names (lowercased), if available.
-                - None if the model does not provide supported languages.
-        """
-        supported = self._supported_languages_set()
         if supported is None:
             return None
         return sorted(supported)
