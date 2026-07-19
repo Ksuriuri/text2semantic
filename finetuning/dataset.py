@@ -89,7 +89,7 @@ class TTSDataset(Dataset):
 
     
     def _build_assistant_text(self, text: str) -> str:
-        return f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+        return f"<|im_start|>assistant\n{text}"
     
     def _ensure_list(self, x: MaybeList) -> List[Any]:
         return x if isinstance(x, list) else [x]
@@ -137,7 +137,7 @@ class TTSDataset(Dataset):
         ref_mel = self.extract_mels(audio=wav, sr=sr)
 
         return {
-            "text_ids": text_ids[:,:-5],    # 1 , t
+            "text_ids": text_ids,            # 1, t
             "audio_codes":audio_codes,      # t, 16
             "ref_mel":ref_mel
         }

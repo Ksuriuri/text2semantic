@@ -1,6 +1,6 @@
-## Fine Tuning Qwen3-TTS-12Hz-1.7B/0.6B-Base
+## Fine-tuning Qwen3.5-2B for Qwen3-TTS 12Hz
 
-The Qwen3-TTS-12Hz-1.7B/0.6B-Base model series currently supports single-speaker fine-tuning. Install this training-only project from the repository root:
+The talker uses the Qwen3.5-2B text backbone. Codec embeddings, codec heads, the code predictor, and the speaker encoder are initialized from Qwen3-TTS-12Hz-1.7B-Base. The training script currently supports single-speaker fine-tuning. Install this training-only project from the repository root:
 
 ```bash
 uv sync
@@ -47,7 +47,8 @@ Run SFT using the prepared JSONL:
 
 ```bash
 uv run accelerate launch finetuning/sft_12hz.py \
-  --init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --base_model_path Qwen/Qwen3.5-2B-Base \
+  --tts_init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
   --output_model_path output \
   --train_jsonl train_with_codes.jsonl \
   --batch_size 32 \
@@ -93,7 +94,8 @@ set -e
 
 DEVICE="cuda:0"
 TOKENIZER_MODEL_PATH="Qwen/Qwen3-TTS-Tokenizer-12Hz"
-INIT_MODEL_PATH="Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+BASE_MODEL_PATH="Qwen/Qwen3.5-2B-Base"
+TTS_INIT_MODEL_PATH="Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 
 RAW_JSONL="train_raw.jsonl"
 TRAIN_JSONL="train_with_codes.jsonl"
@@ -111,7 +113,8 @@ uv run python finetuning/prepare_data.py \
   --output_jsonl ${TRAIN_JSONL}
 
 uv run accelerate launch finetuning/sft_12hz.py \
-  --init_model_path ${INIT_MODEL_PATH} \
+  --base_model_path ${BASE_MODEL_PATH} \
+  --tts_init_model_path ${TTS_INIT_MODEL_PATH} \
   --output_model_path ${OUTPUT_DIR} \
   --train_jsonl ${TRAIN_JSONL} \
   --batch_size ${BATCH_SIZE} \

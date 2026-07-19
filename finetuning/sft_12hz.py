@@ -16,23 +16,57 @@
 import argparse
 import json
 import os
-import shutil
 
 import torch
 from accelerate import Accelerator
 from dataset import TTSDataset
+from qwen_tts.core.models.processing_qwen3_tts import Qwen3TTSProcessor
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
-from safetensors.torch import save_file
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from transformers import AutoConfig
+from transformers import AutoTokenizer
 
 target_speaker_embedding = None
+
+QWEN3_5_MODEL_ID = "Qwen/Qwen3.5-2B-Base"
+QWEN3_TTS_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+
+QWEN3_5_TTS_SPECIAL_TOKENS = {
+    "im_start_token_id": "<|im_start|>",
+    "im_end_token_id": "<|im_end|>",
+    "tts_pad_token_id": "<tts_pad>",
+    "tts_bos_token_id": "<tts_text_bos>",
+    "tts_eos_token_id": "<tts_text_eod>",
+}
+
+
+def configure_qwen3_5_text_tokens(config, tokenizer):
+    for config_name, token in QWEN3_5_TTS_SPECIAL_TOKENS.items():
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        if token_id is None or token_id < 0:
+            raise ValueError(f"Qwen3.5 tokenizer does not define required token {token!r}.")
+        setattr(config, config_name, token_id)
+
+
+def save_checkpoint_assets(model, processor, output_dir):
+    processor.save_pretrained(output_dir)
+
+    speech_tokenizer = model.speech_tokenizer
+    speech_tokenizer_dir = os.path.join(output_dir, "speech_tokenizer")
+    speech_tokenizer.model.save_pretrained(speech_tokenizer_dir, safe_serialization=True)
+    speech_tokenizer.feature_extractor.save_pretrained(speech_tokenizer_dir)
+
+    generation_config_path = os.path.join(output_dir, "generation_config.json")
+    with open(generation_config_path, "w", encoding="utf-8") as f:
+        json.dump(model.generate_config, f, indent=2, ensure_ascii=False)
+
+
 def train():
     global target_speaker_embedding
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--init_model_path", type=str, default="Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+    parser.add_argument("--base_model_path", type=str, default=QWEN3_5_MODEL_ID)
+    parser.add_argument("--tts_init_model_path", type=str, default=QWEN3_TTS_MODEL_ID)
     parser.add_argument("--output_model_path", type=str, default="output")
     parser.add_argument("--train_jsonl", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=2)
@@ -43,18 +77,37 @@ def train():
 
     accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard")
 
-    MODEL_PATH = args.init_model_path
-
     qwen3tts = Qwen3TTSModel.from_pretrained(
-        MODEL_PATH,
-        torch_dtype=torch.bfloat16,
+        args.tts_init_model_path,
+        dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
     )
-    config = AutoConfig.from_pretrained(MODEL_PATH)
+
+    try:
+        from transformers import Qwen3_5ForCausalLM
+    except ImportError as exc:
+        raise ImportError(
+            "Qwen3.5 requires transformers>=5.3.0. Run `uv sync` before training."
+        ) from exc
+
+    qwen3_5 = Qwen3_5ForCausalLM.from_pretrained(
+        args.base_model_path,
+        dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+    )
+    qwen3tts.model.talker.set_qwen3_5_backbone(qwen3_5.model)
+    del qwen3_5
+
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model_path)
+    processor = Qwen3TTSProcessor(tokenizer=tokenizer)
+    qwen3tts.processor = processor
+
+    config = qwen3tts.model.config
+    configure_qwen3_5_text_tokens(config, tokenizer)
 
     train_data = open(args.train_jsonl).readlines()
     train_data = [json.loads(line) for line in train_data]
-    dataset = TTSDataset(train_data, qwen3tts.processor, config)
+    dataset = TTSDataset(train_data, processor, config)
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
 
     optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
@@ -86,7 +139,9 @@ def train():
                 input_text_ids = input_ids[:, :, 0]
                 input_codec_ids = input_ids[:, :, 1]
 
-                input_text_embedding = model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
+                input_text_embedding = model.talker.text_projection(
+                    model.talker.get_text_embeddings()(input_text_ids)
+                ) * text_embedding_mask
                 input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
                 input_codec_embedding[:, 6, :] = speaker_embedding
 
@@ -101,7 +156,8 @@ def train():
                     inputs_embeds=input_embeddings[:, :-1, :],
                     attention_mask=attention_mask[:, :-1],
                     labels=codec_0_labels[:, 1:],
-                    output_hidden_states=True
+                    output_hidden_states=True,
+                    use_cache=False,
                 )
 
                 hidden_states = outputs.hidden_states[0][-1]
@@ -123,25 +179,14 @@ def train():
             if step % 10 == 0:
                 accelerator.print(f"Epoch {epoch} | Step {step} | Loss: {loss.item():.4f}")
 
+        accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch}")
-            shutil.copytree(MODEL_PATH, output_dir, dirs_exist_ok=True)
-
-            input_config_file = os.path.join(MODEL_PATH, "config.json")
-            output_config_file = os.path.join(output_dir, "config.json")
-            with open(input_config_file, 'r', encoding='utf-8') as f:
-                config_dict = json.load(f)
-            config_dict["tts_model_type"] = "custom_voice"
-            talker_config = config_dict.get("talker_config", {})
-            talker_config["spk_id"] = {
+            unwrapped_model = accelerator.unwrap_model(model)
+            unwrapped_model.config.tts_model_type = "custom_voice"
+            unwrapped_model.config.talker_config.spk_id = {
                 args.speaker_name: 3000
             }
-            config_dict["talker_config"] = talker_config
-
-            with open(output_config_file, 'w', encoding='utf-8') as f:
-                json.dump(config_dict, f, indent=2, ensure_ascii=False)
-
-            unwrapped_model = accelerator.unwrap_model(model)
             state_dict = {k: v.detach().to("cpu") for k, v in unwrapped_model.state_dict().items()}
 
             drop_prefix = "speaker_encoder"
@@ -151,8 +196,12 @@ def train():
 
             weight = state_dict['talker.model.codec_embedding.weight']
             state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
-            save_path = os.path.join(output_dir, "model.safetensors")
-            save_file(state_dict, save_path)
+            unwrapped_model.save_pretrained(
+                output_dir,
+                state_dict=state_dict,
+                safe_serialization=True,
+            )
+            save_checkpoint_assets(unwrapped_model, processor, output_dir)
 
 if __name__ == "__main__":
     train()

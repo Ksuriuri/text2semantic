@@ -19,7 +19,7 @@ dependencies = [
     "soundfile",
     "tensorboard",
     "torch",
-    "transformers==4.57.3",
+    "transformers==5.8.1",
 ]
 
 [tool.setuptools.packages.find]

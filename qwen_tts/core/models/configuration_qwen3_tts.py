@@ -397,6 +397,8 @@ class Qwen3TTSTalkerConfig(PretrainedConfig):
         codec_pad_id=4196,
         codec_bos_id=4197,
         spk_id=None,
+        backbone_model_type=None,
+        backbone_config=None,
         **kwargs,
     ):
         super().__init__(
@@ -443,6 +445,8 @@ class Qwen3TTSTalkerConfig(PretrainedConfig):
         self.codec_pad_id = codec_pad_id
         self.codec_bos_id = codec_bos_id
         self.spk_id = spk_id
+        self.backbone_model_type = backbone_model_type
+        self.backbone_config = backbone_config
 
 
 class Qwen3TTSConfig(PretrainedConfig):

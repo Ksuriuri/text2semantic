@@ -523,6 +523,17 @@ class Qwen3TTSTalkerTextPreTrainedModel(PreTrainedModel):
             module.weight.data.fill_(1.0)
 
 
+def compute_default_rope_parameters(config, device=None):
+    head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+    partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+    dim = int(head_dim * partial_rotary_factor)
+    base = config.rope_theta
+    inv_freq = 1.0 / (
+        base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
+    )
+    return inv_freq, 1.0
+
+
 class Qwen3TTSTalkerRotaryEmbedding(nn.Module):
     def __init__(self, config: Qwen3TTSTalkerConfig, device=None):
         super().__init__()
@@ -535,7 +546,11 @@ class Qwen3TTSTalkerRotaryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        self.rope_init_fn = (
+            compute_default_rope_parameters
+            if self.rope_type == "default"
+            else ROPE_INIT_FUNCTIONS[self.rope_type]
+        )
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -570,7 +585,11 @@ class Qwen3TTSRotaryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        self.rope_init_fn = (
+            compute_default_rope_parameters
+            if self.rope_type == "default"
+            else ROPE_INIT_FUNCTIONS[self.rope_type]
+        )
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -1432,14 +1451,31 @@ class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.layers = nn.ModuleList(
-            [Qwen3TTSTalkerDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
-        self.norm = Qwen3TTSRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen3TTSTalkerRotaryEmbedding(config)
-        self.gradient_checkpointing = False
         self.codec_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.text_embedding = nn.Embedding(config.text_vocab_size, config.text_hidden_size)
+        self.backbone_model_type = getattr(config, "backbone_model_type", None)
+
+        if self.backbone_model_type == "qwen3_5":
+            try:
+                from transformers import Qwen3_5TextConfig, Qwen3_5TextModel
+            except ImportError as exc:
+                raise ImportError(
+                    "Qwen3.5 backbones require transformers>=5.3.0. "
+                    "Install the project dependencies with `uv sync`."
+                ) from exc
+
+            if not config.backbone_config:
+                raise ValueError("`backbone_config` is required for a Qwen3.5 talker backbone.")
+            backbone_config = Qwen3_5TextConfig(**config.backbone_config)
+            self.backbone = Qwen3_5TextModel(backbone_config)
+        else:
+            self.layers = nn.ModuleList(
+                [Qwen3TTSTalkerDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            )
+            self.norm = Qwen3TTSRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.rotary_emb = Qwen3TTSTalkerRotaryEmbedding(config)
+            self.text_embedding = nn.Embedding(config.text_vocab_size, config.text_hidden_size)
+
+        self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1448,10 +1484,60 @@ class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
         return self.codec_embedding
     
     def get_text_embeddings(self):
+        if self.backbone_model_type == "qwen3_5":
+            return self.backbone.get_input_embeddings()
         return self.text_embedding
 
     def set_input_embeddings(self, value):
-        self.embed_tokens = value
+        self.codec_embedding = value
+
+    def set_qwen3_5_backbone(self, backbone):
+        """Replace the original talker decoder with a pretrained Qwen3.5 text backbone."""
+        if backbone.config.hidden_size != self.config.hidden_size:
+            raise ValueError(
+                "Qwen3.5 hidden size must match the TTS talker hidden size: "
+                f"{backbone.config.hidden_size} != {self.config.hidden_size}."
+            )
+
+        for module_name in ("layers", "norm", "rotary_emb", "text_embedding"):
+            if hasattr(self, module_name):
+                delattr(self, module_name)
+
+        self.backbone = backbone
+        self.backbone_model_type = "qwen3_5"
+        self.config.backbone_model_type = "qwen3_5"
+        self.config.backbone_config = backbone.config.to_dict()
+        self.config.text_vocab_size = backbone.config.vocab_size
+        self.config.text_hidden_size = backbone.config.hidden_size
+
+        for name in (
+            "hidden_size",
+            "intermediate_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "head_dim",
+            "max_position_embeddings",
+            "rms_norm_eps",
+            "rope_theta",
+            "layer_types",
+            "full_attention_interval",
+            "linear_conv_kernel_dim",
+            "linear_key_head_dim",
+            "linear_value_head_dim",
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+            "mamba_ssm_dtype",
+            "rope_parameters",
+            "attn_output_gate",
+            "attention_bias",
+            "attention_dropout",
+            "hidden_act",
+            "initializer_range",
+            "use_cache",
+        ):
+            if hasattr(backbone.config, name):
+                setattr(self.config, name, getattr(backbone.config, name))
 
     @can_return_tuple
     def forward(
@@ -1467,6 +1553,22 @@ class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> BaseModelOutputWithPast:
+        if self.backbone_model_type == "qwen3_5":
+            if position_ids is not None and position_ids.ndim == 3 and position_ids.shape[0] == 3:
+                position_ids = torch.cat((position_ids[:1], position_ids), dim=0)
+            return self.backbone(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                cache_position=cache_position,
+                **flash_attn_kwargs,
+            )
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1572,9 +1674,12 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         super().__init__(config)
         self.model = Qwen3TTSTalkerModel(config)
         self.vocab_size = config.vocab_size
-        self.text_projection = Qwen3TTSTalkerResizeMLP(
-            config.text_hidden_size, config.text_hidden_size, config.hidden_size, config.hidden_act, bias=True
-        )
+        if getattr(config, "backbone_model_type", None) == "qwen3_5":
+            self.text_projection = nn.Identity()
+        else:
+            self.text_projection = Qwen3TTSTalkerResizeMLP(
+                config.text_hidden_size, config.text_hidden_size, config.hidden_size, config.hidden_act, bias=True
+            )
 
         self.codec_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.code_predictor = Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(
@@ -1593,15 +1698,19 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
 
     def get_text_embeddings(self):
         return self.model.get_text_embeddings()
+
+    def set_qwen3_5_backbone(self, backbone):
+        self.model.set_qwen3_5_backbone(backbone)
+        self.text_projection = nn.Identity()
     
     def set_input_embeddings(self, value):
-        self.model.embed_tokens = value
+        self.model.set_input_embeddings(value)
 
     def get_output_embeddings(self):
-        return self.lm_head
+        return self.codec_head
 
     def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
+        self.codec_head = new_embeddings
 
     def set_decoder(self, decoder):
         self.model = decoder
