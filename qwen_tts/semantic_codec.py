@@ -189,23 +189,22 @@ class MaskGCTSemanticTokenizer:
         repcodec_config_path,
         repcodec_checkpoint_path,
         device="cuda:0",
-        dtype=torch.float32,
     ):
         self.device = torch.device(device)
-        self.dtype = dtype
         self.feature_extractor = SeamlessM4TFeatureExtractor.from_pretrained(
             w2v_bert_path
         )
         self.semantic_model = Wav2Vec2BertModel.from_pretrained(
-            w2v_bert_path, torch_dtype=dtype
+            w2v_bert_path, torch_dtype=torch.float32
         ).to(self.device)
         stats = torch.load(stats_path, map_location="cpu", weights_only=True)
-        self.mean = stats["mean"].to(self.device, dtype=dtype)
-        self.std = stats["var"].sqrt().to(self.device, dtype=dtype)
+        self.mean = stats["mean"].to(self.device, dtype=torch.float32)
+        self.std = stats["var"].sqrt().to(self.device, dtype=torch.float32)
 
         with open(repcodec_config_path, encoding="utf-8") as handle:
             config = yaml.safe_load(handle)
         config = config.get("semantic_codec", config)
+        self.codebook_size = int(config.get("codebook_size", 8192))
         self.codec = RepCodec(**config).to(self.device)
         load_model(self.codec, str(repcodec_checkpoint_path), strict=True)
         self.semantic_model.eval()
@@ -221,19 +220,29 @@ class MaskGCTSemanticTokenizer:
             sampling_rate=16000,
             return_tensors="pt",
         )
-        input_features = inputs.input_features.to(self.device, self.dtype)
+        input_features = inputs.input_features.to(self.device, torch.float32)
         attention_mask = inputs.get("attention_mask")
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.device)
-        outputs = self.semantic_model(
-            input_features=input_features,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-        )
-        features = (outputs.hidden_states[17] - self.mean) / self.std
-        codes, _ = self.codec.quantize(features)
+        with torch.amp.autocast(device_type=self.device.type, enabled=False):
+            outputs = self.semantic_model(
+                input_features=input_features,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+            )
+            features = (
+                outputs.hidden_states[17].float() - self.mean
+            ) / self.std
+            codes, _ = self.codec.quantize(features.float())
         codes = codes.squeeze(0).long().cpu()
-        if codes.numel() == 0 or codes.min() < 0 or codes.max() >= 8192:
+        if attention_mask is not None:
+            valid_length = min(int(attention_mask.sum().item()), codes.numel())
+            codes = codes[:valid_length]
+        if (
+            codes.numel() == 0
+            or codes.min() < 0
+            or codes.max() >= self.codebook_size
+        ):
             raise RuntimeError(f"Invalid semantic codes produced for {audio_path}.")
         return codes
 

@@ -17,8 +17,6 @@
 import argparse
 import json
 
-import torch
-
 from qwen_tts.semantic_codec import MaskGCTSemanticTokenizer
 
 def main():
@@ -30,11 +28,6 @@ def main():
     parser.add_argument("--repcodec_checkpoint_path", type=str, required=True)
     parser.add_argument("--input_jsonl", type=str, required=True)
     parser.add_argument("--output_jsonl", type=str, required=True)
-    parser.add_argument(
-        "--dtype",
-        choices=("float32", "bfloat16"),
-        default="float32",
-    )
     args = parser.parse_args()
 
     tokenizer = MaskGCTSemanticTokenizer(
@@ -43,7 +36,6 @@ def main():
         repcodec_config_path=args.repcodec_config_path,
         repcodec_checkpoint_path=args.repcodec_checkpoint_path,
         device=args.device,
-        dtype=torch.float32 if args.dtype == "float32" else torch.bfloat16,
     )
     with (
         open(args.input_jsonl, encoding="utf-8") as source,

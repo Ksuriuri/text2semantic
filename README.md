@@ -30,7 +30,8 @@ uv pip install flash-attn --no-build-isolation
 {"audio":"./data/utt0001.wav","text":"这是一条训练文本。"}
 ```
 
-使用与 IndexTTS2 一致的 W2V-BERT layer 17 + RepCodec 单码本 pipeline：
+使用与 IndexTTS2 一致的 W2V-BERT layer 17 + RepCodec 单码本 pipeline。
+W2V-BERT、归一化和量化固定使用 FP32，并按 feature attention mask 去除尾部 padding：
 
 ```bash
 uv run python finetuning/prepare_data.py \
@@ -47,10 +48,15 @@ uv run python finetuning/prepare_data.py \
 
 ## 全参数训练
 
+先把预处理结果划分为互不重叠的训练集与验证集，并通过环境变量提供 W&B key：
+
 ```bash
-uv run accelerate launch finetuning/sft_12hz.py \
+export WANDB_API_KEY="<your-wandb-api-key>"
+
+uv run accelerate launch finetuning/train.py \
   --base_model_path Qwen/Qwen3.5-2B-Base \
   --train_jsonl train_semantic.jsonl \
+  --eval_jsonl eval_semantic.jsonl \
   --output_model_path output \
   --batch_size 2 \
   --lr 2e-6 \
@@ -59,6 +65,19 @@ uv run accelerate launch finetuning/sft_12hz.py \
 ```
 
 损失只覆盖 semantic codes 和 EOS。文本仅作为 causal prefix，不计算 text LM loss。
+训练指标、验证 loss、token accuracy 和 EOS accuracy 写入
+`haoyuanhuang22-jcxy/text2semantic` W&B project。API key 不应写进脚本或提交到仓库。
+
+每 500 个 optimizer step 和每个 epoch 保存可恢复 checkpoint。断点续训：
+
+```bash
+uv run accelerate launch finetuning/train.py \
+  --base_model_path Qwen/Qwen3.5-2B-Base \
+  --train_jsonl train_semantic.jsonl \
+  --eval_jsonl eval_semantic.jsonl \
+  --output_model_path output \
+  --resume_from_checkpoint output/checkpoint-step-500
+```
 
 ## 推理
 

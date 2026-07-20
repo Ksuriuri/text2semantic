@@ -1,21 +1,27 @@
 import torch
 from torch import nn
-from transformers import Qwen3_5TextConfig
+from transformers import BatchFeature, Qwen3_5TextConfig
 
 from finetuning.dataset import Text2SemanticDataset
 from qwen_tts.core.models import (
     Text2SemanticConfig,
     Text2SemanticForCausalLM,
 )
-from qwen_tts.semantic_codec import RepCodec
+from qwen_tts.semantic_codec import MaskGCTSemanticTokenizer, RepCodec
 
 
 class DummyTokenizer:
     pad_token_id = 0
     eos_token_id = 1
 
-    def apply_chat_template(self, messages, tokenize, add_generation_prompt):
-        assert tokenize and add_generation_prompt
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize,
+        add_generation_prompt,
+        return_dict,
+    ):
+        assert tokenize and add_generation_prompt and return_dict is False
         return [2, len(messages[0]["content"]) + 2]
 
 
@@ -130,4 +136,43 @@ def test_repcodec_indices_are_in_range():
     assert codes.shape == (1, 5)
     assert int(codes.min()) >= 0
     assert int(codes.max()) < 32
+
+
+def test_semantic_tokenizer_forces_fp32_and_trims_padding(monkeypatch):
+    class FeatureExtractor:
+        def __call__(self, audio, sampling_rate, return_tensors):
+            return BatchFeature(
+                {
+                    "input_features": torch.ones(1, 5, 3),
+                    "attention_mask": torch.tensor([[1, 1, 1, 0, 0]]),
+                }
+            )
+
+    class SemanticModel:
+        def __call__(self, input_features, attention_mask, output_hidden_states):
+            assert input_features.dtype == torch.float32
+            hidden_states = [None] * 18
+            hidden_states[17] = torch.ones(1, 5, 4, dtype=torch.float32)
+            return type("Output", (), {"hidden_states": hidden_states})()
+
+    class Codec:
+        def quantize(self, features):
+            assert features.dtype == torch.float32
+            return torch.tensor([[1, 2, 3, 4, 5]]), features
+
+    tokenizer = MaskGCTSemanticTokenizer.__new__(MaskGCTSemanticTokenizer)
+    tokenizer.device = torch.device("cpu")
+    tokenizer.feature_extractor = FeatureExtractor()
+    tokenizer.semantic_model = SemanticModel()
+    tokenizer.mean = torch.zeros(4)
+    tokenizer.std = torch.ones(4)
+    tokenizer.codec = Codec()
+    tokenizer.codebook_size = 8192
+    monkeypatch.setattr(
+        "qwen_tts.semantic_codec.librosa.load",
+        lambda *args, **kwargs: (torch.zeros(160).numpy(), 16000),
+    )
+
+    codes = tokenizer.encode_file("dummy.wav")
+    assert codes.tolist() == [1, 2, 3]
 

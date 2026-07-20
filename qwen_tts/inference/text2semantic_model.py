@@ -40,6 +40,7 @@ class Text2SemanticModel:
                 [{"role": "user", "content": value}],
                 tokenize=True,
                 add_generation_prompt=True,
+                return_dict=False,
             )
             for value in texts
         ]

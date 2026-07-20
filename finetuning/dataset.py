@@ -13,6 +13,7 @@ class Text2SemanticDataset(Dataset):
         data,
         tokenizer,
         *,
+        semantic_vocab_size=8192,
         speech_bos_token_id=8192,
         speech_eos_token_id=8193,
         max_text_tokens=None,
@@ -20,6 +21,7 @@ class Text2SemanticDataset(Dataset):
     ):
         self.data = data
         self.tokenizer = tokenizer
+        self.semantic_vocab_size = semantic_vocab_size
         self.speech_bos_token_id = speech_bos_token_id
         self.speech_eos_token_id = speech_eos_token_id
         self.max_text_tokens = max_text_tokens
@@ -35,6 +37,7 @@ class Text2SemanticDataset(Dataset):
                 messages,
                 tokenize=True,
                 add_generation_prompt=True,
+                return_dict=False,
             )
         else:
             ids = self.tokenizer(text, add_special_tokens=True)["input_ids"]
@@ -54,8 +57,10 @@ class Text2SemanticDataset(Dataset):
         codes = torch.tensor(codes, dtype=torch.long)
         if codes.numel() == 0:
             raise ValueError("semantic_codes must not be empty.")
-        if int(codes.min()) < 0 or int(codes.max()) >= 8192:
-            raise ValueError("semantic_codes must be in [0, 8191].")
+        if int(codes.min()) < 0 or int(codes.max()) >= self.semantic_vocab_size:
+            raise ValueError(
+                f"semantic_codes must be in [0, {self.semantic_vocab_size - 1}]."
+            )
         return {
             "text_input_ids": self._tokenize_text(item["text"]),
             "speech_input_ids": torch.cat(

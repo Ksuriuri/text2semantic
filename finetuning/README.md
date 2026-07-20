@@ -29,6 +29,9 @@ pipeline:
 4. normalize with the supplied training statistics;
 5. call the frozen, single-codebook RepCodec quantizer.
 
+All semantic extraction stages run in FP32. Codes corresponding to padded
+feature frames are removed using the feature attention mask.
+
 ```bash
 uv run python finetuning/prepare_data.py \
   --device cuda:0 \
@@ -45,10 +48,16 @@ copied into or shared with the autoregressive model.
 
 ### Train
 
+Split the prepared data into disjoint train and evaluation JSONL files. Supply
+W&B authentication only through the environment:
+
 ```bash
-uv run accelerate launch finetuning/sft_12hz.py \
+export WANDB_API_KEY="<your-wandb-api-key>"
+
+uv run accelerate launch finetuning/train.py \
   --base_model_path Qwen/Qwen3.5-2B-Base \
   --train_jsonl train_semantic.jsonl \
+  --eval_jsonl eval_semantic.jsonl \
   --output_model_path output \
   --batch_size 2 \
   --lr 2e-6 \
@@ -72,6 +81,22 @@ Gradient checkpointing is enabled by default. Use
 `--no-gradient_checkpointing` only when memory allows it. If FlashAttention 2
 is unavailable, pass `--attn_implementation sdpa`.
 
+Training loss/LR and validation loss, semantic-token accuracy, and EOS accuracy
+are logged to the `text2semantic` project under the
+`haoyuanhuang22-jcxy` W&B entity.
+
 Checkpoints contain the complete Qwen3.5 backbone, random speech parameters
 after training, tokenizer, model config, and generation defaults. They contain
 no speaker encoder, code predictor, acoustic codebook, or waveform decoder.
+Every checkpoint also contains an `accelerator_state/` directory with model,
+optimizer, scheduler, scaler, and RNG state. Resume without resetting the
+epoch or dataloader position:
+
+```bash
+uv run accelerate launch finetuning/train.py \
+  --base_model_path Qwen/Qwen3.5-2B-Base \
+  --train_jsonl train_semantic.jsonl \
+  --eval_jsonl eval_semantic.jsonl \
+  --output_model_path output \
+  --resume_from_checkpoint output/checkpoint-step-500
+```
