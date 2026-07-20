@@ -1,58 +1,88 @@
 # text2semantic
 
-基于 Qwen3.5-2B 的 12Hz 自回归 text-to-semantic 训练代码。TTS 部分同步自
-[QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) 的 `main`
-分支，基准提交为 `022e286`。
+基于预训练 Qwen3.5 的单码本自回归 text-to-semantic 模型。模型只预测
+MaskGCT RepCodec 的离散 semantic index，不预测后续 acoustic codebook，也不在本项目
+中把 token 解码成波形。
 
-本目录只保留训练所需内容：
+核心约束：
 
-- 12Hz 音频 tokenizer 和训练数据预处理；
-- Qwen3.5 talker 主干，以及 Qwen3-TTS code predictor、speaker encoder 的模型与配置；
-- 单说话人 SFT 数据集、训练脚本和上游训练说明。
+- Qwen3.5 text backbone 从预训练权重加载并全参数训练；
+- speech embedding 和 speech output head 独立随机初始化；
+- semantic codec 只用于离线生成 `[0, 8191]` 的整数标签；
+- speech 词表为 `0..8191`、`BOS=8192`、`EOS/PAD=8193`；
+- checkpoint 不包含 codec codebook、speaker encoder 或 acoustic predictor。
 
-未同步 25Hz tokenizer、CLI/WebUI/API、示例、CI、模型权重和其他推理入口。
-
-## 环境
+## 安装
 
 ```bash
 uv sync
 uv pip install flash-attn --no-build-isolation
 ```
 
-训练脚本固定使用 BF16 和 FlashAttention 2，需要支持 BF16 的 CUDA GPU。
-模型和 tokenizer 可以使用 Hugging Face 仓库名，也可以传入本地目录。训练时会从
-`Qwen/Qwen3.5-2B-Base` 初始化 talker 主干，并从 Qwen3-TTS 1.7B 初始化
-codec embedding、codec head、code predictor 和 speaker encoder。
+默认训练使用 BF16 和 FlashAttention 2。没有 FlashAttention 时可传
+`--attn_implementation sdpa`。
 
 ## 数据预处理
 
-原始 JSONL 每行需要包含 `audio`、`text` 和 `ref_audio`。`ref_audio`
-必须为 24 kHz；单说话人训练建议所有样本使用同一段 `ref_audio`。
+原始 JSONL 每行只需要音频和对应文本：
+
+```json
+{"audio":"./data/utt0001.wav","text":"这是一条训练文本。"}
+```
+
+使用与 IndexTTS2 一致的 W2V-BERT layer 17 + RepCodec 单码本 pipeline：
 
 ```bash
 uv run python finetuning/prepare_data.py \
   --device cuda:0 \
-  --tokenizer_model_path Qwen/Qwen3-TTS-Tokenizer-12Hz \
+  --w2v_bert_path /path/to/w2v-bert-2.0 \
+  --stats_path /path/to/wav2vec2bert_stats.pt \
+  --repcodec_config_path /path/to/config.yaml \
+  --repcodec_checkpoint_path /path/to/semantic_codec/model.safetensors \
   --input_jsonl train_raw.jsonl \
-  --output_jsonl train_with_codes.jsonl
+  --output_jsonl train_semantic.jsonl
 ```
 
-## 训练
+输出会增加一维 `semantic_codes`，并移除旧格式中的 `audio_codes/ref_audio`。
+
+## 全参数训练
 
 ```bash
 uv run accelerate launch finetuning/sft_12hz.py \
   --base_model_path Qwen/Qwen3.5-2B-Base \
-  --tts_init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --train_jsonl train_semantic.jsonl \
   --output_model_path output \
-  --train_jsonl train_with_codes.jsonl \
   --batch_size 2 \
-  --lr 2e-5 \
+  --lr 2e-6 \
   --num_epochs 3 \
-  --speaker_name speaker_1
+  --gradient_accumulation_steps 4
 ```
 
-Qwen3.5 的视觉编码器和语言模型 LM head 不会加载；只加载并训练 24 层
-Qwen3.5 text backbone。该 SFT 同时优化第 0 个 codec codebook 的自回归
-talker loss，以及其余
-15 个 codebook 的 code predictor loss。更完整的数据格式和参数说明见
-`finetuning/README.md`。
+损失只覆盖 semantic codes 和 EOS。文本仅作为 causal prefix，不计算 text LM loss。
+
+## 推理
+
+```python
+import torch
+from qwen_tts import Text2SemanticModel
+
+model = Text2SemanticModel.from_pretrained(
+    "output/checkpoint-epoch-2",
+    device="cuda:0",
+    dtype=torch.bfloat16,
+)
+semantic_tokens = model.generate(
+    "She said she would be here by noon.",
+    max_new_tokens=1000,
+    temperature=0.8,
+    top_k=30,
+)
+```
+
+返回值是每条文本对应的一维 token tensor，不包含 BOS/EOS，也不返回音频。
+
+## 测试
+
+```bash
+uv run --extra test pytest -q
+```

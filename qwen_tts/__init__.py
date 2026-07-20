@@ -14,11 +14,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-qwen_tts: Qwen-TTS package.
-"""
+"""Qwen3.5 single-codebook text-to-semantic package."""
 
-from .inference.qwen3_tts_model import Qwen3TTSModel, VoiceClonePromptItem
-from .inference.qwen3_tts_tokenizer import Qwen3TTSTokenizer
+from .core.models import Text2SemanticConfig, Text2SemanticForCausalLM
+from .inference.text2semantic_model import Text2SemanticModel
+from .semantic_codec import MaskGCTSemanticTokenizer
 
-__all__ = ["__version__"]
+__all__ = [
+    "MaskGCTSemanticTokenizer",
+    "Text2SemanticConfig",
+    "Text2SemanticForCausalLM",
+    "Text2SemanticModel",
+]

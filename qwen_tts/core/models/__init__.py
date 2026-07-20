@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .configuration_qwen3_tts import Qwen3TTSConfig
-from .modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
-from .processing_qwen3_tts import Qwen3TTSProcessor
+from .configuration_text2semantic import Text2SemanticConfig
+from .modeling_text2semantic import Text2SemanticForCausalLM
+
+__all__ = ["Text2SemanticConfig", "Text2SemanticForCausalLM"]

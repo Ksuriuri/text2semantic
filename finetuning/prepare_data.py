@@ -17,55 +17,52 @@
 import argparse
 import json
 
-from qwen_tts import Qwen3TTSTokenizer
+import torch
 
-BATCH_INFER_NUM = 32
+from qwen_tts.semantic_codec import MaskGCTSemanticTokenizer
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--tokenizer_model_path", type=str, default="Qwen/Qwen3-TTS-Tokenizer-12Hz")
+    parser.add_argument("--w2v_bert_path", type=str, required=True)
+    parser.add_argument("--stats_path", type=str, required=True)
+    parser.add_argument("--repcodec_config_path", type=str, required=True)
+    parser.add_argument("--repcodec_checkpoint_path", type=str, required=True)
     parser.add_argument("--input_jsonl", type=str, required=True)
     parser.add_argument("--output_jsonl", type=str, required=True)
+    parser.add_argument(
+        "--dtype",
+        choices=("float32", "bfloat16"),
+        default="float32",
+    )
     args = parser.parse_args()
 
-    tokenizer_12hz = Qwen3TTSTokenizer.from_pretrained(
-        args.tokenizer_model_path,
-        device_map=args.device,
+    tokenizer = MaskGCTSemanticTokenizer(
+        w2v_bert_path=args.w2v_bert_path,
+        stats_path=args.stats_path,
+        repcodec_config_path=args.repcodec_config_path,
+        repcodec_checkpoint_path=args.repcodec_checkpoint_path,
+        device=args.device,
+        dtype=torch.float32 if args.dtype == "float32" else torch.bfloat16,
     )
-
-    total_lines = open(args.input_jsonl).readlines()
-    total_lines = [json.loads(line.strip()) for line in total_lines]
-
-    final_lines = []
-    batch_lines = []
-    batch_audios = []
-    for line in total_lines:
-
-        batch_lines.append(line)
-        batch_audios.append(line['audio'])
-
-        if len(batch_lines) >= BATCH_INFER_NUM:
-            enc_res = tokenizer_12hz.encode(batch_audios)
-            for code, line in zip(enc_res.audio_codes, batch_lines):
-                line['audio_codes'] = code.cpu().tolist()
-                final_lines.append(line)
-            batch_lines.clear()
-            batch_audios.clear()
-
-    if len(batch_audios) > 0:
-        enc_res = tokenizer_12hz.encode(batch_audios)
-        for code, line in zip(enc_res.audio_codes, batch_lines):
-            line['audio_codes'] = code.cpu().tolist()
-            final_lines.append(line)
-        batch_lines.clear()
-        batch_audios.clear()
-
-    final_lines = [json.dumps(line, ensure_ascii=False) for line in final_lines]
-
-    with open(args.output_jsonl, 'w') as f:
-        for line in final_lines:
-            f.writelines(line + '\n')
+    with (
+        open(args.input_jsonl, encoding="utf-8") as source,
+        open(args.output_jsonl, "w", encoding="utf-8") as destination,
+    ):
+        for line_number, raw_line in enumerate(source, start=1):
+            if not raw_line.strip():
+                continue
+            item = json.loads(raw_line)
+            if "audio" not in item or "text" not in item:
+                raise ValueError(
+                    f"Line {line_number} must contain 'audio' and 'text'."
+                )
+            item["semantic_codes"] = tokenizer.encode_file(
+                item["audio"]
+            ).tolist()
+            item.pop("audio_codes", None)
+            item.pop("ref_audio", None)
+            destination.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 if __name__ == "__main__":
     main()
