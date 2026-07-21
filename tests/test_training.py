@@ -7,7 +7,12 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from transformers import Qwen3_5TextConfig
 
-from finetuning.train import evaluate, load_resume_state, save_checkpoint
+from finetuning.train import (
+    add_speaker_features,
+    evaluate,
+    load_resume_state,
+    save_checkpoint,
+)
 from qwen_tts.core.models import (
     Text2SemanticConfig,
     Text2SemanticForCausalLM,
@@ -44,6 +49,16 @@ def tiny_model():
             speech_bos_token_id=16,
             speech_eos_token_id=17,
             speech_pad_token_id=17,
+            speaker_input_dim=8,
+            speaker_conformer_output_size=8,
+            speaker_conformer_linear_units=16,
+            speaker_conformer_attention_heads=2,
+            speaker_conformer_num_blocks=1,
+            speaker_conformer_input_layer="linear",
+            speaker_num_latents=2,
+            speaker_latent_dim=32,
+            speaker_perceiver_depth=1,
+            speaker_perceiver_ff_mult=2,
         )
     )
 
@@ -87,6 +102,8 @@ def test_evaluation_reports_semantic_and_eos_metrics():
             "speech_input_ids": torch.tensor([16, 4, 5]),
             "speech_attention_mask": torch.tensor([1, 1, 1]),
             "labels": torch.tensor([4, 5, 17]),
+            "speaker_features": torch.randn(5, 8),
+            "speaker_feature_lengths": torch.tensor(5),
         }
     ]
     dataloader = DataLoader(samples, batch_size=1)
@@ -95,3 +112,17 @@ def test_evaluation_reports_semantic_and_eos_metrics():
     assert metrics["eval/loss"] > 0
     assert 0 <= metrics["eval/token_accuracy"] <= 1
     assert 0 <= metrics["eval/eos_accuracy"] <= 1
+
+
+def test_add_speaker_features_replaces_audio_paths():
+    class Extractor:
+        def encode_files(self, paths, max_audio_seconds):
+            assert paths == ["ref.wav"]
+            assert max_audio_seconds == 12.0
+            return torch.ones(1, 4, 8), torch.tensor([4])
+
+    batch = {"speaker_audio_paths": ["ref.wav"]}
+    result = add_speaker_features(batch, Extractor(), 12.0)
+    assert "speaker_audio_paths" not in result
+    assert result["speaker_features"].shape == (1, 4, 8)
+    assert result["speaker_feature_lengths"].tolist() == [4]

@@ -7,7 +7,12 @@ from qwen_tts.core.models import (
     Text2SemanticConfig,
     Text2SemanticForCausalLM,
 )
-from qwen_tts.semantic_codec import MaskGCTSemanticTokenizer, RepCodec
+from qwen_tts.inference.text2semantic_model import Text2SemanticModel
+from qwen_tts.semantic_codec import (
+    MaskGCTFeatureExtractor,
+    MaskGCTSemanticTokenizer,
+    RepCodec,
+)
 
 
 class DummyTokenizer:
@@ -48,15 +53,37 @@ def tiny_model():
         speech_bos_token_id=16,
         speech_eos_token_id=17,
         speech_pad_token_id=17,
+        speaker_input_dim=8,
+        speaker_conformer_output_size=8,
+        speaker_conformer_linear_units=16,
+        speaker_conformer_attention_heads=2,
+        speaker_conformer_num_blocks=1,
+        speaker_conformer_input_layer="linear",
+        speaker_num_latents=2,
+        speaker_latent_dim=32,
+        speaker_perceiver_depth=1,
+        speaker_perceiver_ff_mult=2,
     )
     return Text2SemanticForCausalLM(config)
+
+
+def speaker_inputs(batch_size=1):
+    return {
+        "speaker_features": torch.randn(batch_size, 5, 8),
+        "speaker_feature_lengths": torch.full((batch_size,), 5, dtype=torch.long),
+    }
 
 
 def test_dataset_alignment_and_mask():
     dataset = Text2SemanticDataset(
         [
-            {"text": "hello", "semantic_codes": [3, 4]},
-            {"text": "x", "semantic_codes": [5]},
+            {
+                "audio": "target-1.wav",
+                "ref_audio": "ref-1.wav",
+                "text": "hello",
+                "semantic_codes": [3, 4],
+            },
+            {"audio": "target-2.wav", "text": "x", "semantic_codes": [5]},
         ],
         DummyTokenizer(),
         speech_bos_token_id=8192,
@@ -72,6 +99,7 @@ def test_dataset_alignment_and_mask():
         [5, 8193, -100],
     ]
     assert batch["speech_attention_mask"].tolist() == [[1, 1, 1], [1, 1, 0]]
+    assert batch["speaker_audio_paths"] == ["ref-1.wav", "target-2.wav"]
 
 
 def test_forward_backward_and_independent_speech_parameters():
@@ -80,17 +108,20 @@ def test_forward_backward_and_independent_speech_parameters():
         text_input_ids=torch.tensor([[2, 3]]),
         speech_input_ids=torch.tensor([[16, 4, 5]]),
         labels=torch.tensor([[4, 5, 17]]),
+        **speaker_inputs(),
     )
     assert output.logits.shape == (1, 3, 18)
     output.loss.backward()
     assert model.speech_embedding.weight.grad is not None
     assert model.speech_head.weight.grad is not None
     assert model.get_input_embeddings().weight.grad is not None
+    assert next(model.speaker_encoder.parameters()).grad is not None
     assert not any(
         forbidden in key
         for key in model.state_dict()
-        for forbidden in ("code_predictor", "speaker_encoder", "quantizer")
+        for forbidden in ("code_predictor", "quantizer")
     )
+    assert any(key.startswith("speaker_encoder.") for key in model.state_dict())
 
 
 def test_generation_stops_at_eos():
@@ -107,6 +138,7 @@ def test_generation_stops_at_eos():
         torch.tensor([[2, 3]]),
         max_new_tokens=5,
         do_sample=False,
+        **speaker_inputs(),
     )
     assert len(generated) == 1
     assert generated[0].numel() == 0
@@ -121,6 +153,50 @@ def test_checkpoint_round_trip(tmp_path):
         restored.speech_embedding.weight,
     )
     assert restored.config.semantic_vocab_size == 16
+    assert torch.equal(
+        next(model.speaker_encoder.parameters()),
+        next(restored.speaker_encoder.parameters()),
+    )
+
+
+def test_speaker_encoder_has_fixed_length_and_prefix_follows_left_padding():
+    model = tiny_model()
+    features = torch.randn(2, 7, 8)
+    lengths = torch.tensor([7, 4])
+    latents = model.speaker_encoder(features, lengths)
+    assert latents.shape == (2, 2, 32)
+
+    _, prefix_mask = model._build_conditioned_prefix(
+        torch.tensor([[0, 2, 3], [4, 5, 6]]),
+        torch.tensor([[0, 1, 1], [1, 1, 1]]),
+        features,
+        lengths,
+    )
+    assert prefix_mask.tolist() == [
+        [0, 1, 1, 1, 1],
+        [1, 1, 1, 1, 1],
+    ]
+
+
+def test_inference_wrapper_broadcasts_reference_audio():
+    class Model:
+        device = torch.device("cpu")
+
+        def generate_semantic(self, input_ids, **kwargs):
+            assert input_ids.shape[0] == 2
+            assert kwargs["speaker_features"].shape == (2, 4, 8)
+            assert kwargs["speaker_feature_lengths"].tolist() == [4, 4]
+            return [torch.tensor([1]), torch.tensor([2])]
+
+    class Extractor:
+        def encode_files(self, paths, max_audio_seconds):
+            assert paths == ["ref.wav", "ref.wav"]
+            assert max_audio_seconds == 15.0
+            return torch.ones(2, 4, 8), torch.tensor([4, 4])
+
+    wrapper = Text2SemanticModel(Model(), DummyTokenizer(), Extractor())
+    result = wrapper.generate(["first", "second"], ref_audio="ref.wav")
+    assert [tokens.tolist() for tokens in result] == [[1], [2]]
 
 
 def test_repcodec_indices_are_in_range():
@@ -175,4 +251,50 @@ def test_semantic_tokenizer_forces_fp32_and_trims_padding(monkeypatch):
 
     codes = tokenizer.encode_file("dummy.wav")
     assert codes.tolist() == [1, 2, 3]
+
+
+def test_maskgct_feature_extractor_batches_and_masks_padding(monkeypatch):
+    class FeatureExtractor:
+        def __call__(
+            self,
+            audios,
+            sampling_rate,
+            padding,
+            return_attention_mask,
+            return_tensors,
+        ):
+            assert len(audios) == 2
+            assert sampling_rate == 16000
+            assert padding and return_attention_mask and return_tensors == "pt"
+            return BatchFeature(
+                {
+                    "input_features": torch.ones(2, 5, 3),
+                    "attention_mask": torch.tensor(
+                        [[1, 1, 1, 0, 0], [1, 1, 1, 1, 1]]
+                    ),
+                }
+            )
+
+    class SemanticModel:
+        def __call__(self, input_features, attention_mask, output_hidden_states):
+            assert input_features.dtype == torch.float32
+            hidden_states = [None] * 18
+            hidden_states[17] = torch.ones(2, 5, 4)
+            return type("Output", (), {"hidden_states": hidden_states})()
+
+    extractor = MaskGCTFeatureExtractor.__new__(MaskGCTFeatureExtractor)
+    extractor.device = torch.device("cpu")
+    extractor.feature_extractor = FeatureExtractor()
+    extractor.semantic_model = SemanticModel()
+    extractor.mean = torch.zeros(4)
+    extractor.std = torch.ones(4)
+    monkeypatch.setattr(
+        "qwen_tts.semantic_codec.librosa.load",
+        lambda *args, **kwargs: (torch.zeros(160).numpy(), 16000),
+    )
+
+    features, lengths = extractor.encode_files(["a.wav", "b.wav"])
+    assert features.shape == (2, 5, 4)
+    assert lengths.tolist() == [3, 5]
+    assert torch.count_nonzero(features[0, 3:]) == 0
 

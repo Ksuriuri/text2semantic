@@ -53,7 +53,6 @@ def main():
                 item["audio"]
             ).tolist()
             item.pop("audio_codes", None)
-            item.pop("ref_audio", None)
             destination.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 if __name__ == "__main__":

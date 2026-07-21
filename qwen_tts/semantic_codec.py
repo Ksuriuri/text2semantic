@@ -178,6 +178,94 @@ class RepCodec(nn.Module):
         return indices.squeeze(0), quantized.transpose(1, 2)
 
 
+class MaskGCTFeatureExtractor:
+    """Frozen W2V-BERT layer-17 feature extractor used by MaskGCT."""
+
+    def __init__(
+        self,
+        *,
+        w2v_bert_path,
+        stats_path,
+        device="cuda:0",
+    ):
+        self.device = torch.device(device)
+        self.feature_extractor = SeamlessM4TFeatureExtractor.from_pretrained(
+            w2v_bert_path
+        )
+        self.semantic_model = Wav2Vec2BertModel.from_pretrained(
+            w2v_bert_path, torch_dtype=torch.float32
+        ).to(self.device, dtype=torch.float32)
+        stats = torch.load(stats_path, map_location="cpu", weights_only=True)
+        self.mean = stats["mean"].to(self.device, dtype=torch.float32)
+        self.std = stats["var"].sqrt().to(self.device, dtype=torch.float32)
+        self.semantic_model.eval()
+        self.semantic_model.requires_grad_(False)
+
+    @torch.inference_mode()
+    def encode_files(self, audio_paths, max_audio_seconds=15.0):
+        if not audio_paths:
+            raise ValueError("audio_paths must not be empty.")
+        if max_audio_seconds is not None and max_audio_seconds <= 0:
+            raise ValueError("max_audio_seconds must be positive or None.")
+
+        max_audio_samples = (
+            None
+            if max_audio_seconds is None
+            else int(16000 * max_audio_seconds)
+        )
+        audios = []
+        for audio_path in audio_paths:
+            audio, _ = librosa.load(Path(audio_path), sr=16000, mono=True)
+            if max_audio_samples is not None:
+                audio = audio[:max_audio_samples]
+            audios.append(audio)
+
+        inputs = self.feature_extractor(
+            audios,
+            sampling_rate=16000,
+            padding=True,
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+        input_features = inputs.input_features.to(self.device, torch.float32)
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.device)
+
+        with torch.amp.autocast(device_type=self.device.type, enabled=False):
+            outputs = self.semantic_model(
+                input_features=input_features,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+            )
+            features = (
+                outputs.hidden_states[17].float() - self.mean
+            ) / self.std
+
+        feature_length = features.size(1)
+        if attention_mask is None:
+            lengths = torch.full(
+                (features.size(0),),
+                feature_length,
+                dtype=torch.long,
+                device=self.device,
+            )
+        else:
+            if attention_mask.size(1) < feature_length:
+                attention_mask = F.pad(
+                    attention_mask,
+                    (0, feature_length - attention_mask.size(1)),
+                )
+            attention_mask = attention_mask[:, :feature_length]
+            lengths = attention_mask.ne(0).sum(dim=1).clamp(
+                min=0, max=feature_length
+            )
+            features = features.masked_fill(
+                ~attention_mask.ne(0).unsqueeze(-1), 0.0
+            )
+        return features.float(), lengths.long()
+
+
 class MaskGCTSemanticTokenizer:
     """Frozen W2V-BERT layer-17 plus single-codebook RepCodec tokenizer."""
 
@@ -191,15 +279,11 @@ class MaskGCTSemanticTokenizer:
         device="cuda:0",
     ):
         self.device = torch.device(device)
-        self.feature_extractor = SeamlessM4TFeatureExtractor.from_pretrained(
-            w2v_bert_path
+        self.feature_extractor = MaskGCTFeatureExtractor(
+            w2v_bert_path=w2v_bert_path,
+            stats_path=stats_path,
+            device=self.device,
         )
-        self.semantic_model = Wav2Vec2BertModel.from_pretrained(
-            w2v_bert_path, torch_dtype=torch.float32
-        ).to(self.device)
-        stats = torch.load(stats_path, map_location="cpu", weights_only=True)
-        self.mean = stats["mean"].to(self.device, dtype=torch.float32)
-        self.std = stats["var"].sqrt().to(self.device, dtype=torch.float32)
 
         with open(repcodec_config_path, encoding="utf-8") as handle:
             config = yaml.safe_load(handle)
@@ -207,37 +291,57 @@ class MaskGCTSemanticTokenizer:
         self.codebook_size = int(config.get("codebook_size", 8192))
         self.codec = RepCodec(**config).to(self.device)
         load_model(self.codec, str(repcodec_checkpoint_path), strict=True)
-        self.semantic_model.eval()
         self.codec.eval()
-        for module in (self.semantic_model, self.codec):
-            module.requires_grad_(False)
+        self.codec.requires_grad_(False)
 
     @torch.inference_mode()
     def encode_file(self, audio_path):
-        audio, _ = librosa.load(Path(audio_path), sr=16000, mono=True)
-        inputs = self.feature_extractor(
-            audio,
-            sampling_rate=16000,
-            return_tensors="pt",
-        )
-        input_features = inputs.input_features.to(self.device, torch.float32)
-        attention_mask = inputs.get("attention_mask")
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(self.device)
-        with torch.amp.autocast(device_type=self.device.type, enabled=False):
-            outputs = self.semantic_model(
-                input_features=input_features,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
+        if hasattr(self.feature_extractor, "encode_files"):
+            features, lengths = self.feature_extractor.encode_files(
+                [audio_path],
+                max_audio_seconds=None,
             )
-            features = (
-                outputs.hidden_states[17].float() - self.mean
-            ) / self.std
+        else:
+            # Keep the original components independently replaceable for
+            # lightweight callers and tests.
+            audio, _ = librosa.load(Path(audio_path), sr=16000, mono=True)
+            inputs = self.feature_extractor(
+                audio,
+                sampling_rate=16000,
+                return_tensors="pt",
+            )
+            input_features = inputs.input_features.to(
+                self.device, torch.float32
+            )
+            attention_mask = inputs.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.device)
+            with torch.amp.autocast(
+                device_type=self.device.type, enabled=False
+            ):
+                outputs = self.semantic_model(
+                    input_features=input_features,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                )
+                features = (
+                    outputs.hidden_states[17].float() - self.mean
+                ) / self.std
+            feature_length = features.size(1)
+            if attention_mask is None:
+                lengths = torch.tensor(
+                    [feature_length],
+                    dtype=torch.long,
+                    device=self.device,
+                )
+            else:
+                lengths = attention_mask[:, :feature_length].ne(0).sum(dim=1)
+                lengths = lengths.clamp(min=0, max=feature_length)
+        with torch.amp.autocast(device_type=self.device.type, enabled=False):
             codes, _ = self.codec.quantize(features.float())
         codes = codes.squeeze(0).long().cpu()
-        if attention_mask is not None:
-            valid_length = min(int(attention_mask.sum().item()), codes.numel())
-            codes = codes[:valid_length]
+        valid_length = min(int(lengths[0].item()), codes.numel())
+        codes = codes[:valid_length]
         if (
             codes.numel() == 0
             or codes.min() < 0

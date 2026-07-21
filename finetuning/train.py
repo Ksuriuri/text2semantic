@@ -9,12 +9,14 @@ import os
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
+from dotenv import load_dotenv
 from finetuning.dataset import Text2SemanticDataset
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
 from qwen_tts.core.models import Text2SemanticForCausalLM
+from qwen_tts.semantic_codec import MaskGCTFeatureExtractor
 
 
 WANDB_PROJECT = "text2semantic"
@@ -30,6 +32,9 @@ def parse_args():
     parser.add_argument("--output_model_path", default="output")
     parser.add_argument("--train_jsonl", required=True)
     parser.add_argument("--eval_jsonl", required=True)
+    parser.add_argument("--w2v_bert_path", required=True)
+    parser.add_argument("--stats_path", required=True)
+    parser.add_argument("--max_ref_seconds", type=float, default=15.0)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--eval_batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=2e-6)
@@ -59,6 +64,8 @@ def parse_args():
         parser.error("--warmup_ratio must be in [0, 1).")
     if args.checkpointing_steps <= 0:
         parser.error("--checkpointing_steps must be positive.")
+    if args.max_ref_seconds <= 0:
+        parser.error("--max_ref_seconds must be positive.")
     return args
 
 
@@ -91,11 +98,39 @@ def build_dataset(path, tokenizer, model_config, args):
     )
 
 
+def add_speaker_features(batch, feature_extractor, max_ref_seconds):
+    audio_paths = batch.pop("speaker_audio_paths", None)
+    if audio_paths is None:
+        return batch
+    if feature_extractor is None:
+        raise ValueError(
+            "A speaker feature extractor is required for audio-path batches."
+        )
+    features, lengths = feature_extractor.encode_files(
+        audio_paths,
+        max_audio_seconds=max_ref_seconds,
+    )
+    batch["speaker_features"] = features
+    batch["speaker_feature_lengths"] = lengths
+    return batch
+
+
 @torch.inference_mode()
-def evaluate(model, dataloader, accelerator):
+def evaluate(
+    model,
+    dataloader,
+    accelerator,
+    feature_extractor=None,
+    max_ref_seconds=15.0,
+):
     model.eval()
     totals = torch.zeros(5, dtype=torch.float64, device=accelerator.device)
     for batch in dataloader:
+        batch = add_speaker_features(
+            batch,
+            feature_extractor,
+            max_ref_seconds,
+        )
         output = model(**batch, use_cache=False)
         labels = batch["labels"]
         valid = labels.ne(-100)
@@ -203,6 +238,7 @@ def load_resume_state(accelerator, checkpoint):
 
 def train():
     args = parse_args()
+    load_dotenv()
     if not os.environ.get("WANDB_API_KEY"):
         raise EnvironmentError(
             "Set WANDB_API_KEY in the environment before launching training."
@@ -212,6 +248,11 @@ def train():
         mixed_precision="bf16",
         log_with="wandb",
         project_dir=args.output_model_path,
+    )
+    speaker_feature_extractor = MaskGCTFeatureExtractor(
+        w2v_bert_path=args.w2v_bert_path,
+        stats_path=args.stats_path,
+        device=accelerator.device,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(args.base_model_path)
@@ -326,6 +367,11 @@ def train():
             first_step = 0
 
         for step, batch in enumerate(active_dataloader, start=first_step):
+            batch = add_speaker_features(
+                batch,
+                speaker_feature_extractor,
+                args.max_ref_seconds,
+            )
             with accelerator.accumulate(model):
                 output = model(**batch, use_cache=False)
                 accelerator.backward(output.loss)
@@ -361,7 +407,13 @@ def train():
                         global_step=global_step,
                     )
 
-        metrics = evaluate(model, eval_dataloader, accelerator)
+        metrics = evaluate(
+            model,
+            eval_dataloader,
+            accelerator,
+            speaker_feature_extractor,
+            args.max_ref_seconds,
+        )
         accelerator.log(metrics, step=global_step)
         accelerator.print(
             f"Epoch {epoch} | eval loss {metrics['eval/loss']:.4f} | "

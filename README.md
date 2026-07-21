@@ -9,8 +9,10 @@ MaskGCT RepCodec 的离散 semantic index，不预测后续 acoustic codebook，
 - Qwen3.5 text backbone 从预训练权重加载并全参数训练；
 - speech embedding 和 speech output head 独立随机初始化；
 - semantic codec 只用于离线生成 `[0, 8191]` 的整数标签；
+- 参考音频经冻结 W2V-BERT layer 17 和可训练 Conformer + Perceiver
+  压缩为固定 `[32, 1280]` speaker latent；
 - speech 词表为 `0..8191`、`BOS=8192`、`EOS/PAD=8193`；
-- checkpoint 不包含 codec codebook、speaker encoder 或 acoustic predictor。
+- checkpoint 包含 speaker encoder，不包含 W2V-BERT、codec codebook 或 acoustic predictor。
 
 ## 安装
 
@@ -24,10 +26,11 @@ uv pip install flash-attn --no-build-isolation
 
 ## 数据预处理
 
-原始 JSONL 每行只需要音频和对应文本：
+原始 JSONL 每行需要目标音频和对应文本，可额外提供独立的参考音频。
+没有 `ref_audio` 时会使用目标 `audio` 提取说话人条件：
 
 ```json
-{"audio":"./data/utt0001.wav","text":"这是一条训练文本。"}
+{"audio":"./data/utt0001.wav","ref_audio":"./refs/spk1.wav","text":"这是一条训练文本。"}
 ```
 
 使用与 IndexTTS2 一致的 W2V-BERT layer 17 + RepCodec 单码本 pipeline。
@@ -44,17 +47,21 @@ uv run python finetuning/prepare_data.py \
   --output_jsonl train_semantic.jsonl
 ```
 
-输出会增加一维 `semantic_codes`，并移除旧格式中的 `audio_codes/ref_audio`。
+输出会增加一维 `semantic_codes`，移除旧格式中的 `audio_codes`，并保留
+`audio/ref_audio` 供训练时在线提取 speaker 特征。
 
 ## 全参数训练
 
-先把预处理结果划分为互不重叠的训练集与验证集，并通过环境变量提供 W&B key：
+先把预处理结果划分为互不重叠的训练集与验证集。训练脚本会自动加载项目根目录下
+被 Git 忽略的 `.env`，也可以通过环境变量覆盖其中的 W&B key：
 
 ```bash
 export WANDB_API_KEY="<your-wandb-api-key>"
 
 uv run accelerate launch finetuning/train.py \
   --base_model_path Qwen/Qwen3.5-2B-Base \
+  --w2v_bert_path /path/to/w2v-bert-2.0 \
+  --stats_path /path/to/wav2vec2bert_stats.pt \
   --train_jsonl train_semantic.jsonl \
   --eval_jsonl eval_semantic.jsonl \
   --output_model_path output \
@@ -65,6 +72,8 @@ uv run accelerate launch finetuning/train.py \
 ```
 
 损失只覆盖 semantic codes 和 EOS。文本仅作为 causal prefix，不计算 text LM loss。
+训练时冻结的 W2V-BERT 在线产生可变长 `[T,1024]` 特征；随机初始化且可训练的
+Conformer + Perceiver 将其压缩为 32 个固定 speaker token，并注入文本前缀之前。
 训练指标、验证 loss、token accuracy 和 EOS accuracy 写入
 `haoyuanhuang22-jcxy/text2semantic` W&B project。API key 不应写进脚本或提交到仓库。
 
@@ -73,6 +82,8 @@ uv run accelerate launch finetuning/train.py \
 ```bash
 uv run accelerate launch finetuning/train.py \
   --base_model_path Qwen/Qwen3.5-2B-Base \
+  --w2v_bert_path /path/to/w2v-bert-2.0 \
+  --stats_path /path/to/wav2vec2bert_stats.pt \
   --train_jsonl train_semantic.jsonl \
   --eval_jsonl eval_semantic.jsonl \
   --output_model_path output \
@@ -87,11 +98,14 @@ from qwen_tts import Text2SemanticModel
 
 model = Text2SemanticModel.from_pretrained(
     "output/checkpoint-epoch-2",
+    w2v_bert_path="/path/to/w2v-bert-2.0",
+    stats_path="/path/to/wav2vec2bert_stats.pt",
     device="cuda:0",
     dtype=torch.bfloat16,
 )
 semantic_tokens = model.generate(
     "She said she would be here by noon.",
+    ref_audio="./refs/spk1.wav",
     max_new_tokens=1000,
     temperature=0.8,
     top_k=30,

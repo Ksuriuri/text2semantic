@@ -51,6 +51,9 @@ class Text2SemanticDataset(Dataset):
         item = self.data[index]
         if "text" not in item or "semantic_codes" not in item:
             raise ValueError("Each sample needs 'text' and 'semantic_codes'.")
+        speaker_audio_path = item.get("ref_audio") or item.get("audio")
+        if speaker_audio_path is None:
+            raise ValueError("Each sample needs 'ref_audio' or 'audio'.")
         codes = item["semantic_codes"]
         if self.max_semantic_tokens is not None:
             codes = codes[: self.max_semantic_tokens]
@@ -69,6 +72,7 @@ class Text2SemanticDataset(Dataset):
             "labels": torch.cat(
                 (codes, torch.tensor([self.speech_eos_token_id]))
             ),
+            "speaker_audio_path": speaker_audio_path,
         }
 
     def collate_fn(self, samples):
@@ -107,4 +111,7 @@ class Text2SemanticDataset(Dataset):
             "speech_input_ids": speech_ids,
             "speech_attention_mask": speech_mask,
             "labels": labels,
+            "speaker_audio_paths": [
+                sample["speaker_audio_path"] for sample in samples
+            ],
         }

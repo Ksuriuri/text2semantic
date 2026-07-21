@@ -5,18 +5,19 @@
 Raw JSONL:
 
 ```jsonl
-{"audio":"./data/utt0001.wav","text":"其实我很善于观察别人的情绪。"}
+{"audio":"./data/utt0001.wav","ref_audio":"./refs/spk1.wav","text":"其实我很善于观察别人的情绪。"}
 {"audio":"./data/utt0002.wav","text":"She said she would be here by noon."}
 ```
 
 Prepared JSONL:
 
 ```jsonl
-{"audio":"./data/utt0001.wav","text":"其实我很善于观察别人的情绪。","semantic_codes":[52,481,709]}
+{"audio":"./data/utt0001.wav","ref_audio":"./refs/spk1.wav","text":"其实我很善于观察别人的情绪。","semantic_codes":[52,481,709]}
 ```
 
 `semantic_codes` must be a non-empty one-dimensional list with values in
-`[0, 8191]`. `ref_audio` and 16-layer `audio_codes` are not used.
+`[0, 8191]`. `ref_audio` is the preferred speaker reference and falls back to
+`audio` when omitted. Legacy 16-layer `audio_codes` are not used.
 
 ### Extract semantic labels
 
@@ -48,14 +49,17 @@ copied into or shared with the autoregressive model.
 
 ### Train
 
-Split the prepared data into disjoint train and evaluation JSONL files. Supply
-W&B authentication only through the environment:
+Split the prepared data into disjoint train and evaluation JSONL files. The
+training script automatically loads the Git-ignored project-root `.env`;
+an exported environment variable can override it:
 
 ```bash
 export WANDB_API_KEY="<your-wandb-api-key>"
 
 uv run accelerate launch finetuning/train.py \
   --base_model_path Qwen/Qwen3.5-2B-Base \
+  --w2v_bert_path /path/to/w2v-bert-2.0 \
+  --stats_path /path/to/wav2vec2bert_stats.pt \
   --train_jsonl train_semantic.jsonl \
   --eval_jsonl eval_semantic.jsonl \
   --output_model_path output \
@@ -68,8 +72,12 @@ uv run accelerate launch finetuning/train.py \
 ```
 
 The Qwen3.5 backbone is loaded from pretrained weights. The independent
-8194-entry speech embedding and 8194-class output head are random. All three
-parts are trainable. Teacher forcing uses:
+8194-entry speech embedding, 8194-class output head, and IndexTTS2-style
+Conformer + Perceiver speaker encoder are random and trainable. A frozen
+W2V-BERT layer 17 front end runs online in FP32 and the speaker encoder maps
+its variable `[B,T,1024]` output to fixed `[B,32,1280]` latents. After
+projection, the input order is `[left padding][speaker][text][speech]`.
+Teacher forcing uses:
 
 ```text
 speech input:  [BOS, code_0, ..., code_n]
@@ -85,9 +93,10 @@ Training loss/LR and validation loss, semantic-token accuracy, and EOS accuracy
 are logged to the `text2semantic` project under the
 `haoyuanhuang22-jcxy` W&B entity.
 
-Checkpoints contain the complete Qwen3.5 backbone, random speech parameters
-after training, tokenizer, model config, and generation defaults. They contain
-no speaker encoder, code predictor, acoustic codebook, or waveform decoder.
+Checkpoints contain the complete Qwen3.5 backbone, trained speech parameters,
+speaker encoder, tokenizer, model config, and generation defaults. They do not
+contain the frozen W2V-BERT front end, code predictor, acoustic codebook, or
+waveform decoder.
 Every checkpoint also contains an `accelerator_state/` directory with model,
 optimizer, scheduler, scaler, and RNG state. Resume without resetting the
 epoch or dataloader position:
@@ -95,6 +104,8 @@ epoch or dataloader position:
 ```bash
 uv run accelerate launch finetuning/train.py \
   --base_model_path Qwen/Qwen3.5-2B-Base \
+  --w2v_bert_path /path/to/w2v-bert-2.0 \
+  --stats_path /path/to/wav2vec2bert_stats.pt \
   --train_jsonl train_semantic.jsonl \
   --eval_jsonl eval_semantic.jsonl \
   --output_model_path output \

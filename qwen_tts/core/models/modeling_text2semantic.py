@@ -16,6 +16,7 @@ from transformers import (
 from transformers.utils import ModelOutput
 
 from .configuration_text2semantic import Text2SemanticConfig
+from .speaker import SpeakerConditioningEncoder
 
 
 @dataclass
@@ -48,6 +49,26 @@ class Text2SemanticForCausalLM(PreTrainedModel):
             config.speech_vocab_size,
             bias=False,
         )
+        self.speaker_encoder = SpeakerConditioningEncoder(
+            input_dim=config.speaker_input_dim,
+            conformer_output_dim=config.speaker_conformer_output_size,
+            conformer_linear_units=config.speaker_conformer_linear_units,
+            conformer_attention_heads=config.speaker_conformer_attention_heads,
+            conformer_num_blocks=config.speaker_conformer_num_blocks,
+            conformer_input_layer=config.speaker_conformer_input_layer,
+            perceiver_num_latents=config.speaker_num_latents,
+            perceiver_latent_dim=config.speaker_latent_dim,
+            perceiver_depth=config.speaker_perceiver_depth,
+            perceiver_ff_mult=config.speaker_perceiver_ff_mult,
+        )
+        if config.speaker_latent_dim == qwen_config.hidden_size:
+            self.speaker_projection = nn.Identity()
+        else:
+            self.speaker_projection = nn.Linear(
+                config.speaker_latent_dim,
+                qwen_config.hidden_size,
+                bias=False,
+            )
         self.post_init()
         self._init_speech_parameters()
 
@@ -122,12 +143,79 @@ class Text2SemanticForCausalLM(PreTrainedModel):
                 f"got [{minimum}, {maximum}]."
             )
 
+    def _build_conditioned_prefix(
+        self,
+        text_input_ids,
+        text_attention_mask,
+        speaker_features,
+        speaker_feature_lengths,
+    ):
+        if speaker_features is None or speaker_feature_lengths is None:
+            raise ValueError(
+                "speaker_features and speaker_feature_lengths are required."
+            )
+        if speaker_features.ndim != 3:
+            raise ValueError("speaker_features must have shape [batch, time, dim].")
+        if speaker_features.size(0) != text_input_ids.size(0):
+            raise ValueError("speaker_features and text_input_ids batch sizes differ.")
+        if speaker_features.size(2) != self.config.speaker_input_dim:
+            raise ValueError(
+                f"Expected speaker feature dim {self.config.speaker_input_dim}, "
+                f"got {speaker_features.size(2)}."
+            )
+        if speaker_feature_lengths.shape != (speaker_features.size(0),):
+            raise ValueError("speaker_feature_lengths must have shape [batch].")
+        speaker_parameter = next(self.speaker_encoder.parameters())
+        speaker_features = speaker_features.to(
+            device=speaker_parameter.device,
+            dtype=speaker_parameter.dtype,
+        )
+        speaker_feature_lengths = speaker_feature_lengths.to(
+            device=speaker_parameter.device,
+            dtype=torch.long,
+        )
+        if (
+            bool((speaker_feature_lengths <= 0).any())
+            or bool((speaker_feature_lengths > speaker_features.size(1)).any())
+        ):
+            raise ValueError(
+                "speaker_feature_lengths must be in [1, speaker feature time]."
+            )
+        speaker_latents = self.speaker_encoder(
+            speaker_features,
+            speaker_feature_lengths,
+        )
+        speaker_embeds = self.speaker_projection(speaker_latents)
+        text_embeds = self.get_input_embeddings()(text_input_ids)
+        speaker_embeds = speaker_embeds.to(dtype=text_embeds.dtype)
+
+        batch_size, padded_text_length = text_input_ids.shape
+        speaker_length = speaker_embeds.size(1)
+        prefix_embeds = text_embeds.new_zeros(
+            batch_size,
+            padded_text_length + speaker_length,
+            text_embeds.size(-1),
+        )
+        prefix_mask = text_attention_mask.new_zeros(
+            batch_size,
+            padded_text_length + speaker_length,
+        )
+        for row in range(batch_size):
+            valid_text = text_embeds[row][text_attention_mask[row].bool()]
+            padding = padded_text_length - valid_text.size(0)
+            prefix_embeds[row, padding : padding + speaker_length] = speaker_embeds[row]
+            prefix_embeds[row, padding + speaker_length :] = valid_text
+            prefix_mask[row, padding:] = 1
+        return prefix_embeds, prefix_mask
+
     def forward(
         self,
         text_input_ids,
         speech_input_ids,
         text_attention_mask=None,
         speech_attention_mask=None,
+        speaker_features=None,
+        speaker_feature_lengths=None,
         labels=None,
         use_cache=None,
         **kwargs,
@@ -140,11 +228,16 @@ class Text2SemanticForCausalLM(PreTrainedModel):
         if speech_attention_mask is None:
             speech_attention_mask = torch.ones_like(speech_input_ids)
 
-        text_embeds = self.get_input_embeddings()(text_input_ids)
+        prefix_embeds, prefix_mask = self._build_conditioned_prefix(
+            text_input_ids,
+            text_attention_mask,
+            speaker_features,
+            speaker_feature_lengths,
+        )
         speech_embeds = self.speech_embedding(speech_input_ids)
-        inputs_embeds = torch.cat((text_embeds, speech_embeds), dim=1)
+        inputs_embeds = torch.cat((prefix_embeds, speech_embeds), dim=1)
         attention_mask = torch.cat(
-            (text_attention_mask, speech_attention_mask), dim=1
+            (prefix_mask, speech_attention_mask), dim=1
         )
 
         outputs = self.backbone(
@@ -177,6 +270,8 @@ class Text2SemanticForCausalLM(PreTrainedModel):
         self,
         text_input_ids,
         text_attention_mask=None,
+        speaker_features=None,
+        speaker_feature_lengths=None,
         max_new_tokens=1500,
         temperature=1.0,
         top_k=0,
@@ -201,17 +296,22 @@ class Text2SemanticForCausalLM(PreTrainedModel):
             batch_size, dtype=torch.bool, device=text_input_ids.device
         )
 
-        text_embeds = self.get_input_embeddings()(text_input_ids)
+        prefix_embeds, prefix_mask = self._build_conditioned_prefix(
+            text_input_ids,
+            text_attention_mask,
+            speaker_features,
+            speaker_feature_lengths,
+        )
         speech_embeds = self.speech_embedding(generated)
         attention_mask = torch.cat(
             (
-                text_attention_mask,
+                prefix_mask,
                 torch.ones_like(generated),
             ),
             dim=1,
         )
         output = self.backbone(
-            inputs_embeds=torch.cat((text_embeds, speech_embeds), dim=1),
+            inputs_embeds=torch.cat((prefix_embeds, speech_embeds), dim=1),
             attention_mask=attention_mask,
             use_cache=True,
         )

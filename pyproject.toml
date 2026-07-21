@@ -16,6 +16,8 @@ dependencies = [
     "huggingface-hub",
     "librosa",
     "numpy",
+    "packaging",
+    "python-dotenv",
     "pyyaml>=6.0",
     "safetensors",
     "soundfile",
