@@ -18,16 +18,19 @@ from qwen_tts.semantic_codec import (
 class DummyTokenizer:
     pad_token_id = 0
     eos_token_id = 1
+    chat_template = "dummy"
 
-    def apply_chat_template(
-        self,
-        messages,
-        tokenize,
-        add_generation_prompt,
-        return_dict,
-    ):
-        assert tokenize and add_generation_prompt and return_dict is False
-        return [2, len(messages[0]["content"]) + 2]
+    def apply_chat_template(self, *args, **kwargs):
+        raise AssertionError("The Qwen chat template must not be used for TTS.")
+
+    def __call__(self, prompt, add_special_tokens):
+        assert add_special_tokens is False
+        assert prompt.startswith(
+            "<|im_start|>system\nSpeak out the provided text.<|im_end|>\n"
+        )
+        assert prompt.endswith("<|im_start|>assistant\n")
+        assert "<think>" not in prompt and "</think>" not in prompt
+        return {"input_ids": [2] if "\nx<|im_end|>" in prompt else [2, 3]}
 
 
 def tiny_model():
@@ -99,6 +102,8 @@ def test_dataset_alignment_and_mask():
         [5, 8193, -100],
     ]
     assert batch["speech_attention_mask"].tolist() == [[1, 1, 1], [1, 1, 0]]
+    assert batch["text_input_ids"].tolist() == [[2, 3], [2, 0]]
+    assert batch["text_attention_mask"].tolist() == [[1, 1], [1, 0]]
     assert batch["speaker_audio_paths"] == ["ref-1.wav", "target-2.wav"]
 
 
@@ -159,22 +164,47 @@ def test_checkpoint_round_trip(tmp_path):
     )
 
 
-def test_speaker_encoder_has_fixed_length_and_prefix_follows_left_padding():
+def test_training_right_padding_and_generation_left_padding():
     model = tiny_model()
     features = torch.randn(2, 7, 8)
     lengths = torch.tensor([7, 4])
     latents = model.speaker_encoder(features, lengths)
     assert latents.shape == (2, 2, 32)
 
-    _, prefix_mask = model._build_conditioned_prefix(
-        torch.tensor([[0, 2, 3], [4, 5, 6]]),
-        torch.tensor([[0, 1, 1], [1, 1, 1]]),
+    _, training_mask, _, _ = model._build_training_inputs(
+        torch.tensor([[2, 3, 0], [4, 5, 6]]),
+        torch.tensor([[1, 1, 0], [1, 1, 1]]),
+        torch.tensor([[16, 4, 17], [16, 5, 6]]),
+        torch.tensor([[1, 1, 0], [1, 1, 1]]),
         features,
         lengths,
     )
-    assert prefix_mask.tolist() == [
-        [0, 1, 1, 1, 1],
-        [1, 1, 1, 1, 1],
+    assert training_mask.tolist() == [
+        [1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
+        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    ]
+    output = model(
+        text_input_ids=torch.tensor([[2, 3, 0], [4, 5, 6]]),
+        text_attention_mask=torch.tensor([[1, 1, 0], [1, 1, 1]]),
+        speech_input_ids=torch.tensor([[16, 4, 17], [16, 5, 6]]),
+        speech_attention_mask=torch.tensor([[1, 1, 0], [1, 1, 1]]),
+        labels=torch.tensor([[4, 17, -100], [5, 6, 17]]),
+        speaker_features=features,
+        speaker_feature_lengths=lengths,
+    )
+    assert output.logits.shape == (2, 3, 18)
+    assert torch.count_nonzero(output.logits[0, 2]) == 0
+
+    _, generation_mask = model._build_generation_prompt(
+        torch.tensor([[2, 3, 0], [4, 5, 6]]),
+        torch.tensor([[1, 1, 0], [1, 1, 1]]),
+        features,
+        lengths,
+        torch.tensor([[16], [16]]),
+    )
+    assert generation_mask.tolist() == [
+        [0, 1, 1, 1, 1, 1, 1, 1],
+        [1, 1, 1, 1, 1, 1, 1, 1],
     ]
 
 

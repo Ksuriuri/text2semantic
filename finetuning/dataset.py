@@ -4,6 +4,8 @@
 import torch
 from torch.utils.data import Dataset
 
+from qwen_tts.text_template import tokenize_tts_prompt
+
 
 class Text2SemanticDataset(Dataset):
     """Text prefix and MaskGCT semantic-code teacher-forcing dataset."""
@@ -31,16 +33,7 @@ class Text2SemanticDataset(Dataset):
         return len(self.data)
 
     def _tokenize_text(self, text):
-        messages = [{"role": "user", "content": text}]
-        if hasattr(self.tokenizer, "apply_chat_template"):
-            ids = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=False,
-            )
-        else:
-            ids = self.tokenizer(text, add_special_tokens=True)["input_ids"]
+        ids = tokenize_tts_prompt(self.tokenizer, text)
         if self.max_text_tokens is not None:
             ids = ids[: self.max_text_tokens]
         if not ids:
@@ -98,9 +91,8 @@ class Text2SemanticDataset(Dataset):
         for row, sample in enumerate(samples):
             text_length = sample["text_input_ids"].numel()
             speech_length = sample["speech_input_ids"].numel()
-            text_start = max_text - text_length
-            text_ids[row, text_start:] = sample["text_input_ids"]
-            text_mask[row, text_start:] = 1
+            text_ids[row, :text_length] = sample["text_input_ids"]
+            text_mask[row, :text_length] = 1
             speech_ids[row, :speech_length] = sample["speech_input_ids"]
             speech_mask[row, :speech_length] = 1
             labels[row, :speech_length] = sample["labels"]

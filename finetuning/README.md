@@ -76,7 +76,19 @@ The Qwen3.5 backbone is loaded from pretrained weights. The independent
 Conformer + Perceiver speaker encoder are random and trainable. A frozen
 W2V-BERT layer 17 front end runs online in FP32 and the speaker encoder maps
 its variable `[B,T,1024]` output to fixed `[B,32,1280]` latents. After
-projection, the input order is `[left padding][speaker][text][speech]`.
+projection, the text prefix uses the Fish Speech-style ChatML system prompt
+`Speak out the provided text.`, followed by the user text and assistant
+generation prompt. It is rendered explicitly instead of using Qwen3.5's
+default chat template, so no `<think></think>` block is inserted. The full
+training sequence is:
+
+```text
+[speaker_bos][speaker x32][speaker_eos][ChatML text][speech_bos/codes][right padding]
+```
+
+Batch inference left-pads the complete prompt so every sample's final valid
+token is aligned for autoregressive generation. Speech BOS is the local
+equivalent of Fish Speech's `<|voice|>` boundary.
 Teacher forcing uses:
 
 ```text

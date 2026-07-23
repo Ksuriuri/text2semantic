@@ -69,6 +69,7 @@ class Text2SemanticForCausalLM(PreTrainedModel):
                 qwen_config.hidden_size,
                 bias=False,
             )
+        self.speaker_boundary_embedding = nn.Embedding(2, qwen_config.hidden_size)
         self.post_init()
         self._init_speech_parameters()
 
@@ -143,10 +144,8 @@ class Text2SemanticForCausalLM(PreTrainedModel):
                 f"got [{minimum}, {maximum}]."
             )
 
-    def _build_conditioned_prefix(
+    def _encode_speaker_prefix(
         self,
-        text_input_ids,
-        text_attention_mask,
         speaker_features,
         speaker_feature_lengths,
     ):
@@ -156,8 +155,6 @@ class Text2SemanticForCausalLM(PreTrainedModel):
             )
         if speaker_features.ndim != 3:
             raise ValueError("speaker_features must have shape [batch, time, dim].")
-        if speaker_features.size(0) != text_input_ids.size(0):
-            raise ValueError("speaker_features and text_input_ids batch sizes differ.")
         if speaker_features.size(2) != self.config.speaker_input_dim:
             raise ValueError(
                 f"Expected speaker feature dim {self.config.speaker_input_dim}, "
@@ -186,27 +183,121 @@ class Text2SemanticForCausalLM(PreTrainedModel):
             speaker_feature_lengths,
         )
         speaker_embeds = self.speaker_projection(speaker_latents)
-        text_embeds = self.get_input_embeddings()(text_input_ids)
-        speaker_embeds = speaker_embeds.to(dtype=text_embeds.dtype)
+        boundary_ids = torch.arange(
+            2,
+            device=speaker_embeds.device,
+            dtype=torch.long,
+        )
+        boundaries = self.speaker_boundary_embedding(boundary_ids)
+        boundaries = boundaries.to(dtype=speaker_embeds.dtype)
+        return torch.cat(
+            (
+                boundaries[0].view(1, 1, -1).expand(speaker_embeds.size(0), -1, -1),
+                speaker_embeds,
+                boundaries[1].view(1, 1, -1).expand(speaker_embeds.size(0), -1, -1),
+            ),
+            dim=1,
+        )
 
-        batch_size, padded_text_length = text_input_ids.shape
-        speaker_length = speaker_embeds.size(1)
-        prefix_embeds = text_embeds.new_zeros(
-            batch_size,
-            padded_text_length + speaker_length,
+    def _build_training_inputs(
+        self,
+        text_input_ids,
+        text_attention_mask,
+        speech_input_ids,
+        speech_attention_mask,
+        speaker_features,
+        speaker_feature_lengths,
+    ):
+        if speaker_features is not None and speaker_features.size(0) != text_input_ids.size(0):
+            raise ValueError("speaker_features and text_input_ids batch sizes differ.")
+        speaker_embeds = self._encode_speaker_prefix(
+            speaker_features,
+            speaker_feature_lengths,
+        )
+        text_embeds = self.get_input_embeddings()(text_input_ids)
+        speech_embeds = self.speech_embedding(speech_input_ids)
+        speaker_embeds = speaker_embeds.to(dtype=text_embeds.dtype)
+        speech_embeds = speech_embeds.to(dtype=text_embeds.dtype)
+
+        text_lengths = text_attention_mask.sum(dim=1).long()
+        speech_lengths = speech_attention_mask.sum(dim=1).long()
+        total_lengths = text_lengths + speech_lengths + speaker_embeds.size(1)
+        max_total_length = int(total_lengths.max().item())
+        inputs_embeds = text_embeds.new_zeros(
+            text_input_ids.size(0),
+            max_total_length,
             text_embeds.size(-1),
         )
-        prefix_mask = text_attention_mask.new_zeros(
-            batch_size,
-            padded_text_length + speaker_length,
+        attention_mask = text_attention_mask.new_zeros(
+            text_input_ids.size(0),
+            max_total_length,
         )
-        for row in range(batch_size):
+        speech_starts = []
+        for row in range(text_input_ids.size(0)):
+            text_length = int(text_lengths[row])
+            speech_length = int(speech_lengths[row])
+            valid_text = text_embeds[row, :text_length]
+            valid_speech = speech_embeds[row, :speech_length]
+            speech_start = speaker_embeds.size(1) + text_length
+            sequence = torch.cat(
+                (speaker_embeds[row], valid_text, valid_speech),
+                dim=0,
+            )
+            inputs_embeds[row, : sequence.size(0)] = sequence
+            attention_mask[row, : sequence.size(0)] = 1
+            speech_starts.append(speech_start)
+        return (
+            inputs_embeds,
+            attention_mask,
+            speech_starts,
+            speech_lengths,
+        )
+
+    def _build_generation_prompt(
+        self,
+        text_input_ids,
+        text_attention_mask,
+        speaker_features,
+        speaker_feature_lengths,
+        speech_bos_ids,
+    ):
+        if speaker_features is not None and speaker_features.size(0) != text_input_ids.size(0):
+            raise ValueError("speaker_features and text_input_ids batch sizes differ.")
+        speaker_embeds = self._encode_speaker_prefix(
+            speaker_features,
+            speaker_feature_lengths,
+        )
+        text_embeds = self.get_input_embeddings()(text_input_ids)
+        speech_bos_embeds = self.speech_embedding(speech_bos_ids)
+        speaker_embeds = speaker_embeds.to(dtype=text_embeds.dtype)
+        speech_bos_embeds = speech_bos_embeds.to(dtype=text_embeds.dtype)
+
+        text_lengths = text_attention_mask.sum(dim=1).long()
+        prompt_lengths = text_lengths + speaker_embeds.size(1) + 1
+        max_prompt_length = int(prompt_lengths.max().item())
+        prompt_embeds = text_embeds.new_zeros(
+            text_input_ids.size(0),
+            max_prompt_length,
+            text_embeds.size(-1),
+        )
+        prompt_mask = text_attention_mask.new_zeros(
+            text_input_ids.size(0),
+            max_prompt_length,
+        )
+        for row in range(text_input_ids.size(0)):
             valid_text = text_embeds[row][text_attention_mask[row].bool()]
-            padding = padded_text_length - valid_text.size(0)
-            prefix_embeds[row, padding : padding + speaker_length] = speaker_embeds[row]
-            prefix_embeds[row, padding + speaker_length :] = valid_text
-            prefix_mask[row, padding:] = 1
-        return prefix_embeds, prefix_mask
+            sequence = torch.cat(
+                (
+                    speaker_embeds[row],
+                    valid_text,
+                    speech_bos_embeds[row],
+                ),
+                dim=0,
+            )
+            padding = max_prompt_length - sequence.size(0)
+            prompt_embeds[row, padding:] = sequence
+            prompt_mask[row, padding:] = 1
+        return prompt_embeds, prompt_mask
 
     def forward(
         self,
@@ -228,16 +319,18 @@ class Text2SemanticForCausalLM(PreTrainedModel):
         if speech_attention_mask is None:
             speech_attention_mask = torch.ones_like(speech_input_ids)
 
-        prefix_embeds, prefix_mask = self._build_conditioned_prefix(
+        (
+            inputs_embeds,
+            attention_mask,
+            speech_starts,
+            speech_lengths,
+        ) = self._build_training_inputs(
             text_input_ids,
             text_attention_mask,
+            speech_input_ids,
+            speech_attention_mask,
             speaker_features,
             speaker_feature_lengths,
-        )
-        speech_embeds = self.speech_embedding(speech_input_ids)
-        inputs_embeds = torch.cat((prefix_embeds, speech_embeds), dim=1)
-        attention_mask = torch.cat(
-            (prefix_mask, speech_attention_mask), dim=1
         )
 
         outputs = self.backbone(
@@ -246,7 +339,17 @@ class Text2SemanticForCausalLM(PreTrainedModel):
             use_cache=use_cache,
             **kwargs,
         )
-        speech_hidden = outputs.last_hidden_state[:, -speech_input_ids.size(1) :]
+        speech_hidden = outputs.last_hidden_state.new_zeros(
+            speech_input_ids.size(0),
+            speech_input_ids.size(1),
+            outputs.last_hidden_state.size(-1),
+        )
+        for row, speech_start in enumerate(speech_starts):
+            speech_length = int(speech_lengths[row])
+            speech_hidden[row, :speech_length] = outputs.last_hidden_state[
+                row,
+                speech_start : speech_start + speech_length,
+            ]
         logits = self.speech_head(speech_hidden)
         loss = None
         if labels is not None:
@@ -296,22 +399,15 @@ class Text2SemanticForCausalLM(PreTrainedModel):
             batch_size, dtype=torch.bool, device=text_input_ids.device
         )
 
-        prefix_embeds, prefix_mask = self._build_conditioned_prefix(
+        prompt_embeds, attention_mask = self._build_generation_prompt(
             text_input_ids,
             text_attention_mask,
             speaker_features,
             speaker_feature_lengths,
-        )
-        speech_embeds = self.speech_embedding(generated)
-        attention_mask = torch.cat(
-            (
-                prefix_mask,
-                torch.ones_like(generated),
-            ),
-            dim=1,
+            generated,
         )
         output = self.backbone(
-            inputs_embeds=torch.cat((prefix_embeds, speech_embeds), dim=1),
+            inputs_embeds=prompt_embeds,
             attention_mask=attention_mask,
             use_cache=True,
         )

@@ -8,6 +8,7 @@ from transformers import AutoTokenizer
 
 from ..core.models.modeling_text2semantic import Text2SemanticForCausalLM
 from ..semantic_codec import MaskGCTFeatureExtractor
+from ..text_template import tokenize_tts_prompt
 
 
 class Text2SemanticModel:
@@ -71,12 +72,7 @@ class Text2SemanticModel:
                     "ref_audio must be a single path or align with the text batch."
                 )
         encoded = [
-            self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": value}],
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=False,
-            )
+            tokenize_tts_prompt(self.tokenizer, value)
             for value in texts
         ]
         pad_id = self.tokenizer.pad_token_id

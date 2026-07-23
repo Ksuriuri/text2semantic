@@ -73,7 +73,16 @@ uv run accelerate launch finetuning/train.py \
 
 损失只覆盖 semantic codes 和 EOS。文本仅作为 causal prefix，不计算 text LM loss。
 训练时冻结的 W2V-BERT 在线产生可变长 `[T,1024]` 特征；随机初始化且可训练的
-Conformer + Perceiver 将其压缩为 32 个固定 speaker token，并注入文本前缀之前。
+Conformer + Perceiver 将其压缩为 32 个固定 speaker token。文本采用 Fish Speech
+风格的 ChatML：system 指令为 `Speak out the provided text.`，随后是 user 文本和
+assistant generation prompt。模板显式构造，不调用 Qwen3.5 默认 chat template，
+因此不会插入 `<think></think>`；speech BOS 对应 voice 模态起点。
+
+每条训练序列按
+`[speaker_bos][speaker×32][speaker_eos][ChatML text][speech_bos/codes]`
+组织，再在整个序列右侧 padding。批量推理的完整 prompt 改用左 padding，使最后
+一个有效 token 对齐。所有 padding 都由 attention mask 排除，label padding 为
+`-100`。
 训练指标、验证 loss、token accuracy 和 EOS accuracy 写入
 `haoyuanhuang22-jcxy/text2semantic` W&B project。API key 不应写进脚本或提交到仓库。
 
