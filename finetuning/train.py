@@ -3,13 +3,14 @@
 
 import argparse
 import json
-import math
 import os
+import shutil
 from collections import Counter, defaultdict
 
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
+from accelerate.utils import set_seed
 from dotenv import load_dotenv
 from finetuning.dataset import Text2SemanticDataset
 from torch.optim import AdamW
@@ -41,15 +42,25 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--eval_batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=4e-5)
+    parser.add_argument("--new_module_lr", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--adam_beta1", type=float, default=0.9)
+    parser.add_argument("--adam_beta2", type=float, default=0.95)
+    parser.add_argument("--adam_epsilon", type=float, default=1e-8)
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
-    parser.add_argument("--num_epochs", type=int, default=3)
+    parser.add_argument("--max_train_steps", type=int, default=100000)
+    parser.add_argument("--num_epochs", type=int)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--max_text_tokens", type=int)
     parser.add_argument("--max_semantic_tokens", type=int)
     parser.add_argument("--num_workers", type=int, default=0)
-    parser.add_argument("--checkpointing_steps", type=int, default=500)
+    parser.add_argument("--logging_steps", type=int, default=10)
+    parser.add_argument("--eval_steps", type=int, default=10000)
+    parser.add_argument("--checkpointing_steps", type=int, default=1000)
+    parser.add_argument("--checkpoint_total_limit", type=int, default=2)
+    parser.add_argument("--keep_checkpointing_steps", type=int, default=10000)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume_from_checkpoint")
     parser.add_argument("--wandb_run_name")
     parser.add_argument(
@@ -65,8 +76,30 @@ def parse_args():
     args = parser.parse_args()
     if not 0 <= args.warmup_ratio < 1:
         parser.error("--warmup_ratio must be in [0, 1).")
+    if args.max_train_steps <= 0:
+        parser.error("--max_train_steps must be positive.")
+    if args.num_epochs is not None and args.num_epochs <= 0:
+        parser.error("--num_epochs must be positive when set.")
+    if args.lr <= 0:
+        parser.error("--lr must be positive.")
+    if args.new_module_lr <= 0:
+        parser.error("--new_module_lr must be positive.")
+    if not 0 <= args.adam_beta1 < 1:
+        parser.error("--adam_beta1 must be in [0, 1).")
+    if not 0 <= args.adam_beta2 < 1:
+        parser.error("--adam_beta2 must be in [0, 1).")
+    if args.adam_epsilon <= 0:
+        parser.error("--adam_epsilon must be positive.")
     if args.checkpointing_steps <= 0:
         parser.error("--checkpointing_steps must be positive.")
+    if args.checkpoint_total_limit < 0:
+        parser.error("--checkpoint_total_limit must be non-negative.")
+    if args.keep_checkpointing_steps <= 0:
+        parser.error("--keep_checkpointing_steps must be positive.")
+    if args.logging_steps <= 0:
+        parser.error("--logging_steps must be positive.")
+    if args.eval_steps <= 0:
+        parser.error("--eval_steps must be positive.")
     if args.max_ref_seconds <= 0:
         parser.error("--max_ref_seconds must be positive.")
     if args.max_target_seconds <= 0:
@@ -285,9 +318,122 @@ def load_resume_state(accelerator, checkpoint):
     )
 
 
+def parameter_group_name(parameter_name):
+    if parameter_name.startswith("backbone."):
+        return "backbone"
+    return "new_modules"
+
+
+def should_decay_parameter(parameter_name, parameter):
+    if parameter.ndim <= 1:
+        return False
+    lowered = parameter_name.lower()
+    no_decay_terms = ("bias", "norm", "embedding", "embeddings")
+    return not any(term in lowered for term in no_decay_terms)
+
+
+def build_optimizer(model, args):
+    groups = {
+        ("backbone", True): [],
+        ("backbone", False): [],
+        ("new_modules", True): [],
+        ("new_modules", False): [],
+    }
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        group_key = (
+            parameter_group_name(name),
+            should_decay_parameter(name, parameter),
+        )
+        groups[group_key].append(parameter)
+
+    param_groups = []
+    for group_name, lr in (
+        ("backbone", args.lr),
+        ("new_modules", args.new_module_lr),
+    ):
+        for use_decay in (True, False):
+            parameters = groups[(group_name, use_decay)]
+            if not parameters:
+                continue
+            param_groups.append(
+                {
+                    "params": parameters,
+                    "lr": lr,
+                    "weight_decay": args.weight_decay if use_decay else 0.0,
+                    "name": f"{group_name}_{'decay' if use_decay else 'no_decay'}",
+                    "lr_group": group_name,
+                }
+            )
+    return AdamW(
+        param_groups,
+        betas=(args.adam_beta1, args.adam_beta2),
+        eps=args.adam_epsilon,
+    )
+
+
+def learning_rates_by_group(optimizer):
+    lrs = {}
+    for group in optimizer.param_groups:
+        lr_group = group.get("lr_group")
+        if lr_group is None or lr_group in lrs:
+            continue
+        lrs[lr_group] = group["lr"]
+    return lrs
+
+
+def sorted_checkpoints(output_dir, prefix="checkpoint-step-"):
+    if not os.path.isdir(output_dir):
+        return []
+    checkpoints = []
+    for name in os.listdir(output_dir):
+        if not name.startswith(prefix):
+            continue
+        step_text = name[len(prefix) :]
+        if not step_text.isdigit():
+            continue
+        checkpoints.append((int(step_text), os.path.join(output_dir, name)))
+    return [path for _, path in sorted(checkpoints)]
+
+
+def rotate_checkpoints(output_dir, limit):
+    if limit == 0:
+        checkpoints = sorted_checkpoints(output_dir)
+    else:
+        checkpoints = sorted_checkpoints(output_dir)[:-limit]
+    for checkpoint in checkpoints:
+        shutil.rmtree(checkpoint)
+
+
+def run_evaluation(
+    model,
+    eval_dataloader,
+    accelerator,
+    speaker_feature_extractor,
+    max_ref_seconds,
+    global_step,
+):
+    metrics = evaluate(
+        model,
+        eval_dataloader,
+        accelerator,
+        speaker_feature_extractor,
+        max_ref_seconds,
+    )
+    accelerator.log(metrics, step=global_step)
+    accelerator.print(
+        f"Step {global_step} | eval loss {metrics['eval/loss']:.4f} | "
+        f"token acc {metrics['eval/token_accuracy']:.4f} | "
+        f"EOS acc {metrics['eval/eos_accuracy']:.4f}"
+    )
+    return metrics
+
+
 def train():
     args = parse_args()
     load_dotenv()
+    set_seed(args.seed)
     if not os.environ.get("WANDB_API_KEY"):
         raise EnvironmentError(
             "Set WANDB_API_KEY in the environment before launching training."
@@ -346,6 +492,8 @@ def train():
         f"after filtering; eval samples: {len(eval_dataset):,}/"
         f"{eval_dataset.raw_size:,} after filtering"
     )
+    train_generator = torch.Generator()
+    train_generator.manual_seed(args.seed)
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -353,6 +501,7 @@ def train():
         collate_fn=train_dataset.collate_fn,
         num_workers=args.num_workers,
         pin_memory=True,
+        generator=train_generator,
     )
     eval_dataloader = DataLoader(
         eval_dataset,
@@ -371,15 +520,8 @@ def train():
         )
     accelerator.print(f"Full-parameter training: {trainable:,} parameters")
 
-    optimizer = AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
-    updates_per_epoch = math.ceil(
-        len(train_dataloader) / args.gradient_accumulation_steps
-    )
-    total_steps = updates_per_epoch * args.num_epochs
+    optimizer = build_optimizer(model, args)
+    total_steps = args.max_train_steps
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=int(total_steps * args.warmup_ratio),
@@ -428,7 +570,11 @@ def train():
         )
 
     model.train()
-    for epoch in range(start_epoch, args.num_epochs):
+    epoch = start_epoch
+    last_eval_step = 0
+    while global_step < total_steps and (
+        args.num_epochs is None or epoch < args.num_epochs
+    ):
         if epoch == start_epoch and resume_step:
             active_dataloader = accelerator.skip_first_batches(
                 train_dataloader, resume_step
@@ -441,6 +587,8 @@ def train():
             active_dataloader.set_epoch(epoch)
 
         for step, batch in enumerate(active_dataloader, start=first_step):
+            if global_step >= total_steps:
+                break
             batch = add_speaker_features(
                 batch,
                 speaker_feature_extractor,
@@ -459,14 +607,19 @@ def train():
 
             if accelerator.sync_gradients:
                 global_step += 1
-                accelerator.log(
-                    {
+                if global_step % args.logging_steps == 0:
+                    group_lrs = learning_rates_by_group(optimizer)
+                    log_values = {
                         "train/loss": output.loss.detach().float().item(),
-                        "train/lr": scheduler.get_last_lr()[0],
                         "train/epoch": epoch + (step + 1) / len(train_dataloader),
-                    },
-                    step=global_step,
-                )
+                    }
+                    if "backbone" in group_lrs:
+                        log_values["train/lr_backbone"] = group_lrs["backbone"]
+                    if "new_modules" in group_lrs:
+                        log_values["train/lr_new_modules"] = group_lrs[
+                            "new_modules"
+                        ]
+                    accelerator.log(log_values, step=global_step)
                 if global_step % args.checkpointing_steps == 0:
                     save_checkpoint(
                         accelerator,
@@ -480,32 +633,48 @@ def train():
                         step_in_epoch=step + 1,
                         global_step=global_step,
                     )
+                    if accelerator.is_main_process:
+                        rotate_checkpoints(
+                            args.output_model_path, args.checkpoint_total_limit
+                        )
+                    accelerator.wait_for_everyone()
+                if global_step % args.keep_checkpointing_steps == 0:
+                    save_checkpoint(
+                        accelerator,
+                        model,
+                        tokenizer,
+                        os.path.join(
+                            args.output_model_path,
+                            f"checkpoint-keep-step-{global_step}",
+                        ),
+                        epoch=epoch,
+                        step_in_epoch=step + 1,
+                        global_step=global_step,
+                    )
+                if global_step % args.eval_steps == 0:
+                    run_evaluation(
+                        model,
+                        eval_dataloader,
+                        accelerator,
+                        speaker_feature_extractor,
+                        args.max_ref_seconds,
+                        global_step,
+                    )
+                    last_eval_step = global_step
+                if global_step >= total_steps:
+                    break
 
-        metrics = evaluate(
+        resume_step = 0
+        epoch += 1
+    if global_step and global_step != last_eval_step:
+        run_evaluation(
             model,
             eval_dataloader,
             accelerator,
             speaker_feature_extractor,
             args.max_ref_seconds,
+            global_step,
         )
-        accelerator.log(metrics, step=global_step)
-        accelerator.print(
-            f"Epoch {epoch} | eval loss {metrics['eval/loss']:.4f} | "
-            f"token acc {metrics['eval/token_accuracy']:.4f} | "
-            f"EOS acc {metrics['eval/eos_accuracy']:.4f}"
-        )
-        save_checkpoint(
-            accelerator,
-            model,
-            tokenizer,
-            os.path.join(
-                args.output_model_path, f"checkpoint-epoch-{epoch}"
-            ),
-            epoch=epoch + 1,
-            step_in_epoch=0,
-            global_step=global_step,
-        )
-        resume_step = 0
     accelerator.end_training()
 
 

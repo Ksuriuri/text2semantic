@@ -26,8 +26,9 @@ uv pip install flash-attn --no-build-isolation
 
 ## 数据预处理
 
-原始 JSONL 每行需要目标音频和对应文本，可额外提供独立的参考音频。
-没有 `ref_audio` 时会使用目标 `audio` 提取说话人条件：
+原始 JSONL 每行需要目标音频和对应文本，并且必须能提供独立于目标音频的
+speaker reference。可以显式提供 `ref_audio`，或提供 `speaker_id` 让训练集从同一
+speaker 的其他音频中选择参考音频；无法找到独立参考音频的样本会被过滤：
 
 ```json
 {"audio":"./data/utt0001.wav","ref_audio":"./refs/spk1.wav","text":"这是一条训练文本。"}
@@ -67,7 +68,8 @@ uv run accelerate launch finetuning/train.py \
   --output_model_path output \
   --batch_size 2 \
   --lr 4e-5 \
-  --num_epochs 3 \
+  --new_module_lr 2e-4 \
+  --max_train_steps 100000 \
   --gradient_accumulation_steps 4
 ```
 
@@ -83,10 +85,16 @@ assistant generation prompt。模板显式构造，不调用 Qwen3.5 默认 chat
 组织，再在整个序列右侧 padding。批量推理的完整 prompt 改用左 padding，使最后
 一个有效 token 对齐。所有 padding 都由 attention mask 排除，label padding 为
 `-100`。
+Qwen backbone 默认学习率为 `4e-5`；随机初始化的 speech embedding/head、speaker
+encoder、speaker projection 和 speaker boundary embedding 默认使用 `2e-4`。同一个
+cosine warmup scheduler 会分别衰减各参数组的学习率，并保持二者比例。
+
 训练指标、验证 loss、token accuracy 和 EOS accuracy 写入
 `haoyuanhuang22-jcxy/text2semantic` W&B project。API key 不应写进脚本或提交到仓库。
 
-每 500 个 optimizer step 和每个 epoch 保存可恢复 checkpoint。断点续训：
+默认每 1000 个 optimizer step 保存一个可恢复 checkpoint，只保留最新 2 个普通
+`checkpoint-step-*`；每 10000 step 额外保存一个 `checkpoint-keep-step-*`，不会自动删除。
+断点续训：
 
 ```bash
 uv run accelerate launch finetuning/train.py \
@@ -96,7 +104,7 @@ uv run accelerate launch finetuning/train.py \
   --train_jsonl train_semantic.jsonl \
   --eval_jsonl eval_semantic.jsonl \
   --output_model_path output \
-  --resume_from_checkpoint output/checkpoint-step-500
+  --resume_from_checkpoint output/checkpoint-step-1000
 ```
 
 ## 推理

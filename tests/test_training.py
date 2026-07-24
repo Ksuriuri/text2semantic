@@ -1,4 +1,5 @@
 import json
+import os
 
 import torch
 from accelerate import Accelerator
@@ -9,12 +10,16 @@ from transformers import Qwen3_5TextConfig
 
 from finetuning.train import (
     add_speaker_features,
+    build_optimizer,
     evaluate,
     load_resume_state,
+    learning_rates_by_group,
     parse_args,
+    rotate_checkpoints,
     save_checkpoint,
     speaker_key,
     speaker_statistics,
+    sorted_checkpoints,
 )
 from qwen_tts.core.models import (
     Text2SemanticConfig,
@@ -45,6 +50,15 @@ def test_parse_args_defaults_match_dataset_limits(monkeypatch):
     )
     args = parse_args()
     assert args.lr == 4e-5
+    assert args.new_module_lr == 2e-4
+    assert args.max_train_steps == 100000
+    assert args.num_epochs is None
+    assert args.logging_steps == 10
+    assert args.eval_steps == 10000
+    assert args.checkpointing_steps == 1000
+    assert args.checkpoint_total_limit == 2
+    assert args.keep_checkpointing_steps == 10000
+    assert args.seed == 42
     assert args.max_ref_seconds == 20.0
     assert args.max_target_seconds == 30.0
     assert args.min_speaker_records == 2
@@ -147,6 +161,53 @@ def test_accelerator_checkpoint_restores_full_training_state(tmp_path):
     assert torch.equal(next(model.parameters()).detach(), original)
     assert (tmp_path / "accelerator_state").is_dir()
     assert (tmp_path / "trainer_state.json").is_file()
+
+
+def test_optimizer_uses_lr_groups_and_no_decay_defaults(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "train.py",
+            "--train_jsonl",
+            "train.jsonl",
+            "--eval_jsonl",
+            "eval.jsonl",
+            "--w2v_bert_path",
+            "w2v",
+            "--stats_path",
+            "stats.pt",
+        ],
+    )
+    args = parse_args()
+    optimizer = build_optimizer(tiny_model(), args)
+    group_names = {group["name"] for group in optimizer.param_groups}
+
+    assert group_names == {
+        "backbone_decay",
+        "backbone_no_decay",
+        "new_modules_decay",
+        "new_modules_no_decay",
+    }
+    assert learning_rates_by_group(optimizer) == {
+        "backbone": 4e-5,
+        "new_modules": 2e-4,
+    }
+    assert any(group["weight_decay"] == 0 for group in optimizer.param_groups)
+    assert any(group["weight_decay"] == 0.01 for group in optimizer.param_groups)
+
+
+def test_rotate_checkpoints_keeps_latest_regular_steps(tmp_path):
+    for step in (1000, 2000, 3000, 4000):
+        (tmp_path / f"checkpoint-step-{step}").mkdir()
+    (tmp_path / "checkpoint-keep-step-4000").mkdir()
+
+    rotate_checkpoints(tmp_path, limit=2)
+
+    assert [os.path.basename(path) for path in sorted_checkpoints(tmp_path)] == [
+        "checkpoint-step-3000",
+        "checkpoint-step-4000",
+    ]
+    assert (tmp_path / "checkpoint-keep-step-4000").is_dir()
 
 
 def test_evaluation_reports_semantic_and_eos_metrics():

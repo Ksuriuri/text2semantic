@@ -83,6 +83,8 @@ class Text2SemanticDataset(Dataset):
         return paths_by_id
 
     def _is_usable(self, item):
+        if self._speaker_audio_path(item) is None:
+            return False
         speaker_key = self._speaker_key(item)
         if (
             speaker_key is not None
@@ -153,16 +155,16 @@ class Text2SemanticDataset(Dataset):
 
     def _speaker_audio_path(self, item):
         explicit = item.get("ref_audio") or item.get("ref_audio_path")
-        if explicit is not None:
-            return explicit
         target_audio_path = self._target_audio_path(item)
+        if explicit is not None:
+            return explicit if explicit != target_audio_path else None
         speaker_key = self._speaker_key(item)
         if speaker_key is None:
-            return target_audio_path
+            return None
         for audio_path in self.speaker_audio_paths_by_id.get(speaker_key, ()):
             if audio_path != target_audio_path:
                 return audio_path
-        return target_audio_path
+        return None
 
     def _semantic_codes(self, item):
         if "semantic_codes" in item:

@@ -87,9 +87,15 @@ def test_dataset_alignment_and_mask():
                 "audio": "target-1.wav",
                 "ref_audio": "ref-1.wav",
                 "text": "hello",
+                "speaker_id": "speaker-a",
                 "semantic_codes": [3, 4],
             },
-            {"audio": "target-2.wav", "text": "x", "semantic_codes": [5]},
+            {
+                "audio": "target-2.wav",
+                "text": "x",
+                "speaker_id": "speaker-a",
+                "semantic_codes": [5],
+            },
         ],
         DummyTokenizer(),
         speech_bos_token_id=8192,
@@ -108,7 +114,7 @@ def test_dataset_alignment_and_mask():
     assert batch["speech_attention_mask"].tolist() == [[1, 1, 1], [1, 1, 0]]
     assert batch["text_input_ids"].tolist() == [[2, 3], [2, 0]]
     assert batch["text_attention_mask"].tolist() == [[1, 1], [1, 0]]
-    assert batch["speaker_audio_paths"] == ["ref-1.wav", "target-2.wav"]
+    assert batch["speaker_audio_paths"] == ["ref-1.wav", "target-1.wav"]
 
 
 def test_dataset_reads_compact_codes_and_filters_speakers_and_duration(tmp_path):
@@ -166,6 +172,7 @@ def test_dataset_filters_overlong_semantic_targets_instead_of_truncating():
             [
                 {
                     "audio": "target.wav",
+                    "ref_audio": "ref.wav",
                     "text": "hello",
                     "semantic_codes": [3, 4, 5],
                 }
@@ -184,6 +191,7 @@ def test_dataset_rejects_out_of_bounds_compact_code_ranges(tmp_path):
         [
             {
                 "audio": "target.wav",
+                "ref_audio": "ref.wav",
                 "text": "hello",
                 "semantic_code_path": str(code_path),
                 "semantic_code_offset": 1,
@@ -195,6 +203,32 @@ def test_dataset_rejects_out_of_bounds_compact_code_ranges(tmp_path):
 
     with pytest.raises(ValueError, match="out of bounds"):
         dataset[0]
+
+
+def test_dataset_filters_samples_without_independent_reference():
+    with pytest.raises(ValueError, match="No usable samples"):
+        Text2SemanticDataset(
+            [
+                {
+                    "audio": "target.wav",
+                    "text": "no speaker reference",
+                    "semantic_codes": [3, 4],
+                },
+                {
+                    "audio": "same.wav",
+                    "ref_audio": "same.wav",
+                    "text": "explicit target leak",
+                    "semantic_codes": [5, 6],
+                },
+                {
+                    "audio": "only.wav",
+                    "text": "single speaker",
+                    "speaker_id": "speaker-a",
+                    "semantic_codes": [7, 8],
+                },
+            ],
+            DummyTokenizer(),
+        )
 
 
 def test_forward_backward_and_independent_speech_parameters():

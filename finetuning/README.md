@@ -6,7 +6,7 @@ Raw JSONL:
 
 ```jsonl
 {"audio":"./data/utt0001.wav","ref_audio":"./refs/spk1.wav","text":"其实我很善于观察别人的情绪。"}
-{"audio":"./data/utt0002.wav","text":"She said she would be here by noon."}
+{"audio":"./data/utt0002.wav","speaker_id":"spk1","text":"She said she would be here by noon."}
 ```
 
 Prepared JSONL:
@@ -16,8 +16,10 @@ Prepared JSONL:
 ```
 
 `semantic_codes` must be a non-empty one-dimensional list with values in
-`[0, 8191]`. `ref_audio` is the preferred speaker reference and falls back to
-`audio` when omitted. Legacy 16-layer `audio_codes` are not used.
+`[0, 8191]`. `ref_audio` is the preferred speaker reference. When it is
+omitted, training chooses a different utterance from the same `speaker_id`.
+Samples without an independent reference audio are filtered. Legacy 16-layer
+`audio_codes` are not used.
 
 ### Extract semantic labels
 
@@ -65,9 +67,10 @@ uv run accelerate launch finetuning/train.py \
   --output_model_path output \
   --batch_size 2 \
   --lr 4e-5 \
+  --new_module_lr 2e-4 \
   --weight_decay 0.01 \
   --warmup_ratio 0.03 \
-  --num_epochs 3 \
+  --max_train_steps 100000 \
   --gradient_accumulation_steps 4
 ```
 
@@ -101,6 +104,11 @@ Gradient checkpointing is enabled by default. Use
 `--no-gradient_checkpointing` only when memory allows it. If FlashAttention 2
 is unavailable, pass `--attn_implementation sdpa`.
 
+The Qwen backbone uses `--lr` and the randomly initialized speech/speaker
+modules use `--new_module_lr`. The cosine warmup scheduler decays each
+parameter group's own learning rate, so the default `4e-5` and `2e-4` rates
+decay together while keeping their ratio.
+
 Training loss/LR and validation loss, semantic-token accuracy, and EOS accuracy
 are logged to the `text2semantic` project under the
 `haoyuanhuang22-jcxy` W&B entity.
@@ -121,5 +129,9 @@ uv run accelerate launch finetuning/train.py \
   --train_jsonl train_semantic.jsonl \
   --eval_jsonl eval_semantic.jsonl \
   --output_model_path output \
-  --resume_from_checkpoint output/checkpoint-step-500
+  --resume_from_checkpoint output/checkpoint-step-1000
 ```
+
+By default, resumable `checkpoint-step-*` directories are saved every 1000
+optimizer steps and only the latest two are retained. Every 10000 steps,
+`checkpoint-keep-step-*` is also saved and is not rotated.
