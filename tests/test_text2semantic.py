@@ -1,3 +1,6 @@
+from array import array
+
+import pytest
 import torch
 from torch import nn
 from transformers import BatchFeature, Qwen3_5TextConfig
@@ -55,7 +58,7 @@ def tiny_model():
         semantic_vocab_size=16,
         speech_bos_token_id=16,
         speech_eos_token_id=17,
-        speech_pad_token_id=17,
+        speech_pad_token_id=18,
         speaker_input_dim=8,
         speaker_conformer_output_size=8,
         speaker_conformer_linear_units=16,
@@ -91,11 +94,12 @@ def test_dataset_alignment_and_mask():
         DummyTokenizer(),
         speech_bos_token_id=8192,
         speech_eos_token_id=8193,
+        speech_pad_token_id=8194,
     )
     batch = dataset.collate_fn([dataset[0], dataset[1]])
     assert batch["speech_input_ids"].tolist() == [
         [8192, 3, 4],
-        [8192, 5, 8193],
+        [8192, 5, 8194],
     ]
     assert batch["labels"].tolist() == [
         [3, 4, 8193],
@@ -107,6 +111,92 @@ def test_dataset_alignment_and_mask():
     assert batch["speaker_audio_paths"] == ["ref-1.wav", "target-2.wav"]
 
 
+def test_dataset_reads_compact_codes_and_filters_speakers_and_duration(tmp_path):
+    code_path = tmp_path / "codes.bin"
+    with open(code_path, "wb") as handle:
+        array("H", [3, 4, 5, 6, 7, 8]).tofile(handle)
+
+    dataset = Text2SemanticDataset(
+        [
+            {
+                "audio_path": "target-1.wav",
+                "text": "hello",
+                "speaker_id": "speaker-a",
+                "duration": 10.0,
+                "semantic_code_path": str(code_path),
+                "semantic_code_offset": 1,
+                "semantic_code_length": 2,
+            },
+            {
+                "audio_path": "prompt-only.wav",
+                "text": "too long",
+                "speaker_id": "speaker-a",
+                "duration": 31.0,
+                "semantic_code_path": str(code_path),
+                "semantic_code_offset": 3,
+                "semantic_code_length": 1,
+            },
+            {
+                "audio_path": "single-speaker.wav",
+                "text": "skip",
+                "speaker_id": "speaker-b",
+                "duration": 5.0,
+                "semantic_code_path": str(code_path),
+                "semantic_code_offset": 4,
+                "semantic_code_length": 1,
+            },
+        ],
+        DummyTokenizer(),
+        semantic_vocab_size=16,
+        speech_bos_token_id=16,
+        speech_eos_token_id=17,
+        speech_pad_token_id=18,
+    )
+
+    assert len(dataset) == 1
+    batch = dataset.collate_fn([dataset[0]])
+    assert batch["speech_input_ids"].tolist() == [[16, 4, 5]]
+    assert batch["labels"].tolist() == [[4, 5, 17]]
+    assert batch["speaker_audio_paths"] == ["prompt-only.wav"]
+
+
+def test_dataset_filters_overlong_semantic_targets_instead_of_truncating():
+    with pytest.raises(ValueError, match="No usable samples"):
+        Text2SemanticDataset(
+            [
+                {
+                    "audio": "target.wav",
+                    "text": "hello",
+                    "semantic_codes": [3, 4, 5],
+                }
+            ],
+            DummyTokenizer(),
+            max_semantic_tokens=2,
+        )
+
+
+def test_dataset_rejects_out_of_bounds_compact_code_ranges(tmp_path):
+    code_path = tmp_path / "codes.bin"
+    with open(code_path, "wb") as handle:
+        array("H", [3, 4]).tofile(handle)
+
+    dataset = Text2SemanticDataset(
+        [
+            {
+                "audio": "target.wav",
+                "text": "hello",
+                "semantic_code_path": str(code_path),
+                "semantic_code_offset": 1,
+                "semantic_code_length": 3,
+            }
+        ],
+        DummyTokenizer(),
+    )
+
+    with pytest.raises(ValueError, match="out of bounds"):
+        dataset[0]
+
+
 def test_forward_backward_and_independent_speech_parameters():
     model = tiny_model()
     output = model(
@@ -115,7 +205,7 @@ def test_forward_backward_and_independent_speech_parameters():
         labels=torch.tensor([[4, 5, 17]]),
         **speaker_inputs(),
     )
-    assert output.logits.shape == (1, 3, 18)
+    assert output.logits.shape == (1, 3, 19)
     output.loss.backward()
     assert model.speech_embedding.weight.grad is not None
     assert model.speech_head.weight.grad is not None
@@ -134,7 +224,7 @@ def test_generation_stops_at_eos():
 
     class EosHead(nn.Module):
         def forward(self, hidden):
-            logits = torch.full((*hidden.shape[:-1], 18), -100.0)
+            logits = torch.full((*hidden.shape[:-1], 19), -100.0)
             logits[..., 17] = 100.0
             return logits
 
@@ -146,6 +236,26 @@ def test_generation_stops_at_eos():
         **speaker_inputs(),
     )
     assert len(generated) == 1
+    assert generated[0].numel() == 0
+
+
+def test_generation_never_emits_pad_token():
+    model = tiny_model()
+
+    class PadBiasedHead(nn.Module):
+        def forward(self, hidden):
+            logits = torch.full((*hidden.shape[:-1], 19), -100.0)
+            logits[..., 18] = 100.0
+            logits[..., 17] = 90.0
+            return logits
+
+    model.speech_head = PadBiasedHead()
+    generated = model.generate_semantic(
+        torch.tensor([[2, 3]]),
+        max_new_tokens=5,
+        do_sample=False,
+        **speaker_inputs(),
+    )
     assert generated[0].numel() == 0
 
 
@@ -174,7 +284,7 @@ def test_training_right_padding_and_generation_left_padding():
     _, training_mask, _, _ = model._build_training_inputs(
         torch.tensor([[2, 3, 0], [4, 5, 6]]),
         torch.tensor([[1, 1, 0], [1, 1, 1]]),
-        torch.tensor([[16, 4, 17], [16, 5, 6]]),
+        torch.tensor([[16, 4, 18], [16, 5, 6]]),
         torch.tensor([[1, 1, 0], [1, 1, 1]]),
         features,
         lengths,
@@ -186,16 +296,16 @@ def test_training_right_padding_and_generation_left_padding():
     output = model(
         text_input_ids=torch.tensor([[2, 3, 0], [4, 5, 6]]),
         text_attention_mask=torch.tensor([[1, 1, 0], [1, 1, 1]]),
-        speech_input_ids=torch.tensor([[16, 4, 17], [16, 5, 6]]),
+        speech_input_ids=torch.tensor([[16, 4, 18], [16, 5, 6]]),
         speech_attention_mask=torch.tensor([[1, 1, 0], [1, 1, 1]]),
         labels=torch.tensor([[4, 17, -100], [5, 6, 17]]),
         speaker_features=features,
         speaker_feature_lengths=lengths,
     )
-    assert output.logits.shape == (2, 3, 18)
+    assert output.logits.shape == (2, 3, 19)
     assert torch.count_nonzero(output.logits[0, 2]) == 0
 
-    _, generation_mask = model._build_generation_prompt(
+    _, generation_mask, generation_position_ids = model._build_generation_prompt(
         torch.tensor([[2, 3, 0], [4, 5, 6]]),
         torch.tensor([[1, 1, 0], [1, 1, 1]]),
         features,
@@ -205,6 +315,10 @@ def test_training_right_padding_and_generation_left_padding():
     assert generation_mask.tolist() == [
         [0, 1, 1, 1, 1, 1, 1, 1],
         [1, 1, 1, 1, 1, 1, 1, 1],
+    ]
+    assert generation_position_ids.tolist() == [
+        [0, 0, 1, 2, 3, 4, 5, 6],
+        [0, 1, 2, 3, 4, 5, 6, 7],
     ]
 
 

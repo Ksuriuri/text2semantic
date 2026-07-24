@@ -11,7 +11,7 @@ MaskGCT RepCodec 的离散 semantic index，不预测后续 acoustic codebook，
 - semantic codec 只用于离线生成 `[0, 8191]` 的整数标签；
 - 参考音频经冻结 W2V-BERT layer 17 和可训练 Conformer + Perceiver
   压缩为固定 `[32, 1280]` speaker latent；
-- speech 词表为 `0..8191`、`BOS=8192`、`EOS/PAD=8193`；
+- speech 词表为 `0..8191`、`BOS=8192`、`EOS=8193`、`PAD=8194`；
 - checkpoint 包含 speaker encoder，不包含 W2V-BERT、codec codebook 或 acoustic predictor。
 
 ## 安装
@@ -66,7 +66,7 @@ uv run accelerate launch finetuning/train.py \
   --eval_jsonl eval_semantic.jsonl \
   --output_model_path output \
   --batch_size 2 \
-  --lr 2e-6 \
+  --lr 4e-5 \
   --num_epochs 3 \
   --gradient_accumulation_steps 4
 ```

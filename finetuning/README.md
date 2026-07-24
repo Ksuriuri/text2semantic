@@ -64,7 +64,7 @@ uv run accelerate launch finetuning/train.py \
   --eval_jsonl eval_semantic.jsonl \
   --output_model_path output \
   --batch_size 2 \
-  --lr 2e-6 \
+  --lr 4e-5 \
   --weight_decay 0.01 \
   --warmup_ratio 0.03 \
   --num_epochs 3 \
@@ -72,7 +72,7 @@ uv run accelerate launch finetuning/train.py \
 ```
 
 The Qwen3.5 backbone is loaded from pretrained weights. The independent
-8194-entry speech embedding, 8194-class output head, and IndexTTS2-style
+8195-entry speech embedding, 8195-class output head, and IndexTTS2-style
 Conformer + Perceiver speaker encoder are random and trainable. A frozen
 W2V-BERT layer 17 front end runs online in FP32 and the speaker encoder maps
 its variable `[B,T,1024]` output to fixed `[B,32,1280]` latents. After

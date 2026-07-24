@@ -5,6 +5,7 @@ import argparse
 import json
 import math
 import os
+from collections import Counter, defaultdict
 
 import torch
 import torch.nn.functional as F
@@ -34,10 +35,12 @@ def parse_args():
     parser.add_argument("--eval_jsonl", required=True)
     parser.add_argument("--w2v_bert_path", required=True)
     parser.add_argument("--stats_path", required=True)
-    parser.add_argument("--max_ref_seconds", type=float, default=15.0)
+    parser.add_argument("--max_ref_seconds", type=float, default=20.0)
+    parser.add_argument("--max_target_seconds", type=float, default=30.0)
+    parser.add_argument("--min_speaker_records", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--eval_batch_size", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=2e-6)
+    parser.add_argument("--lr", type=float, default=4e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
     parser.add_argument("--num_epochs", type=int, default=3)
@@ -66,6 +69,10 @@ def parse_args():
         parser.error("--checkpointing_steps must be positive.")
     if args.max_ref_seconds <= 0:
         parser.error("--max_ref_seconds must be positive.")
+    if args.max_target_seconds <= 0:
+        parser.error("--max_target_seconds must be positive.")
+    if args.min_speaker_records < 1:
+        parser.error("--min_speaker_records must be positive.")
     return args
 
 
@@ -86,15 +93,57 @@ def read_jsonl(path):
     return samples
 
 
-def build_dataset(path, tokenizer, model_config, args):
+def target_audio_path(item):
+    return item.get("audio") or item.get("audio_path")
+
+
+def speaker_key(item):
+    speaker_id = item.get("speaker_id")
+    if speaker_id is None:
+        return None
+    language = item.get("language") or item.get("lang")
+    return language, speaker_id
+
+
+def speaker_statistics(*datasets):
+    speaker_counts = Counter()
+    speaker_audio_paths = defaultdict(list)
+    for data in datasets:
+        for item in data:
+            key = speaker_key(item)
+            if key is None:
+                continue
+            speaker_counts[key] += 1
+            audio_path = target_audio_path(item)
+            if (
+                audio_path is not None
+                and audio_path not in speaker_audio_paths[key]
+            ):
+                speaker_audio_paths[key].append(audio_path)
+    return dict(speaker_counts), dict(speaker_audio_paths)
+
+
+def build_dataset(
+    data,
+    tokenizer,
+    model_config,
+    args,
+    speaker_counts,
+    speaker_audio_paths,
+):
     return Text2SemanticDataset(
-        read_jsonl(path),
+        data,
         tokenizer,
         semantic_vocab_size=model_config.semantic_vocab_size,
         speech_bos_token_id=model_config.speech_bos_token_id,
         speech_eos_token_id=model_config.speech_eos_token_id,
+        speech_pad_token_id=model_config.speech_pad_token_id,
         max_text_tokens=args.max_text_tokens,
         max_semantic_tokens=args.max_semantic_tokens,
+        speaker_counts=speaker_counts,
+        speaker_audio_paths_by_id=speaker_audio_paths,
+        min_speaker_records=args.min_speaker_records,
+        max_target_seconds=args.max_target_seconds,
     )
 
 
@@ -121,7 +170,7 @@ def evaluate(
     dataloader,
     accelerator,
     feature_extractor=None,
-    max_ref_seconds=15.0,
+    max_ref_seconds=20.0,
 ):
     model.eval()
     totals = torch.zeros(5, dtype=torch.float64, device=accelerator.device)
@@ -268,11 +317,34 @@ def train():
         model.gradient_checkpointing_enable()
         model.config.use_cache = False
 
+    train_data = read_jsonl(args.train_jsonl)
+    eval_data = read_jsonl(args.eval_jsonl)
+    train_speaker_counts, train_speaker_audio_paths = speaker_statistics(
+        train_data
+    )
+    eval_speaker_counts, eval_speaker_audio_paths = speaker_statistics(
+        eval_data
+    )
     train_dataset = build_dataset(
-        args.train_jsonl, tokenizer, model.config, args
+        train_data,
+        tokenizer,
+        model.config,
+        args,
+        train_speaker_counts,
+        train_speaker_audio_paths,
     )
     eval_dataset = build_dataset(
-        args.eval_jsonl, tokenizer, model.config, args
+        eval_data,
+        tokenizer,
+        model.config,
+        args,
+        eval_speaker_counts,
+        eval_speaker_audio_paths,
+    )
+    accelerator.print(
+        f"Train samples: {len(train_dataset):,}/{train_dataset.raw_size:,} "
+        f"after filtering; eval samples: {len(eval_dataset):,}/"
+        f"{eval_dataset.raw_size:,} after filtering"
     )
     train_dataloader = DataLoader(
         train_dataset,
@@ -365,6 +437,8 @@ def train():
         else:
             active_dataloader = train_dataloader
             first_step = 0
+        if hasattr(active_dataloader, "set_epoch"):
+            active_dataloader.set_epoch(epoch)
 
         for step, batch in enumerate(active_dataloader, start=first_step):
             batch = add_speaker_features(

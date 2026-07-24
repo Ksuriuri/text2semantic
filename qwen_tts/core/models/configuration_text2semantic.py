@@ -15,7 +15,7 @@ class Text2SemanticConfig(PretrainedConfig):
         semantic_vocab_size=8192,
         speech_bos_token_id=8192,
         speech_eos_token_id=8193,
-        speech_pad_token_id=8193,
+        speech_pad_token_id=8194,
         initializer_range=0.02,
         codec_name="maskgct_repcodec",
         codec_frame_rate=50,
@@ -42,7 +42,7 @@ class Text2SemanticConfig(PretrainedConfig):
         )
         self.qwen_config = qwen_config or {}
         self.semantic_vocab_size = semantic_vocab_size
-        self.speech_vocab_size = semantic_vocab_size + 2
+        self.speech_vocab_size = semantic_vocab_size + 3
         self.speech_bos_token_id = speech_bos_token_id
         self.speech_eos_token_id = speech_eos_token_id
         self.speech_pad_token_id = speech_pad_token_id

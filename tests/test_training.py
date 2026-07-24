@@ -11,7 +11,10 @@ from finetuning.train import (
     add_speaker_features,
     evaluate,
     load_resume_state,
+    parse_args,
     save_checkpoint,
+    speaker_key,
+    speaker_statistics,
 )
 from qwen_tts.core.models import (
     Text2SemanticConfig,
@@ -23,6 +26,60 @@ class SavingTokenizer:
     def save_pretrained(self, path):
         with open(path / "tokenizer_config.json", "w", encoding="utf-8") as handle:
             json.dump({"test": True}, handle)
+
+
+def test_parse_args_defaults_match_dataset_limits(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "train.py",
+            "--train_jsonl",
+            "train.jsonl",
+            "--eval_jsonl",
+            "eval.jsonl",
+            "--w2v_bert_path",
+            "w2v",
+            "--stats_path",
+            "stats.pt",
+        ],
+    )
+    args = parse_args()
+    assert args.lr == 4e-5
+    assert args.max_ref_seconds == 20.0
+    assert args.max_target_seconds == 30.0
+    assert args.min_speaker_records == 2
+
+
+def test_speaker_statistics_are_split_local():
+    train_counts, train_paths = speaker_statistics(
+        [
+            {
+                "speaker_id": "speaker-a",
+                "language": "en",
+                "audio_path": "train-en.wav",
+            },
+            {
+                "speaker_id": "speaker-a",
+                "language": "zh",
+                "audio_path": "train-zh.wav",
+            },
+        ]
+    )
+    eval_counts, eval_paths = speaker_statistics(
+        [{"speaker_id": "speaker-a", "language": "en", "audio_path": "eval.wav"}]
+    )
+
+    assert speaker_key({"speaker_id": "speaker-a", "language": "en"}) == (
+        "en",
+        "speaker-a",
+    )
+    assert train_counts == {("en", "speaker-a"): 1, ("zh", "speaker-a"): 1}
+    assert train_paths == {
+        ("en", "speaker-a"): ["train-en.wav"],
+        ("zh", "speaker-a"): ["train-zh.wav"],
+    }
+    assert eval_counts == {("en", "speaker-a"): 1}
+    assert eval_paths == {("en", "speaker-a"): ["eval.wav"]}
 
 
 def tiny_model():
@@ -48,7 +105,7 @@ def tiny_model():
             semantic_vocab_size=16,
             speech_bos_token_id=16,
             speech_eos_token_id=17,
-            speech_pad_token_id=17,
+            speech_pad_token_id=18,
             speaker_input_dim=8,
             speaker_conformer_output_size=8,
             speaker_conformer_linear_units=16,

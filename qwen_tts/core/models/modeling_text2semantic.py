@@ -110,7 +110,7 @@ class Text2SemanticForCausalLM(PreTrainedModel):
             semantic_vocab_size=semantic_vocab_size,
             speech_bos_token_id=semantic_vocab_size,
             speech_eos_token_id=semantic_vocab_size + 1,
-            speech_pad_token_id=semantic_vocab_size + 1,
+            speech_pad_token_id=semantic_vocab_size + 2,
             initializer_range=initializer_range,
             codec_name=codec_name,
             codec_frame_rate=codec_frame_rate,
@@ -118,6 +118,11 @@ class Text2SemanticForCausalLM(PreTrainedModel):
         model = cls(config)
         model.backbone = backbone
         return model
+
+    @staticmethod
+    def _position_ids_from_attention_mask(attention_mask):
+        position_ids = attention_mask.long().cumsum(dim=1) - 1
+        return position_ids.masked_fill(attention_mask.eq(0), 0)
 
     def get_input_embeddings(self):
         return self.backbone.get_input_embeddings()
@@ -297,7 +302,8 @@ class Text2SemanticForCausalLM(PreTrainedModel):
             padding = max_prompt_length - sequence.size(0)
             prompt_embeds[row, padding:] = sequence
             prompt_mask[row, padding:] = 1
-        return prompt_embeds, prompt_mask
+        position_ids = self._position_ids_from_attention_mask(prompt_mask)
+        return prompt_embeds, prompt_mask, position_ids
 
     def forward(
         self,
@@ -399,7 +405,7 @@ class Text2SemanticForCausalLM(PreTrainedModel):
             batch_size, dtype=torch.bool, device=text_input_ids.device
         )
 
-        prompt_embeds, attention_mask = self._build_generation_prompt(
+        prompt_embeds, attention_mask, position_ids = self._build_generation_prompt(
             text_input_ids,
             text_attention_mask,
             speaker_features,
@@ -409,6 +415,7 @@ class Text2SemanticForCausalLM(PreTrainedModel):
         output = self.backbone(
             inputs_embeds=prompt_embeds,
             attention_mask=attention_mask,
+            position_ids=position_ids,
             use_cache=True,
         )
         past_key_values = output.past_key_values
@@ -416,8 +423,9 @@ class Text2SemanticForCausalLM(PreTrainedModel):
 
         for _ in range(max_new_tokens):
             next_logits = next_logits / temperature
-            # BOS is an input-only control token and must never be emitted.
+            # BOS/PAD are input-only control tokens and must never be emitted.
             next_logits[:, self.config.speech_bos_token_id] = -torch.inf
+            next_logits[:, self.config.speech_pad_token_id] = -torch.inf
             if top_k > 0:
                 k = min(top_k, next_logits.size(-1))
                 threshold = torch.topk(next_logits, k, dim=-1).values[:, -1:]
@@ -444,9 +452,11 @@ class Text2SemanticForCausalLM(PreTrainedModel):
             attention_mask = torch.cat(
                 (attention_mask, torch.ones_like(next_token)), dim=1
             )
+            position_ids = attention_mask.sum(dim=1, keepdim=True) - 1
             output = self.backbone(
                 inputs_embeds=self.speech_embedding(next_token),
                 attention_mask=attention_mask,
+                position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=True,
             )

@@ -1,6 +1,7 @@
 # Copyright 2026
 # SPDX-License-Identifier: Apache-2.0
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 
@@ -18,16 +19,99 @@ class Text2SemanticDataset(Dataset):
         semantic_vocab_size=8192,
         speech_bos_token_id=8192,
         speech_eos_token_id=8193,
+        speech_pad_token_id=8194,
         max_text_tokens=None,
         max_semantic_tokens=None,
+        speaker_counts=None,
+        speaker_audio_paths_by_id=None,
+        min_speaker_records=2,
+        max_target_seconds=30.0,
     ):
-        self.data = data
+        self.raw_size = len(data)
         self.tokenizer = tokenizer
         self.semantic_vocab_size = semantic_vocab_size
         self.speech_bos_token_id = speech_bos_token_id
         self.speech_eos_token_id = speech_eos_token_id
+        self.speech_pad_token_id = speech_pad_token_id
         self.max_text_tokens = max_text_tokens
         self.max_semantic_tokens = max_semantic_tokens
+        self.speaker_counts = speaker_counts or self._count_speakers(data)
+        self.speaker_audio_paths_by_id = (
+            speaker_audio_paths_by_id
+            or self._collect_speaker_audio_paths(data)
+        )
+        self.min_speaker_records = min_speaker_records
+        self.max_target_seconds = max_target_seconds
+        self._semantic_code_cache = {}
+        self.data = [item for item in data if self._is_usable(item)]
+        if not self.data:
+            raise ValueError("No usable samples remain after dataset filtering.")
+        self.filtered_size = self.raw_size - len(self.data)
+
+    @staticmethod
+    def _target_audio_path(item):
+        return item.get("audio") or item.get("audio_path")
+
+    @staticmethod
+    def _speaker_key(item):
+        speaker_id = item.get("speaker_id")
+        if speaker_id is None:
+            return None
+        language = item.get("language") or item.get("lang")
+        return language, speaker_id
+
+    @staticmethod
+    def _count_speakers(data):
+        counts = {}
+        for item in data:
+            speaker_key = Text2SemanticDataset._speaker_key(item)
+            if speaker_key is not None:
+                counts[speaker_key] = counts.get(speaker_key, 0) + 1
+        return counts
+
+    @classmethod
+    def _collect_speaker_audio_paths(cls, data):
+        paths_by_id = {}
+        for item in data:
+            speaker_key = cls._speaker_key(item)
+            audio_path = cls._target_audio_path(item)
+            if speaker_key is None or audio_path is None:
+                continue
+            paths_by_id.setdefault(speaker_key, [])
+            if audio_path not in paths_by_id[speaker_key]:
+                paths_by_id[speaker_key].append(audio_path)
+        return paths_by_id
+
+    def _is_usable(self, item):
+        speaker_key = self._speaker_key(item)
+        if (
+            speaker_key is not None
+            and self.speaker_counts.get(speaker_key, 0) < self.min_speaker_records
+        ):
+            return False
+        duration = item.get("duration")
+        if (
+            duration is not None
+            and self.max_target_seconds is not None
+            and float(duration) > self.max_target_seconds
+        ):
+            return False
+        semantic_length = self._semantic_length(item)
+        if (
+            semantic_length is not None
+            and self.max_semantic_tokens is not None
+            and semantic_length > self.max_semantic_tokens
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _semantic_length(item):
+        if "semantic_codes" in item:
+            return len(item["semantic_codes"])
+        if "semantic_code_length" in item:
+            return int(item["semantic_code_length"])
+        return None
 
     def __len__(self):
         return len(self.data)
@@ -42,15 +126,14 @@ class Text2SemanticDataset(Dataset):
 
     def __getitem__(self, index):
         item = self.data[index]
-        if "text" not in item or "semantic_codes" not in item:
-            raise ValueError("Each sample needs 'text' and 'semantic_codes'.")
-        speaker_audio_path = item.get("ref_audio") or item.get("audio")
+        if "text" not in item:
+            raise ValueError("Each sample needs 'text'.")
+        speaker_audio_path = self._speaker_audio_path(item)
         if speaker_audio_path is None:
-            raise ValueError("Each sample needs 'ref_audio' or 'audio'.")
-        codes = item["semantic_codes"]
-        if self.max_semantic_tokens is not None:
-            codes = codes[: self.max_semantic_tokens]
-        codes = torch.tensor(codes, dtype=torch.long)
+            raise ValueError(
+                "Each sample needs 'ref_audio', 'audio', or 'audio_path'."
+            )
+        codes = self._semantic_codes(item)
         if codes.numel() == 0:
             raise ValueError("semantic_codes must not be empty.")
         if int(codes.min()) < 0 or int(codes.max()) >= self.semantic_vocab_size:
@@ -68,6 +151,46 @@ class Text2SemanticDataset(Dataset):
             "speaker_audio_path": speaker_audio_path,
         }
 
+    def _speaker_audio_path(self, item):
+        explicit = item.get("ref_audio") or item.get("ref_audio_path")
+        if explicit is not None:
+            return explicit
+        target_audio_path = self._target_audio_path(item)
+        speaker_key = self._speaker_key(item)
+        if speaker_key is None:
+            return target_audio_path
+        for audio_path in self.speaker_audio_paths_by_id.get(speaker_key, ()):
+            if audio_path != target_audio_path:
+                return audio_path
+        return target_audio_path
+
+    def _semantic_codes(self, item):
+        if "semantic_codes" in item:
+            return torch.tensor(item["semantic_codes"], dtype=torch.long)
+        required = (
+            "semantic_code_path",
+            "semantic_code_offset",
+            "semantic_code_length",
+        )
+        if not all(key in item for key in required):
+            raise ValueError(
+                "Each sample needs 'semantic_codes' or compact semantic code fields."
+            )
+        path = item["semantic_code_path"]
+        codes = self._semantic_code_cache.get(path)
+        if codes is None:
+            codes = np.memmap(path, dtype="<u2", mode="r")
+            self._semantic_code_cache[path] = codes
+        offset = int(item["semantic_code_offset"])
+        length = int(item["semantic_code_length"])
+        if offset < 0 or length <= 0 or offset + length > len(codes):
+            raise ValueError(
+                "Compact semantic code range is out of bounds: "
+                f"path={path}, offset={offset}, length={length}, "
+                f"available={len(codes)}."
+            )
+        return torch.tensor(codes[offset : offset + length], dtype=torch.long)
+
     def collate_fn(self, samples):
         batch_size = len(samples)
         max_text = max(x["text_input_ids"].numel() for x in samples)
@@ -76,13 +199,15 @@ class Text2SemanticDataset(Dataset):
         if text_pad is None:
             text_pad = self.tokenizer.eos_token_id
         if text_pad is None:
-            raise ValueError("The Qwen tokenizer must define pad_token_id or eos_token_id.")
+            raise ValueError(
+                "The Qwen tokenizer must define pad_token_id or eos_token_id."
+            )
 
         text_ids = torch.full((batch_size, max_text), text_pad, dtype=torch.long)
         text_mask = torch.zeros((batch_size, max_text), dtype=torch.long)
         speech_ids = torch.full(
             (batch_size, max_speech),
-            self.speech_eos_token_id,
+            self.speech_pad_token_id,
             dtype=torch.long,
         )
         speech_mask = torch.zeros((batch_size, max_speech), dtype=torch.long)
