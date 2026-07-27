@@ -51,6 +51,41 @@ uv run python finetuning/prepare_data.py \
 输出会增加一维 `semantic_codes`，移除旧格式中的 `audio_codes`，并保留
 `audio/ref_audio` 供训练时在线提取 speaker 特征。
 
+## 从 GCS 语料构建训练数据
+
+`data_pipeline/` 提供从 `gs://noiz-taiwan-audio-data/preprocessed/` 到本项目
+manifest 格式的完整流程：GCS 访问、质量过滤、语义 token 编码。
+完整说明见 [docs/gcs-data-pipeline.md](docs/gcs-data-pipeline.md)。
+
+过滤条件：采样率 ≥ 22.05 kHz；`3s < 时长 < 30s` 且同一说话人还有其他音频、
+其中至少一条 > 6s；ASR 一致性 WER/CER < 0.5（有原始文本时用 cohere 对原文本，
+无原始文本时用 granite 对 cohere）。
+
+```bash
+# 1) 下载模型权重（W2V-BERT 2.0 + MaskGCT RepCodec）
+python scripts/download_models.py --out-dir checkpoints/maskgct
+
+# 2) 扫描语料、应用过滤、统计时长与空间
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/gcs-key.json
+python -m data_pipeline.scan --out-dir runs/full --workers 16
+python -m data_pipeline.stats --run-dir runs/full
+
+# 3) 拉取音频、编码语义 token、产出 manifest
+python -m data_pipeline.encode \
+  --index runs/full/filtered_index.jsonl.gz \
+  --out-dir /path/to/train_data \
+  --model-dir checkpoints/maskgct \
+  --device cuda:0
+```
+
+产出的 manifest 使用打包的 `<u2` code store
+（`semantic_code_path` / `semantic_code_offset` / `semantic_code_length`），
+而不是内联 `semantic_codes` —— 在这个数据量级下内联会让 manifest 膨胀一个数量级。
+两种格式 `Text2SemanticDataset` 都支持。
+
+GCS service account key 不要提交进仓库（`.gitignore` 已忽略
+`gcs-key.json` / `key.json`）。
+
 ## 全参数训练
 
 先把预处理结果划分为互不重叠的训练集与验证集。训练脚本会自动加载项目根目录下

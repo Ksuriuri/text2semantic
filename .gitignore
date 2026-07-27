@@ -13,3 +13,6 @@ data/
 output/
 runs/
 *.wav
+gcs-key.json
+key.json
+checkpoints/

@@ -1,0 +1,21 @@
+# RepCodec (MaskGCT single-codebook semantic quantizer) architecture.
+#
+# The upstream amphion/MaskGCT release ships only `semantic_codec/model.safetensors`
+# and hard-codes the architecture in its own source, so no config file exists to
+# download. These values are the ones `qwen_tts.semantic_codec.RepCodec` needs,
+# and each was verified against the tensor shapes in that checkpoint:
+#
+#   quantizer.quantizers.0.codebook.weight     [8192, 8]     -> codebook_size, codebook_dim
+#   encoder.0.embed.weight                     [384, 1024, 7]-> vocos_dim, hidden_size
+#   encoder.0.convnext.N.pwconv1.weight        [2048, 384]   -> vocos_intermediate_dim
+#   encoder.0.convnext.{0..11}                 12 blocks     -> vocos_num_layers
+#
+# `load_model(..., strict=True)` in MaskGCTSemanticTokenizer will fail loudly if
+# any of these drift, so the file is safe to treat as authoritative.
+semantic_codec:
+  codebook_size: 8192
+  hidden_size: 1024
+  codebook_dim: 8
+  vocos_dim: 384
+  vocos_intermediate_dim: 2048
+  vocos_num_layers: 12
