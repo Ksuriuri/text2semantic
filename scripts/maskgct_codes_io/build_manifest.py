@@ -165,6 +165,18 @@ def keep(row: dict, args: argparse.Namespace) -> str | None:
     length = int(row["semantic_code_length"])
     if args.max_semantic_tokens is not None and length > args.max_semantic_tokens:
         return "max_semantic_tokens"
+    if args.min_sample_rate is not None:
+        # Source-recording quality, not a tokenizer requirement -- the codes were
+        # produced from audio loaded at 16 kHz regardless, so upsampled low-rate
+        # material is indistinguishable to the tokenizer but still sounds worse.
+        # A row with no sample_rate at all is dropped rather than assumed good.
+        sample_rate = row.get("sample_rate")
+        try:
+            sample_rate = float(sample_rate) if sample_rate not in (None, "", "None") else None
+        except (TypeError, ValueError):
+            sample_rate = None
+        if sample_rate is None or sample_rate < args.min_sample_rate:
+            return "min_sample_rate"
     if args.require_speaker_id:
         speaker = row.get("speaker_id")
         # Upstream exports write missing values as the *string* "None".
@@ -184,7 +196,9 @@ def main() -> int:
                         help="limit to these shards (repeatable)")
     source.add_argument("--cache-dir", type=Path, default=Path("/tmp/maskgct-codes-cache"))
     source.add_argument("--root", default=DEFAULT_ROOT)
-    source.add_argument("--token", default="gcs-key.json")
+    source.add_argument("--token", default="gcs-key.json",
+                        help="service-account json; ignored when the file is "
+                             "absent, so a GCE VM uses its attached account")
 
     parser.add_argument("--out", type=Path, required=True, help="manifest jsonl to write")
     parser.add_argument("--path-style", choices=("relative", "absolute"),
@@ -205,6 +219,10 @@ def main() -> int:
     flt.add_argument("--max-target-seconds", type=float, default=None,
                      help="text2semantic's own default is 30.0")
     flt.add_argument("--max-semantic-tokens", type=int, default=None)
+    flt.add_argument("--min-sample-rate", type=int, default=None,
+                     help="drop rows recorded below N Hz; text2semantic's "
+                          "data_pipeline uses 22050. Rows with no sample_rate "
+                          "are dropped too, since quality can't be established")
     flt.add_argument("--require-speaker-id", action="store_true",
                      help="drop rows whose speaker_id is missing or the string "
                           "'None'; text2semantic cannot use them (it needs a "
@@ -237,7 +255,14 @@ def main() -> int:
     else:
         import gcsfs
 
-        fs = gcsfs.GCSFileSystem(token=args.token)
+        # A key file is the fallback, not the default: on a GCE VM the attached
+        # service account works through the metadata server, and passing a
+        # nonexistent path makes gcsfs raise "token is either not valid, or
+        # expired" instead of falling back. Same precedence as features/run.sh.
+        token = args.token
+        if token and token != "anon" and not Path(token).is_file():
+            token = None
+        fs = gcsfs.GCSFileSystem(token=token)
         remote = f"{args.root}/{args.dataset}/{FEATURE_DIR}"
         shards = args.shard or sorted(
             Path(name).stem for name in fs.ls(remote)

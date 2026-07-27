@@ -68,7 +68,7 @@ python features/build_manifest.py --dataset vctk --out /data/manifests/vctk.json
 # text2semantic（绝对路径；它不解析相对路径），带它自己那套过滤
 python features/build_manifest.py --dataset vctk --out /data/manifests/vctk.jsonl \
     --path-style absolute --max-target-seconds 30 --require-speaker-id \
-    --min-speaker-records 2
+    --min-speaker-records 2 --min-sample-rate 22050
 ```
 
 只读单个 shard 看一眼：`python features/read_codes.py --dataset vctk --shard vctk-000000`。
@@ -93,11 +93,19 @@ python features/build_manifest.py --dataset vctk --out /data/manifests/vctk.json
 | `--min-target-seconds` | s2any 的 `min_target_seconds` 一类时长下限 |
 | `--require-speaker-id` | t2s 需要说话人参考音频，`speaker_id` 缺失就用不了 |
 | `--min-speaker-records` | `min_speaker_records`（默认 2：要能配出参考 clip） |
+| `--min-sample-rate` | `data_pipeline/filters.py` 的 `min_sample_rate`（22050） |
 
 注意上游导出把缺失值写成**字符串 `"None"`**，不是 `null`；`build_manifest.py` 的
 `--require-speaker-id` 已按这个处理。s2any 侧另有配对相关的门槛
 （`min_prompt_seconds` / `max_prompt_seconds` / `min_generated_frames` / `max_pair_seconds`），
 那些依赖 prompt/target 的配对结果，仍留在 dataset 里做。
+
+`--min-sample-rate` 与 `data_pipeline/filters.py` 的第一条门槛（`min_sample_rate=22050`）
+同口径：**没有 `sample_rate` 字段的行也丢**，质量无法确认就不留。它管的是**源录音质量**，
+不是 tokenizer 的需求——codes 本来就是按 16 kHz 单声道载入算出来的
+（`librosa.load(sr=16000, mono=True)`），低采样率上采样上来不会变好。实测各数据集：
+Genshin/expresso/vctk/ears 48k，WutheringWaves/hi_fi_tts 44.1k，laion_emolia 24k（这条不砍它），
+StarRail 混合（44.1k 为主，含 12k/24k/32k/36k/48k），noiz-short 含 16k 会被砍。
 
 ## 6. 长音频：不要按波形切窗
 

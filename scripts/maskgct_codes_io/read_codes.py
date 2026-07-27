@@ -95,6 +95,12 @@ def fetch_shard(dataset: str, shard: str, cache_dir: Path,
     """Download one shard's index and blob, once, and return the index path."""
     import gcsfs
 
+    # A key file is the fallback, not the default: on a GCE VM the attached
+    # service account works through the metadata server, and handing gcsfs a
+    # path that does not exist makes it raise "token is either not valid, or
+    # expired" rather than falling back. Same precedence as features/run.sh.
+    if token and token != "anon" and not Path(token).is_file():
+        token = None
     fs = gcsfs.GCSFileSystem(token=token)
     cache_dir.mkdir(parents=True, exist_ok=True)
     remote = f"{root}/{dataset}/{FEATURE_DIR}"
