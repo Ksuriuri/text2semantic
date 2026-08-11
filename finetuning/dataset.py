@@ -1,6 +1,8 @@
 # Copyright 2026
 # SPDX-License-Identifier: Apache-2.0
 
+import random
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -26,6 +28,7 @@ class Text2SemanticDataset(Dataset):
         speaker_audio_paths_by_id=None,
         min_speaker_records=2,
         max_target_seconds=30.0,
+        seed=42,
     ):
         self.raw_size = len(data)
         self.tokenizer = tokenizer
@@ -42,6 +45,7 @@ class Text2SemanticDataset(Dataset):
         )
         self.min_speaker_records = min_speaker_records
         self.max_target_seconds = max_target_seconds
+        self.seed = seed
         self._semantic_code_cache = {}
         self.data = [item for item in data if self._is_usable(item)]
         if not self.data:
@@ -82,7 +86,14 @@ class Text2SemanticDataset(Dataset):
                 paths_by_id[speaker_key].append(audio_path)
         return paths_by_id
 
+    @staticmethod
+    def _has_usable_text(item):
+        text = item.get("text")
+        return isinstance(text, str) and bool(text.strip())
+
     def _is_usable(self, item):
+        if not self._has_usable_text(item):
+            return False
         if self._speaker_audio_path(item) is None:
             return False
         speaker_key = self._speaker_key(item)
@@ -128,9 +139,9 @@ class Text2SemanticDataset(Dataset):
 
     def __getitem__(self, index):
         item = self.data[index]
-        if "text" not in item:
-            raise ValueError("Each sample needs 'text'.")
-        speaker_audio_path = self._speaker_audio_path(item)
+        if not self._has_usable_text(item):
+            raise ValueError("Each sample needs a non-empty string 'text'.")
+        speaker_audio_path = self._speaker_audio_path(item, index)
         if speaker_audio_path is None:
             raise ValueError(
                 "Each sample needs 'ref_audio', 'audio', or 'audio_path'."
@@ -153,7 +164,14 @@ class Text2SemanticDataset(Dataset):
             "speaker_audio_path": speaker_audio_path,
         }
 
-    def _speaker_audio_path(self, item):
+    def _speaker_audio_path(self, item, index=None):
+        """Reference clip for `item`, or None when the speaker has no other clip.
+
+        With `index` given, the clip is drawn from a per-index seeded rotation so
+        a speaker's rows spread over all of its clips instead of piling onto the
+        first one.  Filtering calls this without an index: only the existence of
+        a distinct clip matters there, not which one.
+        """
         explicit = item.get("ref_audio") or item.get("ref_audio_path")
         target_audio_path = self._target_audio_path(item)
         if explicit is not None:
@@ -161,7 +179,14 @@ class Text2SemanticDataset(Dataset):
         speaker_key = self._speaker_key(item)
         if speaker_key is None:
             return None
-        for audio_path in self.speaker_audio_paths_by_id.get(speaker_key, ()):
+        candidates = self.speaker_audio_paths_by_id.get(speaker_key, ())
+        if not candidates:
+            return None
+        start = 0
+        if index is not None:
+            start = random.Random(self.seed + index).randrange(len(candidates))
+        for offset in range(len(candidates)):
+            audio_path = candidates[(start + offset) % len(candidates)]
             if audio_path != target_audio_path:
                 return audio_path
         return None

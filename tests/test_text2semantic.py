@@ -231,6 +231,75 @@ def test_dataset_filters_samples_without_independent_reference():
         )
 
 
+def test_dataset_filters_samples_without_usable_text():
+    dataset = Text2SemanticDataset(
+        [
+            {
+                "audio": "null-text.wav",
+                "text": None,
+                "speaker_id": "speaker-a",
+                "semantic_codes": [3],
+            },
+            {
+                "audio": "empty-text.wav",
+                "text": "",
+                "speaker_id": "speaker-a",
+                "semantic_codes": [4],
+            },
+            {
+                "audio": "blank-text.wav",
+                "text": "   ",
+                "speaker_id": "speaker-a",
+                "semantic_codes": [5],
+            },
+            {
+                "audio": "keep-1.wav",
+                "text": "hello",
+                "speaker_id": "speaker-a",
+                "semantic_codes": [6],
+            },
+            {
+                "audio": "keep-2.wav",
+                "text": "hello",
+                "speaker_id": "speaker-a",
+                "semantic_codes": [7],
+            },
+        ],
+        DummyTokenizer(),
+    )
+
+    assert [item["audio"] for item in dataset.data] == ["keep-1.wav", "keep-2.wav"]
+    assert dataset.filtered_size == 3
+    # Every surviving row must be materializable: the null-text rows used to pass
+    # filtering and blow up inside a DataLoader worker instead.
+    for index in range(len(dataset)):
+        dataset[index]
+
+
+def test_dataset_spreads_reference_clips_over_the_speaker():
+    data = [
+        {
+            "audio": f"clip-{index}.wav",
+            "text": "hello",
+            "speaker_id": "speaker-a",
+            "semantic_codes": [3],
+        }
+        for index in range(12)
+    ]
+
+    dataset = Text2SemanticDataset(data, DummyTokenizer())
+    references = [dataset[index]["speaker_audio_path"] for index in range(len(dataset))]
+
+    assert len(set(references)) > 1, "reference clips must not collapse onto one path"
+    for index, reference in enumerate(references):
+        assert reference != data[index]["audio"]
+    # Seeded, so the choice is reproducible across ranks and resumes.
+    again = Text2SemanticDataset(data, DummyTokenizer(), seed=dataset.seed)
+    assert [again[i]["speaker_audio_path"] for i in range(len(again))] == references
+    shifted = Text2SemanticDataset(data, DummyTokenizer(), seed=dataset.seed + 1)
+    assert [shifted[i]["speaker_audio_path"] for i in range(len(shifted))] != references
+
+
 def test_forward_backward_and_independent_speech_parameters():
     model = tiny_model()
     output = model(

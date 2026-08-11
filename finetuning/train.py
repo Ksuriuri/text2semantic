@@ -177,6 +177,7 @@ def build_dataset(
         speaker_audio_paths_by_id=speaker_audio_paths,
         min_speaker_records=args.min_speaker_records,
         max_target_seconds=args.max_target_seconds,
+        seed=args.seed,
     )
 
 
