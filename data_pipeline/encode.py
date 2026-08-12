@@ -5,12 +5,14 @@ worker:
 
 1. streams the shard's ``audio/<ds>-NNNNNN.tar`` from GCS once and extracts only
    the surviving members;
-2. runs :class:`qwen_tts.semantic_codec.MaskGCTSemanticTokenizer` over them;
+2. runs :class:`qwen_tts.semantic_codec.MaskGCTSemanticTokenizer` over them
+   (IndexTTS-2.5's EnhancedCodec by default, ``--semantic-codec maskgct`` for the
+   old one);
 3. appends the codes to a packed ``<u2`` code store and records
    ``semantic_code_path`` / ``semantic_code_offset`` / ``semantic_code_length``;
 4. keeps the audio only when it is needed as a speaker reference clip.
 
-Why the code store instead of inline ``semantic_codes``: at ~50 codes per second
+Why the code store instead of inline ``semantic_codes``: at 25-50 codes per second
 the whole corpus of codes is a few GB, while inlining them into jsonl inflates
 the manifest by an order of magnitude and makes it slow to load.
 ``Text2SemanticDataset`` already supports the memory-mapped form.
@@ -110,15 +112,15 @@ def choose_reference_clips(rows_by_shard, per_speaker, min_w_distance=0,
     return keep, report
 
 
-def build_tokenizer(model_dir, device):
-    from qwen_tts.semantic_codec import MaskGCTSemanticTokenizer
+def build_tokenizer(model_dir, device, codec_type=None):
+    from qwen_tts.semantic_codec import (
+        DEFAULT_SEMANTIC_CODEC,
+        MaskGCTSemanticTokenizer,
+    )
 
-    model_dir = Path(model_dir)
-    return MaskGCTSemanticTokenizer(
-        w2v_bert_path=model_dir / "w2v-bert-2.0",
-        stats_path=model_dir / "wav2vec2bert_stats.pt",
-        repcodec_config_path=model_dir / "semantic_codec" / "config.yaml",
-        repcodec_checkpoint_path=model_dir / "semantic_codec" / "model.safetensors",
+    return MaskGCTSemanticTokenizer.from_model_dir(
+        model_dir,
+        codec_type=codec_type or DEFAULT_SEMANTIC_CODEC,
         device=device,
     )
 
@@ -215,6 +217,13 @@ def encode_shard(corpus, tokenizer, dataset, shard, rows, out_dir,
                     "audio": kept_audio,
                     "semantic_code_offset": offset,
                     "semantic_code_length": int(codes.size),
+                    # Codes from the two codecs are the same dtype and shape, so
+                    # without this nothing downstream can tell them apart.
+                    "semantic_codec": getattr(tokenizer, "codec_type", "maskgct"),
+                    "semantic_fps": float(getattr(tokenizer, "code_fps", 50.0)),
+                    "semantic_frame_rate": float(
+                        getattr(tokenizer, "code_fps", 50.0)
+                    ),
                 }
             )
             codes_chunks.append(codes)
@@ -236,6 +245,11 @@ def build_parser():
     parser.add_argument("--bucket", default=gcs.BUCKET)
     parser.add_argument("--root", default=gcs.ROOT)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--semantic-codec", default=None,
+                        help="indextts25 (default, 25 Hz codes) or maskgct "
+                             "(50 Hz). Codes from the two are not "
+                             "interchangeable; the choice is stamped on every "
+                             "manifest row.")
     parser.add_argument("--reference-clips-per-speaker", type=int, default=2)
     parser.add_argument("--min-w-distance", type=int,
                         default=pairing.DEFAULT_MIN_W_DISTANCE,
@@ -249,7 +263,10 @@ def build_parser():
                              "run instead of backfilling a near-repeat "
                              "reference. Discards data, so off by default; it "
                              "is the better trade only for laion's slice half, "
-                             "where the backfilled pair is low value -- 85.5% of "
+                             # Escaped: argparse %-expands help strings, so a
+                             # bare "85.5% of" is read as a %o conversion and
+                             # --help raises TypeError.
+                             "where the backfilled pair is low value -- 85.5%% of "
                              "those groups are one continuous run, so the "
                              "backfill is a near-repeat of the target.")
     parser.add_argument("--no-keep-audio", action="store_true",
@@ -288,7 +305,10 @@ def main(argv=None):
         gcs.make_client(args.gcs_key, args.project),
         bucket=args.bucket, root=args.root,
     )
-    tokenizer = build_tokenizer(args.model_dir, args.device)
+    tokenizer = build_tokenizer(args.model_dir, args.device,
+                                args.semantic_codec)
+    print(f"[encode] semantic codec: {tokenizer.codec_type} "
+          f"({tokenizer.code_fps:g} Hz codes)", flush=True)
 
     for dataset, shard in keys:
         code_path = out_dir / "codes" / dataset / f"{dataset}-{shard:06d}.u2.bin"

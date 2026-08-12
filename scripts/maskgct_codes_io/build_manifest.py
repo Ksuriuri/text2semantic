@@ -26,17 +26,24 @@ field names and path conventions:
 So three concrete gaps, all on the writer's side, none needing a change to
 either trainer:
 
-  1. `semantic_frame_rate` -> also emit `semantic_fps` (same 50.0).
+  1. `semantic_frame_rate` -> also emit `semantic_fps` (same value: 25.0 for
+     indextts25, 50.0 for maskgct).
   2. `semantic_code_path` is a bare filename in the bucket index (deliberately,
      so a shard stays relocatable) -> rewrite to a real path.
-  3. no lookup table in the bucket -> `--emit-lookup` materializes
-     `maskgct_lookup.pt` from the codec checkpoint and stamps its sha256 on
-     every row. The table is a function of the checkpoint, not of the data,
-     which is why it does not belong in the per-tar shards.
+  3. no decode-side artifact in the bucket -> `--emit-lookup` materializes one
+     from the codec checkpoint and stamps its sha256 on every row. It is a
+     function of the checkpoint, not of the data, which is why it does not
+     belong in the per-tar shards.
 
-The lookup table is `quantizer.vq2emb(arange(8192))`, i.e. the frozen
-8192x1024 post-projection embedding, byte-compatible with what
-`semantic2any/scripts/precompute_maskgct_codes.py` writes.
+What that artifact is depends on the codec, and both are byte-compatible with
+what `semantic2any/scripts/precompute_maskgct_codes.py` writes:
+
+  * maskgct     `maskgct_lookup.pt`, the frozen 8192x1024 post-projection
+                embedding `quantizer.vq2emb(arange(8192))`.
+  * indextts25  `indextts25_decoder.pt`, the decode-side *weights*
+                (quantizer + decoder + up). This codec has no per-code table:
+                decode runs a ConvNeXt stack over the whole sequence, so a code
+                has no context-free embedding to tabulate.
 
 Usage::
 
@@ -64,8 +71,27 @@ from pathlib import Path
 
 from read_codes import CODE_DTYPE, DEFAULT_ROOT, FEATURE_DIR, fetch_shard
 
-LOOKUP_NAME = "maskgct_lookup.pt"
-SEMANTIC_FPS = 50.0
+#: (artifact name, code fps) per codec.  indextts25 is IndexTTS-2.5's
+#: EnhancedCodec and the default, matching the tokenizer default in
+#: qwen_tts.semantic_codec.
+SEMANTIC_CODECS = {
+    "indextts25": ("indextts25_decoder.pt", 25.0),
+    "maskgct": ("maskgct_lookup.pt", 50.0),
+}
+DEFAULT_SEMANTIC_CODEC = "indextts25"
+
+#: Spellings of the same codec that may appear in bucket rows.
+SEMANTIC_CODEC_ALIASES = {
+    "indextts2.5": "indextts25",
+    "indextts-2.5": "indextts25",
+    "indextts_2.5": "indextts25",
+    "enhancedcodec": "indextts25",
+}
+
+
+def canonical_semantic_codec(name):
+    return SEMANTIC_CODEC_ALIASES.get(str(name).strip().lower(),
+                                      str(name).strip().lower())
 
 
 def sha256_file(path: Path) -> str:
@@ -76,44 +102,99 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def build_lookup(out_path: Path, *, checkpoint_dir: Path, device: str = "cpu") -> Path:
-    """Materialize the frozen codebook lookup table from the codec checkpoint.
+def _load_codec(checkpoint_dir: Path, codec_type: str, device: str = "cpu"):
+    """Build the codec from a scripts/download_models.py checkpoint dir.
+
+    Needs this project's ``qwen_tts.semantic_codec``, which is the only copy that
+    carries the decode side. The SpeechData copy of this script (see README) can
+    still build a manifest and reuse an existing artifact via ``--lookup-path``;
+    it just cannot materialize one until the same change lands upstream.
+    """
+    try:
+        from qwen_tts.semantic_codec import (
+            RepCodec,
+            load_codec_checkpoint,
+            load_codec_config,
+            resolve_codec_assets,
+        )
+    except ImportError as error:  # running from the SpeechData copy
+        raise RuntimeError(
+            "--emit-lookup needs qwen_tts.semantic_codec (the decode side lives "
+            "there). Run this from text2semantic, or pass --lookup-path to reuse "
+            f"an artifact built there: {error}"
+        ) from error
+
+    config_path, checkpoint_path = resolve_codec_assets(checkpoint_dir, codec_type)
+    codec = RepCodec(**load_codec_config(config_path, codec_type)).to(device)
+    load_codec_checkpoint(codec, checkpoint_path)
+    codec.eval()
+    return codec, Path(checkpoint_path)
+
+
+def build_lookup(out_path: Path, *, checkpoint_dir: Path,
+                 codec_type: str = DEFAULT_SEMANTIC_CODEC,
+                 device: str = "cpu") -> Path:
+    """Materialize the decode-side artifact from the codec checkpoint.
 
     Written once per manifest tree, not per shard: it depends only on the
     RepCodec weights. Skipped if a matching file already exists, and a
     *mismatching* one is an error rather than an overwrite -- a manifest whose
     rows claim a checksum the file no longer has would fail deep inside
     training instead of here.
+
+    For maskgct this is the [8192, 1024] lookup table. For indextts25 there is no
+    such table (its decode is context dependent), so the artifact carries the
+    decode-side weights in the shape semantic2any's IndexTTS25CodeDecoder loads.
     """
-    # Imported lazily and *after* the reuse check: building the table needs the
-    # RepCodec weights and semantic_codec.py, but reusing an existing one needs
-    # neither, so a manifest built next to an existing lookup runs anywhere.
+    # Imported lazily and *after* the reuse check: building the artifact needs
+    # the RepCodec weights and semantic_codec.py, but reusing an existing one
+    # needs neither, so a manifest built next to an existing artifact runs
+    # anywhere.
     if out_path.exists():
         return out_path
 
     import torch
-    import yaml
 
-    from semantic_codec import RepCodec, load_model
+    codec_type = canonical_semantic_codec(codec_type)
+    codec, checkpoint_path = _load_codec(checkpoint_dir, codec_type, device)
 
-    config_path = checkpoint_dir / "semantic_codec" / "config.yaml"
-    with config_path.open(encoding="utf-8") as handle:
-        config = yaml.safe_load(handle)
-    config = config.get("semantic_codec", config)
-    codec = RepCodec(**config).to(device)
-    load_model(codec, str(checkpoint_dir / "semantic_codec" / "model.safetensors"),
-               strict=True)
-    codec.eval()
-    with torch.no_grad():
-        codes = torch.arange(int(codec.quantizer.codebook_size),
-                             device=device, dtype=torch.long)
-        # vq2emb takes [n_quantizers, B, T]; one codebook, one "batch" of 8192.
-        lookup = codec.quantizer.vq2emb(codes.view(1, 1, -1))
-        lookup = lookup.transpose(1, 2).reshape(codes.numel(), -1)
-        lookup = lookup.detach().cpu().float().contiguous()
+    if codec_type == "indextts25":
+        state = {
+            key: value.detach().cpu().clone()
+            for key, value in codec.state_dict().items()
+            if key.startswith(("quantizer.", "decoder.", "up."))
+        }
+        if not state:
+            raise ValueError("Refusing to write an empty decoder bundle")
+        payload = {
+            "codec_type": "indextts25",
+            "frames_per_code": int(codec.downsample_scale),
+            "semantic_dim": int(codec.hidden_size),
+            "arch": {
+                "codebook_size": int(codec.codebook_size),
+                "hidden_size": int(codec.hidden_size),
+                "codebook_dim": int(codec.codebook_dim),
+                "vocos_dim": int(codec.vocos_dim),
+                "vocos_intermediate_dim": int(codec.vocos_intermediate_dim),
+                "vocos_num_layers": int(codec.vocos_num_layers),
+                "num_quantizers": int(codec.num_quantizers),
+                "downsample_scale": int(codec.downsample_scale),
+            },
+            "state_dict": state,
+            "source_checkpoint": str(checkpoint_path),
+            "source_checkpoint_sha256": sha256_file(checkpoint_path),
+        }
+    else:
+        with torch.no_grad():
+            codes = torch.arange(int(codec.quantizer.codebook_size),
+                                 device=device, dtype=torch.long)
+            # vq2emb takes [n_quantizers, B, T]; one codebook, one "batch" of 8192.
+            lookup = codec.quantizer.vq2emb(codes.view(1, 1, -1))
+            lookup = lookup.transpose(1, 2).reshape(codes.numel(), -1)
+            payload = {"lookup": lookup.detach().cpu().float().contiguous()}
 
     tmp_path = out_path.with_suffix(out_path.suffix + ".part")
-    torch.save({"lookup": lookup}, tmp_path)
+    torch.save(payload, tmp_path)
     os.replace(tmp_path, out_path)
     return out_path
 
@@ -124,7 +205,8 @@ def iter_shards(codes_dir: Path):
 
 
 def manifest_rows(index_path: Path, *, codes_dir: Path, manifest_dir: Path,
-                  path_style: str):
+                  path_style: str, codec_type: str = DEFAULT_SEMANTIC_CODEC,
+                  semantic_fps: float = 25.0):
     """Yield trainer-shaped rows for one shard's index."""
     for line in index_path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
@@ -142,9 +224,20 @@ def manifest_rows(index_path: Path, *, codes_dir: Path, manifest_dir: Path,
         row["semantic_code_path"] = code_path
         # s2mel_dataset reads `semantic_fps`; keep `semantic_frame_rate` too so
         # the row stays readable by anything written against the bucket schema.
-        row["semantic_fps"] = row.get("semantic_frame_rate", SEMANTIC_FPS)
+        row["semantic_fps"] = row.get("semantic_frame_rate", semantic_fps)
         row["semantic_codebooks"] = 1
-        row["semantic_codec"] = "maskgct"
+        # A bucket row that already names its codec wins: it was written by the
+        # job that produced these ids, and disagreeing with it would mislabel
+        # them. Normalized, because that job spells it "indextts2.5".
+        row["semantic_codec"] = canonical_semantic_codec(
+            row.get("semantic_codec") or codec_type
+        )
+        if row["semantic_codec"] != codec_type:
+            raise ValueError(
+                f"{index_path} was encoded with {row['semantic_codec']!r} but "
+                f"--semantic-codec is {codec_type!r}; the decode-side artifact "
+                "would not match the codes"
+            )
         yield row
 
 
@@ -206,10 +299,17 @@ def main() -> int:
                         help="relative: resolved against the manifest dir "
                              "(semantic2any). absolute: required by text2semantic, "
                              "which memmaps the string verbatim.")
+    parser.add_argument("--semantic-codec", default=DEFAULT_SEMANTIC_CODEC,
+                        choices=sorted(SEMANTIC_CODECS),
+                        help="codec that produced these shards. indextts25 "
+                             "(default) has 25 Hz codes and ships decoder "
+                             "weights; maskgct has 50 Hz codes and a lookup "
+                             "table. A shard that names its own codec must "
+                             "agree with this.")
     parser.add_argument("--emit-lookup", action="store_true",
-                        help="write maskgct_lookup.pt next to the manifest and "
-                             "stamp semantic_lookup_path/_sha256 on every row "
-                             "(semantic2any requires both)")
+                        help="write the decode-side artifact next to the "
+                             "manifest and stamp semantic_lookup_path/_sha256 "
+                             "on every row (semantic2any requires both)")
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints/maskgct"))
     parser.add_argument("--lookup-path", type=Path, default=None,
                         help="reuse an existing lookup table instead of building one")
@@ -238,12 +338,16 @@ def main() -> int:
     manifest_dir = args.out.parent.resolve()
     manifest_dir.mkdir(parents=True, exist_ok=True)
 
+    codec_type = canonical_semantic_codec(args.semantic_codec)
+    lookup_name, semantic_fps = SEMANTIC_CODECS[codec_type]
+
     lookup_path = args.lookup_path
     lookup_sha = None
     if args.emit_lookup:
-        lookup_path = lookup_path or (manifest_dir / LOOKUP_NAME)
+        lookup_path = lookup_path or (manifest_dir / lookup_name)
         lookup_path = build_lookup(Path(lookup_path),
-                                   checkpoint_dir=args.checkpoint_dir)
+                                   checkpoint_dir=args.checkpoint_dir,
+                                   codec_type=codec_type)
         lookup_sha = sha256_file(Path(lookup_path))
 
     if args.codes_dir:
@@ -278,7 +382,9 @@ def main() -> int:
     for index_path in indexes:
         for row in manifest_rows(index_path, codes_dir=codes_dir,
                                  manifest_dir=manifest_dir,
-                                 path_style=args.path_style):
+                                 path_style=args.path_style,
+                                 codec_type=codec_type,
+                                 semantic_fps=semantic_fps):
             reason = keep(row, args)
             if reason:
                 dropped[reason] += 1
@@ -309,7 +415,9 @@ def main() -> int:
         "manifest": str(args.out),
         "shards": len(indexes),
         "rows": len(rows),
-        "audio_hours": round(codes / SEMANTIC_FPS / 3600, 2),
+        "semantic_codec": codec_type,
+        "semantic_fps": semantic_fps,
+        "audio_hours": round(codes / semantic_fps / 3600, 2),
         "dropped": dict(dropped),
         "path_style": args.path_style,
         "lookup": str(lookup_path) if lookup_sha else None,

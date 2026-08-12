@@ -1,0 +1,28 @@
+# EnhancedCodec (IndexTTS-2.5 semantic quantizer) architecture.
+#
+# Same RepCodec as MaskGCT plus `downsample_scale: 2`, which adds a stride-2
+# `down` conv before the encoder and an `up` conv after the decoder.  Codes
+# therefore sit at 25 Hz while the w2v-bert features stay at 50 Hz.
+#
+# IndexTTS-2.5 ships `checkpoints/codec.pth` and hard-codes downsample_scale in
+# its own source, so the published `codec_config.json` / `config.yaml` omit it.
+# The remaining values are that file's `model.semantic_codec` block verbatim, and
+# each was verified against the tensor shapes in codec.pth:
+#
+#   quantizer.quantizers.0.codebook.weight      [8192, 8]      -> codebook_size, codebook_dim
+#   encoder.0.embed.weight                      [384, 1024, 7] -> vocos_dim, hidden_size
+#   encoder.0.convnext.N.pwconv1.weight         [2048, 384]    -> vocos_intermediate_dim
+#   encoder.0.convnext.{0..11}                  12 blocks      -> vocos_num_layers
+#   down.weight / up.weight                     [1024, 1024, 3]-> downsample_scale > 1
+#
+# `load_state_dict(..., strict=True)` in MaskGCTSemanticTokenizer fails loudly if
+# any of these drift; with these values codec.pth loads with no missing and no
+# unexpected keys.
+semantic_codec:
+  codebook_size: 8192
+  hidden_size: 1024
+  codebook_dim: 8
+  vocos_dim: 384
+  vocos_intermediate_dim: 2048
+  vocos_num_layers: 12
+  downsample_scale: 2
