@@ -29,6 +29,7 @@ class Text2SemanticDataset(Dataset):
         speaker_audio_paths_by_id=None,
         min_speaker_records=2,
         max_target_seconds=30.0,
+        min_target_seconds=3.0,
         punctuation_dropout_prob=0.0,
         punctuation_dropout_keep_word_spaces=True,
         seed=42,
@@ -48,6 +49,7 @@ class Text2SemanticDataset(Dataset):
         )
         self.min_speaker_records = min_speaker_records
         self.max_target_seconds = max_target_seconds
+        self.min_target_seconds = min_target_seconds
         if not 0.0 <= punctuation_dropout_prob <= 1.0:
             raise ValueError("punctuation_dropout_prob must be in [0, 1].")
         self.punctuation_dropout_prob = punctuation_dropout_prob
@@ -116,6 +118,12 @@ class Text2SemanticDataset(Dataset):
             duration is not None
             and self.max_target_seconds is not None
             and float(duration) > self.max_target_seconds
+        ):
+            return False
+        if (
+            duration is not None
+            and self.min_target_seconds is not None
+            and float(duration) < self.min_target_seconds
         ):
             return False
         semantic_length = self._semantic_length(item)

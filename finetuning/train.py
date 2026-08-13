@@ -38,6 +38,7 @@ def parse_args():
     parser.add_argument("--stats_path", required=True)
     parser.add_argument("--max_ref_seconds", type=float, default=20.0)
     parser.add_argument("--max_target_seconds", type=float, default=30.0)
+    parser.add_argument("--min_target_seconds", type=float, default=3.0)
     parser.add_argument("--min_speaker_records", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--eval_batch_size", type=int, default=2)
@@ -125,6 +126,8 @@ def parse_args():
         parser.error("--max_ref_seconds must be positive.")
     if args.max_target_seconds <= 0:
         parser.error("--max_target_seconds must be positive.")
+    if args.min_target_seconds < 0:
+        parser.error("--min_target_seconds must be non-negative.")
     if args.min_speaker_records < 1:
         parser.error("--min_speaker_records must be positive.")
     if not 0 <= args.punctuation_dropout_prob <= 1:
@@ -202,6 +205,7 @@ def build_dataset(
         speaker_audio_paths_by_id=speaker_audio_paths,
         min_speaker_records=args.min_speaker_records,
         max_target_seconds=args.max_target_seconds,
+        min_target_seconds=args.min_target_seconds,
         punctuation_dropout_prob=punctuation_dropout_prob,
         punctuation_dropout_keep_word_spaces=(
             args.punctuation_dropout_keep_word_spaces
