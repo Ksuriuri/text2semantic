@@ -1,5 +1,6 @@
 import json
 import os
+from types import SimpleNamespace
 
 import torch
 from accelerate import Accelerator
@@ -10,6 +11,7 @@ from transformers import Qwen3_5TextConfig
 
 from finetuning.train import (
     add_speaker_features,
+    build_dataset,
     build_optimizer,
     evaluate,
     load_resume_state,
@@ -62,6 +64,8 @@ def test_parse_args_defaults_match_dataset_limits(monkeypatch):
     assert args.max_ref_seconds == 20.0
     assert args.max_target_seconds == 30.0
     assert args.min_speaker_records == 2
+    assert args.punctuation_dropout_prob == 0.1
+    assert args.punctuation_dropout_keep_word_spaces is False
 
 
 def test_speaker_statistics_are_split_local():
@@ -244,3 +248,45 @@ def test_add_speaker_features_replaces_audio_paths():
     assert "speaker_audio_paths" not in result
     assert result["speaker_features"].shape == (1, 4, 8)
     assert result["speaker_feature_lengths"].tolist() == [4]
+
+
+def test_build_dataset_augments_train_text_but_not_eval_text():
+    data = [
+        {
+            "audio": f"clip-{index}.wav",
+            "text": "你好，世界！",
+            "speaker_id": "speaker-a",
+            "semantic_codes": [3, 4],
+        }
+        for index in range(2)
+    ]
+    args = SimpleNamespace(
+        max_text_tokens=None,
+        max_semantic_tokens=None,
+        min_speaker_records=2,
+        max_target_seconds=30.0,
+        punctuation_dropout_keep_word_spaces=False,
+        seed=42,
+    )
+    model_config = SimpleNamespace(
+        semantic_vocab_size=8192,
+        speech_bos_token_id=8192,
+        speech_eos_token_id=8193,
+        speech_pad_token_id=8194,
+    )
+
+    train_dataset = build_dataset(
+        data,
+        SimpleNamespace(),
+        model_config,
+        args,
+        None,
+        None,
+        punctuation_dropout_prob=0.1,
+    )
+    eval_dataset = build_dataset(
+        data, SimpleNamespace(), model_config, args, None, None
+    )
+
+    assert train_dataset.punctuation_dropout_prob == 0.1
+    assert eval_dataset.punctuation_dropout_prob == 0.0

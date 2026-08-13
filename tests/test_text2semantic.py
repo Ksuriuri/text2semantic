@@ -1,3 +1,4 @@
+import random
 from array import array
 
 import pytest
@@ -16,6 +17,7 @@ from qwen_tts.semantic_codec import (
     MaskGCTSemanticTokenizer,
     RepCodec,
 )
+from qwen_tts.text_augment import strip_pause_marks
 
 
 class DummyTokenizer:
@@ -545,3 +547,125 @@ def test_maskgct_feature_extractor_batches_and_masks_padding(monkeypatch):
     assert lengths.tolist() == [3, 5]
     assert torch.count_nonzero(features[0, 3:]) == 0
 
+
+class RecordingTokenizer:
+    """Tokenizer that keeps every prompt it was handed."""
+
+    pad_token_id = 0
+    eos_token_id = 1
+
+    def __init__(self):
+        self.prompts = []
+
+    def __call__(self, prompt, add_special_tokens):
+        assert add_special_tokens is False
+        self.prompts.append(prompt)
+        return {"input_ids": [2, 3]}
+
+
+def _dropout_dataset(tokenizer, text="你好，世界！", **kwargs):
+    return Text2SemanticDataset(
+        [
+            {
+                "audio": "target-1.wav",
+                "ref_audio": "ref-1.wav",
+                "text": text,
+                "speaker_id": "speaker-a",
+                "semantic_codes": [3, 4],
+            }
+        ],
+        tokenizer,
+        min_speaker_records=1,
+        **kwargs,
+    )
+
+
+def test_strip_pause_marks_removes_punctuation_spaces_and_newlines():
+    assert strip_pause_marks("你好，世界！\n真的吗？") == "你好世界真的吗"
+    assert strip_pause_marks("Hello, world!\tHow are you?") == "HelloworldHowareyou"
+    # Ideographic space and NBSP are separators too.
+    assert strip_pause_marks("a\u3000b\u00a0c") == "abc"
+    # Wave dashes act as prosody marks even though Unicode calls them symbols.
+    assert strip_pause_marks("好啊~好啊～") == "好啊好啊"
+    # Digits and content-bearing symbols stay: dropping them would change what
+    # is spoken, not how it is paced.
+    assert strip_pause_marks("50% off, $3 + $4 = $7!") == "50%off$3+$4=$7"
+    assert strip_pause_marks("R&B, 9/11, user_name@host") == "R&B9/11user_name@host"
+
+
+def test_strip_pause_marks_keeps_marks_glued_inside_a_word():
+    # Orthography, not prosody: dropping these changes what is read out.
+    assert strip_pause_marks("It is 3.14, not 12:30.") == "Itis3.14not12:30"
+    assert strip_pause_marks("don't stop state-of-the-art!") == "don'tstopstate-of-the-art"
+    # Only ASCII words get the exemption, so a CJK comma between hanzi still goes.
+    assert strip_pause_marks("好，好") == "好好"
+
+
+def test_strip_pause_marks_can_keep_word_boundaries():
+    assert (
+        strip_pause_marks("Hello, world!\n How  are you?", keep_word_spaces=True)
+        == "Hello world How are you"
+    )
+    assert strip_pause_marks("你好，世界。", keep_word_spaces=True) == "你好世界"
+
+
+def test_strip_pause_marks_may_strip_everything():
+    assert strip_pause_marks("……！！") == ""
+
+
+def test_punctuation_dropout_is_off_unless_requested():
+    tokenizer = RecordingTokenizer()
+    dataset = _dropout_dataset(tokenizer)
+    assert dataset.punctuation_dropout_prob == 0.0
+    for _ in range(50):
+        dataset[0]
+    assert tokenizer.prompts
+    assert all("\n你好，世界！<|im_end|>" in prompt for prompt in tokenizer.prompts)
+
+
+def test_punctuation_dropout_strips_every_read_at_probability_one():
+    tokenizer = RecordingTokenizer()
+    dataset = _dropout_dataset(tokenizer, punctuation_dropout_prob=1.0)
+    for _ in range(10):
+        dataset[0]
+    assert all("\n你好世界<|im_end|>" in prompt for prompt in tokenizer.prompts)
+
+
+def test_punctuation_dropout_hits_roughly_the_configured_rate():
+    tokenizer = RecordingTokenizer()
+    dataset = _dropout_dataset(tokenizer, punctuation_dropout_prob=0.1)
+    random.seed(12345)
+    for _ in range(400):
+        dataset[0]
+    stripped = sum("\n你好世界<|im_end|>" in p for p in tokenizer.prompts)
+    # Binomial(400, 0.1): mean 40, sd 6.  Seeded, so this is deterministic.
+    assert 20 <= stripped <= 60
+
+
+def test_punctuation_dropout_can_keep_word_spaces():
+    tokenizer = RecordingTokenizer()
+    dataset = _dropout_dataset(
+        tokenizer,
+        text="Hello, world!",
+        punctuation_dropout_prob=1.0,
+        punctuation_dropout_keep_word_spaces=True,
+    )
+    dataset[0]
+    assert "\nHello world<|im_end|>" in tokenizer.prompts[-1]
+
+
+def test_punctuation_dropout_keeps_text_that_would_strip_to_nothing():
+    tokenizer = RecordingTokenizer()
+    dataset = _dropout_dataset(
+        tokenizer, text="……！！", punctuation_dropout_prob=1.0
+    )
+    # An all-punctuation transcript must not become an empty prompt.
+    dataset[0]
+    assert "\n……！！<|im_end|>" in tokenizer.prompts[-1]
+
+
+def test_punctuation_dropout_rejects_probabilities_outside_the_unit_range():
+    with pytest.raises(ValueError):
+        _dropout_dataset(RecordingTokenizer(), punctuation_dropout_prob=1.5)
+    with pytest.raises(ValueError):
+        _dropout_dataset(RecordingTokenizer(), punctuation_dropout_prob=-0.1)

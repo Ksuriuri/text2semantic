@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from qwen_tts.text_augment import strip_pause_marks
 from qwen_tts.text_template import tokenize_tts_prompt
 
 
@@ -28,6 +29,8 @@ class Text2SemanticDataset(Dataset):
         speaker_audio_paths_by_id=None,
         min_speaker_records=2,
         max_target_seconds=30.0,
+        punctuation_dropout_prob=0.0,
+        punctuation_dropout_keep_word_spaces=False,
         seed=42,
     ):
         self.raw_size = len(data)
@@ -45,6 +48,12 @@ class Text2SemanticDataset(Dataset):
         )
         self.min_speaker_records = min_speaker_records
         self.max_target_seconds = max_target_seconds
+        if not 0.0 <= punctuation_dropout_prob <= 1.0:
+            raise ValueError("punctuation_dropout_prob must be in [0, 1].")
+        self.punctuation_dropout_prob = punctuation_dropout_prob
+        self.punctuation_dropout_keep_word_spaces = (
+            punctuation_dropout_keep_word_spaces
+        )
         self.seed = seed
         self._semantic_code_cache = {}
         self.data = [item for item in data if self._is_usable(item)]
@@ -129,6 +138,27 @@ class Text2SemanticDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
+    def _augmented_text(self, item):
+        """The sample's text, sometimes with every written pause cue removed.
+
+        The draw happens per read rather than per row, so over epochs the model
+        sees the same sentence both punctuated and bare and has to learn the
+        pacing itself.  DataLoader workers get their own `random` seed derived
+        from the base seed, so a run stays reproducible.
+        """
+        text = item["text"]
+        if self.punctuation_dropout_prob <= 0.0:
+            return text
+        if random.random() >= self.punctuation_dropout_prob:
+            return text
+        stripped = strip_pause_marks(
+            text,
+            keep_word_spaces=self.punctuation_dropout_keep_word_spaces,
+        )
+        # A transcript that is nothing but punctuation strips down to nothing and
+        # would raise inside _tokenize_text; keep the original text instead.
+        return stripped if stripped.strip() else text
+
     def _tokenize_text(self, text):
         ids = tokenize_tts_prompt(self.tokenizer, text)
         if self.max_text_tokens is not None:
@@ -154,7 +184,7 @@ class Text2SemanticDataset(Dataset):
                 f"semantic_codes must be in [0, {self.semantic_vocab_size - 1}]."
             )
         return {
-            "text_input_ids": self._tokenize_text(item["text"]),
+            "text_input_ids": self._tokenize_text(self._augmented_text(item)),
             "speech_input_ids": torch.cat(
                 (torch.tensor([self.speech_bos_token_id]), codes)
             ),

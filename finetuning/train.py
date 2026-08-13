@@ -54,6 +54,25 @@ def parse_args():
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--max_text_tokens", type=int)
     parser.add_argument("--max_semantic_tokens", type=int)
+    parser.add_argument(
+        "--punctuation_dropout_prob",
+        type=float,
+        default=0.1,
+        help=(
+            "Probability of removing every punctuation mark, space and "
+            "line break from a training sample's text, so the model has "
+            "to place the pauses itself.  Train split only."
+        ),
+    )
+    parser.add_argument(
+        "--punctuation_dropout_keep_word_spaces",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Keep single spaces between words when dropping punctuation. "
+            "Off by default, i.e. spaces go too."
+        ),
+    )
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--eval_steps", type=int, default=10000)
@@ -106,6 +125,8 @@ def parse_args():
         parser.error("--max_target_seconds must be positive.")
     if args.min_speaker_records < 1:
         parser.error("--min_speaker_records must be positive.")
+    if not 0 <= args.punctuation_dropout_prob <= 1:
+        parser.error("--punctuation_dropout_prob must be in [0, 1].")
     return args
 
 
@@ -163,6 +184,8 @@ def build_dataset(
     args,
     speaker_counts,
     speaker_audio_paths,
+    *,
+    punctuation_dropout_prob=0.0,
 ):
     return Text2SemanticDataset(
         data,
@@ -177,6 +200,10 @@ def build_dataset(
         speaker_audio_paths_by_id=speaker_audio_paths,
         min_speaker_records=args.min_speaker_records,
         max_target_seconds=args.max_target_seconds,
+        punctuation_dropout_prob=punctuation_dropout_prob,
+        punctuation_dropout_keep_word_spaces=(
+            args.punctuation_dropout_keep_word_spaces
+        ),
         seed=args.seed,
     )
 
@@ -479,7 +506,10 @@ def train():
         args,
         train_speaker_counts,
         train_speaker_audio_paths,
+        punctuation_dropout_prob=args.punctuation_dropout_prob,
     )
+    # The eval split keeps its punctuation: an augmented eval set would
+    # make the loss/accuracy curve move for reasons unrelated to training.
     eval_dataset = build_dataset(
         eval_data,
         tokenizer,
@@ -492,6 +522,11 @@ def train():
         f"Train samples: {len(train_dataset):,}/{train_dataset.raw_size:,} "
         f"after filtering; eval samples: {len(eval_dataset):,}/"
         f"{eval_dataset.raw_size:,} after filtering"
+    )
+    accelerator.print(
+        "Punctuation dropout (train split only): p="
+        f"{args.punctuation_dropout_prob}, keep_word_spaces="
+        f"{args.punctuation_dropout_keep_word_spaces}"
     )
     train_generator = torch.Generator()
     train_generator.manual_seed(args.seed)
