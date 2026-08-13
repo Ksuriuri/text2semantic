@@ -30,7 +30,7 @@ class Text2SemanticDataset(Dataset):
         min_speaker_records=2,
         max_target_seconds=30.0,
         punctuation_dropout_prob=0.0,
-        punctuation_dropout_keep_word_spaces=False,
+        punctuation_dropout_keep_word_spaces=True,
         seed=42,
     ):
         self.raw_size = len(data)

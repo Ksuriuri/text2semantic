@@ -65,7 +65,7 @@ def test_parse_args_defaults_match_dataset_limits(monkeypatch):
     assert args.max_target_seconds == 30.0
     assert args.min_speaker_records == 2
     assert args.punctuation_dropout_prob == 0.1
-    assert args.punctuation_dropout_keep_word_spaces is False
+    assert args.punctuation_dropout_keep_word_spaces is True
 
 
 def test_speaker_statistics_are_split_local():
@@ -265,7 +265,7 @@ def test_build_dataset_augments_train_text_but_not_eval_text():
         max_semantic_tokens=None,
         min_speaker_records=2,
         max_target_seconds=30.0,
-        punctuation_dropout_keep_word_spaces=False,
+        punctuation_dropout_keep_word_spaces=True,
         seed=42,
     )
     model_config = SimpleNamespace(

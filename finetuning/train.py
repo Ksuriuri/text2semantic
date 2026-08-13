@@ -67,10 +67,12 @@ def parse_args():
     parser.add_argument(
         "--punctuation_dropout_keep_word_spaces",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
-            "Keep single spaces between words when dropping punctuation. "
-            "Off by default, i.e. spaces go too."
+            "Keep single spaces between words when dropping punctuation, "
+            "so space-separated scripts keep their word boundaries.  On by "
+            "default; --no-punctuation_dropout_keep_word_spaces drops the "
+            "spaces as well."
         ),
     )
     parser.add_argument("--num_workers", type=int, default=0)

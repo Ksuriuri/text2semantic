@@ -597,8 +597,14 @@ def test_strip_pause_marks_keeps_marks_glued_inside_a_word():
     # Orthography, not prosody: dropping these changes what is read out.
     assert strip_pause_marks("It is 3.14, not 12:30.") == "Itis3.14not12:30"
     assert strip_pause_marks("don't stop state-of-the-art!") == "don'tstopstate-of-the-art"
-    # Only ASCII words get the exemption, so a CJK comma between hanzi still goes.
+    # The exemption needs all three characters to be ASCII, so a CJK comma
+    # goes whether its neighbours are hanzi or Latin letters (mixed text).
     assert strip_pause_marks("好，好") == "好好"
+    assert strip_pause_marks("hello，world") == "helloworld"
+    assert (
+        strip_pause_marks("中英 mixed，text", keep_word_spaces=True)
+        == "中英 mixedtext"
+    )
 
 
 def test_strip_pause_marks_can_keep_word_boundaries():
@@ -642,16 +648,28 @@ def test_punctuation_dropout_hits_roughly_the_configured_rate():
     assert 20 <= stripped <= 60
 
 
-def test_punctuation_dropout_can_keep_word_spaces():
+def test_punctuation_dropout_keeps_word_spaces_by_default():
     tokenizer = RecordingTokenizer()
     dataset = _dropout_dataset(
         tokenizer,
         text="Hello, world!",
         punctuation_dropout_prob=1.0,
-        punctuation_dropout_keep_word_spaces=True,
     )
+    assert dataset.punctuation_dropout_keep_word_spaces is True
     dataset[0]
     assert "\nHello world<|im_end|>" in tokenizer.prompts[-1]
+
+
+def test_punctuation_dropout_can_drop_word_spaces_too():
+    tokenizer = RecordingTokenizer()
+    dataset = _dropout_dataset(
+        tokenizer,
+        text="Hello, world!",
+        punctuation_dropout_prob=1.0,
+        punctuation_dropout_keep_word_spaces=False,
+    )
+    dataset[0]
+    assert "\nHelloworld<|im_end|>" in tokenizer.prompts[-1]
 
 
 def test_punctuation_dropout_keeps_text_that_would_strip_to_nothing():

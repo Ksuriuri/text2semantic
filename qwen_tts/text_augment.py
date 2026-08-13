@@ -34,13 +34,16 @@ def _is_ascii_word_char(char):
     return char.isascii() and char.isalnum()
 
 
-def _inside_ascii_word(text, index):
-    """True for a mark glued between two ASCII alphanumerics.
+def _inside_ascii_word(text, index, char):
+    """True for an ASCII mark glued between two ASCII alphanumerics.
 
     That is the orthographic case, not the prosodic one: 3.14, 12:30, don't,
-    state-of-the-art, AC/DC.  Restricted to ASCII on purpose, so that a CJK
-    comma between two hanzi still counts as a pause cue.
+    state-of-the-art, AC/DC.  All three characters have to be ASCII: a CJK comma
+    between two hanzi is a pause cue, and so is a fullwidth comma between two
+    Latin letters in mixed text ("hello，world").
     """
+    if not char.isascii():
+        return False
     if index == 0 or index + 1 >= len(text):
         return False
     return _is_ascii_word_char(text[index - 1]) and _is_ascii_word_char(
@@ -56,7 +59,7 @@ def _is_pause_mark(text, index, char):
     category = unicodedata.category(char)
     if category[0] not in _REMOVED_CATEGORY_STARTS and category != "Cc":
         return False
-    return not _inside_ascii_word(text, index)
+    return not _inside_ascii_word(text, index, char)
 
 
 def strip_pause_marks(text, *, keep_word_spaces=False):
