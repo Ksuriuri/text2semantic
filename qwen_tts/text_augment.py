@@ -25,8 +25,9 @@ _EXTRA_MARKS = frozenset("~～")
 _KEPT_MARKS = frozenset("%@&#/_")
 
 # Candidate categories: P* (every punctuation class), Z* (every separator,
-# including NBSP and the ideographic space) and Cc (\n, \r, \t, \v, \f).
-# Letters, digits and symbols ($ + = < > °) are never touched.
+# including NBSP and the ideographic space) and Cc (\r, \t, \v, \f).  Line feeds
+# are handled separately and always survive.  Letters, digits and symbols
+# ($ + = < > °) are never touched.
 _REMOVED_CATEGORY_STARTS = ("P", "Z")
 
 
@@ -62,26 +63,36 @@ def _is_pause_mark(text, index, char):
     return not _inside_ascii_word(text, index, char)
 
 
-def strip_pause_marks(text, *, keep_word_spaces=False):
-    """Return `text` with pause punctuation, spaces and line breaks removed.
+def _strip_line(line, keep_word_spaces):
+    kept = []
+    for index, char in enumerate(line):
+        if char.isspace():
+            if keep_word_spaces:
+                kept.append(" ")
+            continue
+        if _is_pause_mark(line, index, char):
+            continue
+        kept.append(char)
+    stripped = "".join(kept)
+    return " ".join(stripped.split()) if keep_word_spaces else stripped
 
-    `keep_word_spaces=True` collapses runs of whitespace into a single space
-    instead of deleting them, which preserves word boundaries in
-    space-separated scripts while still removing all pause punctuation.
+
+def strip_pause_marks(text, *, keep_word_spaces=False):
+    """Return `text` with its pause punctuation removed.
+
+    Line feeds always survive, and the layout around them is preserved: the text
+    is split on "\\n", each line is stripped on its own, and the lines are
+    rejoined, so blank lines stay blank lines.
+
+    `keep_word_spaces=True` collapses the remaining whitespace inside a line
+    into single spaces instead of deleting it, which preserves word boundaries
+    in space-separated scripts while still removing all pause punctuation.
 
     The result can legitimately be empty (a transcript that is nothing but
     punctuation); callers decide what to do with that.
     """
     if not isinstance(text, str):
         raise TypeError("text must be a string.")
-    kept = []
-    for index, char in enumerate(text):
-        if char.isspace():
-            if keep_word_spaces:
-                kept.append(" ")
-            continue
-        if _is_pause_mark(text, index, char):
-            continue
-        kept.append(char)
-    stripped = "".join(kept)
-    return " ".join(stripped.split()) if keep_word_spaces else stripped
+    return "\n".join(
+        _strip_line(line, keep_word_spaces) for line in text.split("\n")
+    )

@@ -580,8 +580,8 @@ def _dropout_dataset(tokenizer, text="你好，世界！", **kwargs):
     )
 
 
-def test_strip_pause_marks_removes_punctuation_spaces_and_newlines():
-    assert strip_pause_marks("你好，世界！\n真的吗？") == "你好世界真的吗"
+def test_strip_pause_marks_removes_punctuation_and_spaces():
+    assert strip_pause_marks("你好，世界！\n真的吗？") == "你好世界\n真的吗"
     assert strip_pause_marks("Hello, world!\tHow are you?") == "HelloworldHowareyou"
     # Ideographic space and NBSP are separators too.
     assert strip_pause_marks("a\u3000b\u00a0c") == "abc"
@@ -610,9 +610,23 @@ def test_strip_pause_marks_keeps_marks_glued_inside_a_word():
 def test_strip_pause_marks_can_keep_word_boundaries():
     assert (
         strip_pause_marks("Hello, world!\n How  are you?", keep_word_spaces=True)
-        == "Hello world How are you"
+        == "Hello world\nHow are you"
     )
     assert strip_pause_marks("你好，世界。", keep_word_spaces=True) == "你好世界"
+
+
+def test_strip_pause_marks_keeps_the_line_layout():
+    # Line feeds are pauses the writer already committed to, so they stay,
+    # and blank lines stay blank lines.
+    assert strip_pause_marks("第一行。\n\n第二行！") == "第一行\n\n第二行"
+    # A CRLF transcript keeps the LF and loses the CR.
+    assert strip_pause_marks("one, two\r\nthree.") == "onetwo\nthree"
+    assert (
+        strip_pause_marks("one, two\r\nthree.", keep_word_spaces=True)
+        == "one two\nthree"
+    )
+    # Only the punctuation goes on an all-punctuation line.
+    assert strip_pause_marks("a\n……\nb") == "a\n\nb"
 
 
 def test_strip_pause_marks_may_strip_everything():
@@ -680,6 +694,15 @@ def test_punctuation_dropout_keeps_text_that_would_strip_to_nothing():
     # An all-punctuation transcript must not become an empty prompt.
     dataset[0]
     assert "\n……！！<|im_end|>" in tokenizer.prompts[-1]
+
+
+def test_punctuation_dropout_keeps_the_line_feeds_of_a_sample():
+    tokenizer = RecordingTokenizer()
+    dataset = _dropout_dataset(
+        tokenizer, text="你好，世界！\n真的吗？", punctuation_dropout_prob=1.0
+    )
+    dataset[0]
+    assert "\n你好世界\n真的吗<|im_end|>" in tokenizer.prompts[-1]
 
 
 def test_punctuation_dropout_rejects_probabilities_outside_the_unit_range():

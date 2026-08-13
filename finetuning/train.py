@@ -59,9 +59,9 @@ def parse_args():
         type=float,
         default=0.1,
         help=(
-            "Probability of removing every punctuation mark, space and "
-            "line break from a training sample's text, so the model has "
-            "to place the pauses itself.  Train split only."
+            "Probability of removing the written pause marks from a "
+            "training sample's text, so the model has to place the pauses "
+            "itself.  Line feeds are always kept.  Train split only."
         ),
     )
     parser.add_argument(
