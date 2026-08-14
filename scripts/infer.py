@@ -44,13 +44,34 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-DEFAULT_INDEXTTS_ROOT = "/mnt/data_sdd/hhy/indextts-new/index-tts"
-DEFAULT_CODEC_DIR = (
-    "/mnt/data_sdd/hhy/indextts-new/index-tts/checkpoints/indextts25_codec"
+def _first_existing(*paths: str) -> str:
+    for path in paths:
+        if path and os.path.exists(path):
+            return path
+    return paths[0]
+
+
+DEFAULT_INDEXTTS_ROOT = _first_existing(
+    "/hunshan/hhy/workspace/indextts-new/index-tts",
+    "/mnt/data_sdd/hhy/indextts-new/index-tts",
 )
-DEFAULT_BIGVGAN_DIR = "/mnt/data_sdd/hhy/indextts-2.5/checkpoints/hf_cache/bigvgan"
-DEFAULT_W2V_BERT = os.path.join(DEFAULT_CODEC_DIR, "w2v-bert-2.0")
-DEFAULT_STATS = os.path.join(DEFAULT_CODEC_DIR, "wav2vec2bert_stats.pt")
+DEFAULT_CODEC_DIR = _first_existing(
+    "/hunshan/hhy/models/IndexTTS-2.5",
+    "/mnt/data_sdd/hhy/indextts-new/index-tts/checkpoints/indextts25_codec",
+)
+DEFAULT_BIGVGAN_DIR = _first_existing(
+    os.path.join(DEFAULT_CODEC_DIR, "bigvgan"),
+    "/hunshan/hhy/models/IndexTTS-2-vLLM/bigvgan",
+    "/mnt/data_sdd/hhy/indextts-2.5/checkpoints/hf_cache/bigvgan",
+)
+DEFAULT_W2V_BERT = _first_existing(
+    os.path.join(DEFAULT_CODEC_DIR, "w2v-bert-2.0"),
+    "/hunshan/hhy/models/IndexTTS-2-vLLM/w2v-bert-2.0",
+)
+DEFAULT_STATS = _first_existing(
+    os.path.join(DEFAULT_CODEC_DIR, "wav2vec2bert_stats.pt"),
+    "/hunshan/hhy/models/IndexTTS-2-vLLM/wav2vec2bert_stats.pt",
+)
 
 # Official infer_v2_5.py constants. length_regulator sees *decoded* 50 Hz
 # features, so this is the same 1.72 used by the old 50 Hz codec — decode()
