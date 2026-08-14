@@ -144,6 +144,26 @@ uv run accelerate launch finetuning/train.py \
 
 ## 推理
 
+`Text2SemanticModel.generate()` 只产出 25 Hz semantic codes（不含 BOS/EOS）。
+完整波形推理走 `scripts/infer.py`，后半段与 IndexTTS-2.5 `infer_v2_5.py` 对齐：
+
+1. 参考音频 + 目标文本 → 本项目 AR 模型 → 25 Hz codes
+2. `EnhancedCodec.decode(codes)` 上采样回 50 Hz 连续特征（不要把 25 Hz id 直接喂给 s2mel）
+3. s2mel 的 prompt 用原始 w2v-bert 特征（不经过 codec）；target 用 decode 后的 50 Hz 特征，`target_lengths = decoded_T * 1.72`
+4. CAMPPlus + CFM + BigVGAN → 22.05 kHz wav
+
+当前训练用的是 IndexTTS-2.5 EnhancedCodec，**不能**用旧的 MaskGCT 50 Hz vocoder 或旧 overfit checkpoint。
+
+```bash
+python scripts/infer.py \
+  --checkpoint /path/to/checkpoint-step-5000 \
+  --ref-audio /path/to/ref.wav \
+  --text "这是一句测试文本。" \
+  --out /tmp/out.wav
+```
+
+只看 codes：
+
 ```python
 import torch
 from qwen_tts import Text2SemanticModel
@@ -163,8 +183,6 @@ semantic_tokens = model.generate(
     top_k=30,
 )
 ```
-
-返回值是每条文本对应的一维 token tensor，不包含 BOS/EOS，也不返回音频。
 
 ## 测试
 
