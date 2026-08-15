@@ -24,6 +24,23 @@ uv pip install flash-attn --no-build-isolation
 默认训练使用 BF16 和 FlashAttention 2。没有 FlashAttention 时可传
 `--attn_implementation sdpa`。
 
+## 完整推理（波形）与 WebUI
+
+当前训练预测的是 IndexTTS-2.5 EnhancedCodec 的 25 Hz codes。完整出音频：
+
+参考音频 + 文本 → text2semantic AR → `EnhancedCodec.decode`（50 Hz）→ s2mel → BigVGAN。
+
+新机器部署、目录布局、环境变量见 [docs/inference-webui.md](docs/inference-webui.md)。
+
+```bash
+# 命令行
+python scripts/infer.py --checkpoint /path/to/ckpt --ref-audio ref.wav --text "测试" --out out.wav
+
+# WebUI（先 export T2S_CHECKPOINT INDEXTTS_ROOT CODEC_DIR）
+pip install -e ".[infer]"
+bash scripts/launch_webui.sh
+```
+
 ## 数据预处理
 
 原始 JSONL 每行需要目标音频和对应文本，并且必须能提供独立于目标音频的

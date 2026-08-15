@@ -29,6 +29,12 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
+infer = [
+    "gradio>=4.0",
+    "omegaconf",
+    "torchaudio",
+    "munch",
+]
 
 [tool.setuptools.packages.find]
 include = ["finetuning*", "qwen_tts*", "data_pipeline*"]
