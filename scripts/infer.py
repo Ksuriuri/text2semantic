@@ -85,6 +85,23 @@ FEATURE_FPS = 50.0
 CODEBOOK_SIZE = 8192
 
 
+def _load_bigvgan_local(bigvgan_mod, bigvgan_dir: str):
+    """Load BigVGAN from a local dir. Avoids huggingface_hub mixin kwargs
+    that newer hub versions no longer pass through to `_from_pretrained`."""
+    config_path = os.path.join(bigvgan_dir, "config.json")
+    weight_path = os.path.join(bigvgan_dir, "bigvgan_generator.pt")
+    if not os.path.isfile(config_path) or not os.path.isfile(weight_path):
+        raise FileNotFoundError(
+            f"BigVGAN local files missing under {bigvgan_dir}"
+        )
+    h = bigvgan_mod.load_hparams_from_json(config_path)
+    voc = bigvgan_mod.BigVGAN(h, use_cuda_kernel=False)
+    ckpt = torch.load(weight_path, map_location="cpu")
+    state = ckpt["generator"] if isinstance(ckpt, dict) and "generator" in ckpt else ckpt
+    voc.load_state_dict(state)
+    return voc
+
+
 def _import_indextts(indextts_root: str):
     root = os.path.abspath(indextts_root)
     if root not in sys.path:
@@ -196,9 +213,7 @@ class IndexTTS25Vocoder:
         campplus.load_state_dict(torch.load(campplus_ckpt, map_location="cpu"))
         self.campplus = campplus.to(device).eval()
 
-        voc = mods["bigvgan"].BigVGAN.from_pretrained(
-            bigvgan_dir, use_cuda_kernel=False
-        )
+        voc = _load_bigvgan_local(mods["bigvgan"], bigvgan_dir)
         voc = voc.to(device)
         voc.remove_weight_norm()
         self.bigvgan = voc.eval()
@@ -341,10 +356,18 @@ def generate_codes(t2s, text: str, ref_audio: str, **gen_kwargs) -> torch.Tensor
 
 def save_wav(path: str, wav: torch.Tensor, sr: int) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-    wav = wav.detach().cpu()
+    wav = wav.detach().cpu().float()
     if wav.ndim == 1:
         wav = wav.unsqueeze(0)
-    torchaudio.save(path, wav, sr, encoding="PCM_S", bits_per_sample=16)
+    pcm = (wav.clamp(-1.0, 1.0) * 32767.0).to(torch.int16).numpy()
+    # torchaudio 2.11+ save() requires torchcodec; write PCM16 directly.
+    import wave
+
+    with wave.open(path, "wb") as handle:
+        handle.setnchannels(int(pcm.shape[0]))
+        handle.setsampwidth(2)
+        handle.setframerate(int(sr))
+        handle.writeframes(pcm.T.tobytes() if pcm.shape[0] > 1 else pcm.tobytes())
 
 
 def parse_args(argv=None):
