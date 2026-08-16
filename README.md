@@ -43,9 +43,12 @@ bash scripts/launch_webui.sh
 
 ## 数据预处理
 
-原始 JSONL 每行需要目标音频和对应文本，并且必须能提供独立于目标音频的
-speaker reference。可以显式提供 `ref_audio`，或提供 `speaker_id` 让训练集从同一
-speaker 的其他音频中选择参考音频；无法找到独立参考音频的样本会被过滤：
+**默认**从打包的 speaker ref shard 读参考音频（`refs/speaker_index.jsonl` +
+`refs/shards/*.tar`）。布局、字段和启动参数见
+[docs/train-ref-shards.md](docs/train-ref-shards.md)。没有 index 时回退到散文件。
+
+旧的 JSONL 仍可显式提供 `ref_audio`，或提供 `speaker_id` 从同一 speaker 的其他
+散落音频里选参考；无法找到独立参考音频的样本会被过滤：
 
 ```json
 {"audio":"./data/utt0001.wav","ref_audio":"./refs/spk1.wav","text":"这是一条训练文本。"}

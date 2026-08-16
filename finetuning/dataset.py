@@ -27,6 +27,7 @@ class Text2SemanticDataset(Dataset):
         max_semantic_tokens=None,
         speaker_counts=None,
         speaker_audio_paths_by_id=None,
+        ref_store=None,
         min_speaker_records=2,
         max_target_seconds=30.0,
         min_target_seconds=3.0,
@@ -43,9 +44,15 @@ class Text2SemanticDataset(Dataset):
         self.max_text_tokens = max_text_tokens
         self.max_semantic_tokens = max_semantic_tokens
         self.speaker_counts = speaker_counts or self._count_speakers(data)
+        self.ref_store = ref_store
         self.speaker_audio_paths_by_id = (
             speaker_audio_paths_by_id
-            or self._collect_speaker_audio_paths(data)
+            if speaker_audio_paths_by_id is not None
+            else (
+                {}
+                if ref_store is not None
+                else self._collect_speaker_audio_paths(data)
+            )
         )
         self.min_speaker_records = min_speaker_records
         self.max_target_seconds = max_target_seconds
@@ -105,7 +112,7 @@ class Text2SemanticDataset(Dataset):
     def _is_usable(self, item):
         if not self._has_usable_text(item):
             return False
-        if self._speaker_audio_path(item) is None:
+        if not self._has_speaker_ref(item):
             return False
         speaker_key = self._speaker_key(item)
         if (
@@ -182,7 +189,8 @@ class Text2SemanticDataset(Dataset):
         speaker_audio_path = self._speaker_audio_path(item, index)
         if speaker_audio_path is None:
             raise ValueError(
-                "Each sample needs 'ref_audio', 'audio', or 'audio_path'."
+                "Each sample needs a packed ref (speaker_index), "
+                "'ref_audio', or another clip of the same speaker."
             )
         codes = self._semantic_codes(item)
         if codes.numel() == 0:
@@ -202,6 +210,22 @@ class Text2SemanticDataset(Dataset):
             "speaker_audio_path": speaker_audio_path,
         }
 
+    def _has_speaker_ref(self, item):
+        explicit = item.get("ref_audio") or item.get("ref_audio_path")
+        target_audio_path = self._target_audio_path(item)
+        if explicit is not None:
+            return explicit != target_audio_path
+        speaker_key = self._speaker_key(item)
+        if speaker_key is None:
+            return False
+        if self.ref_store is not None:
+            exclude = item.get("id")
+            return self.ref_store.has_usable_ref(
+                speaker_key,
+                exclude=None if exclude is None else str(exclude),
+            )
+        return self._speaker_audio_path(item) is not None
+
     def _speaker_audio_path(self, item, index=None):
         """Reference clip for `item`, or None when the speaker has no other clip.
 
@@ -217,6 +241,17 @@ class Text2SemanticDataset(Dataset):
         speaker_key = self._speaker_key(item)
         if speaker_key is None:
             return None
+        if self.ref_store is not None:
+            rng = None
+            if index is not None:
+                rng = random.Random(self.seed + index)
+            exclude = None
+            target_id = item.get("id")
+            if target_id is not None:
+                exclude = str(target_id)
+            return self.ref_store.pick_path(
+                speaker_key, exclude=exclude, rng=rng
+            )
         candidates = self.speaker_audio_paths_by_id.get(speaker_key, ())
         if not candidates:
             return None

@@ -13,6 +13,7 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed
 from dotenv import load_dotenv
 from finetuning.dataset import Text2SemanticDataset
+from finetuning.ref_store import SpeakerRefStore, default_ref_index_path
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
@@ -40,6 +41,36 @@ def parse_args():
     parser.add_argument("--max_target_seconds", type=float, default=30.0)
     parser.add_argument("--min_target_seconds", type=float, default=3.0)
     parser.add_argument("--min_speaker_records", type=int, default=2)
+    parser.add_argument(
+        "--ref_index",
+        default=None,
+        help=(
+            "Path to refs/speaker_index.jsonl (or .parquet). Default: look "
+            "next to --train_jsonl for ../refs/speaker_index.jsonl. "
+            "Packed speaker refs are the default read path."
+        ),
+    )
+    parser.add_argument(
+        "--ref_root",
+        default=None,
+        help="Trainset refs/ directory. Default: parent of --ref_index.",
+    )
+    parser.add_argument(
+        "--ref_cache",
+        default=None,
+        help="Local extract cache for packed refs. Default: refs/.extract-cache",
+    )
+    parser.add_argument(
+        "--refs_per_speaker",
+        type=int,
+        default=0,
+        help="Use at most N packed refs per speaker. 0 = all packed refs.",
+    )
+    parser.add_argument(
+        "--loose_refs",
+        action="store_true",
+        help="Ignore packed refs and use loose audio_path files (legacy).",
+    )
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--eval_batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=4e-5)
@@ -130,6 +161,8 @@ def parse_args():
         parser.error("--min_target_seconds must be non-negative.")
     if args.min_speaker_records < 1:
         parser.error("--min_speaker_records must be positive.")
+    if args.refs_per_speaker < 0:
+        parser.error("--refs_per_speaker must be >= 0 (0 = all packed refs).")
     if not 0 <= args.punctuation_dropout_prob <= 1:
         parser.error("--punctuation_dropout_prob must be in [0, 1].")
     return args
@@ -182,6 +215,25 @@ def speaker_statistics(*datasets):
     return dict(speaker_counts), dict(speaker_audio_paths)
 
 
+def resolve_ref_store(args):
+    if args.loose_refs:
+        return None
+    index_path = args.ref_index
+    if index_path:
+        index_path = os.path.expanduser(index_path)
+    else:
+        discovered = default_ref_index_path(args.train_jsonl)
+        index_path = str(discovered) if discovered is not None else None
+    if not index_path:
+        return None
+    return SpeakerRefStore(
+        index_path,
+        ref_root=args.ref_root,
+        cache_dir=args.ref_cache,
+        refs_per_speaker=args.refs_per_speaker,
+    )
+
+
 def build_dataset(
     data,
     tokenizer,
@@ -191,6 +243,7 @@ def build_dataset(
     speaker_audio_paths,
     *,
     punctuation_dropout_prob=0.0,
+    ref_store=None,
 ):
     return Text2SemanticDataset(
         data,
@@ -203,9 +256,10 @@ def build_dataset(
         max_semantic_tokens=args.max_semantic_tokens,
         speaker_counts=speaker_counts,
         speaker_audio_paths_by_id=speaker_audio_paths,
+        ref_store=ref_store,
         min_speaker_records=args.min_speaker_records,
         max_target_seconds=args.max_target_seconds,
-        min_target_seconds=args.min_target_seconds,
+        min_target_seconds=getattr(args, "min_target_seconds", 3.0),
         punctuation_dropout_prob=punctuation_dropout_prob,
         punctuation_dropout_keep_word_spaces=(
             args.punctuation_dropout_keep_word_spaces
@@ -499,6 +553,19 @@ def train():
 
     train_data = read_jsonl(args.train_jsonl)
     eval_data = read_jsonl(args.eval_jsonl)
+    ref_store = resolve_ref_store(args)
+    if ref_store is not None:
+        accelerator.print(
+            f"Packed refs: index={ref_store.index_path} "
+            f"speakers={len(ref_store):,} "
+            f"refs_per_speaker={args.refs_per_speaker or 'all packed'}"
+        )
+    else:
+        accelerator.print(
+            "Packed refs not found; falling back to loose audio_path files. "
+            "Pass --ref_index or place refs/speaker_index.jsonl next to "
+            "manifests/ to use the default shard layout."
+        )
     train_speaker_counts, train_speaker_audio_paths = speaker_statistics(
         train_data
     )
@@ -513,6 +580,7 @@ def train():
         train_speaker_counts,
         train_speaker_audio_paths,
         punctuation_dropout_prob=args.punctuation_dropout_prob,
+        ref_store=ref_store,
     )
     # The eval split keeps its punctuation: an augmented eval set would
     # make the loss/accuracy curve move for reasons unrelated to training.
@@ -523,6 +591,7 @@ def train():
         args,
         eval_speaker_counts,
         eval_speaker_audio_paths,
+        ref_store=ref_store,
     )
     accelerator.print(
         f"Train samples: {len(train_dataset):,}/{train_dataset.raw_size:,} "
