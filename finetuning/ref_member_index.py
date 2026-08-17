@@ -11,11 +11,16 @@ A shard's headers never change after packing, so they are scanned once into a
 sidecar::
 
     refs/.member-index/refs-000123.json
-    {"members": {"spk_1/000.flac": [1536, 214528], ...}}
+    {"shard_size": 544210944, "members": {"spk_1/000.flac": [1536, 214528], ...}}
 
 After that a ref read is one ``pread`` at a known offset, and the sidecars cost
 about 40 KB per shard (~650 MB for the full t2s-v1 refs set) instead of the
 8.5 TB a full extraction would put on disk.
+
+A sidecar records the shard size it was built from and is rebuilt when that no
+longer matches, and a truncated shard is rejected outright: scanning a tar that
+is still being downloaded yields a short member list without raising, and a
+sidecar built from one would silently hide every ref past the cut.
 """
 
 from __future__ import annotations
@@ -46,6 +51,7 @@ def index_path_for(shard_path, index_dir):
 def scan_shard(shard_path):
     """{member name: (data offset, size)} for every regular file in the tar."""
     shard_path = Path(shard_path)
+    shard_size = shard_path.stat().st_size
     members = {}
     # "r:" refuses a compressed archive on purpose: a member's byte offset is
     # only meaningful in an uncompressed tar, which is what the packer writes.
@@ -55,6 +61,29 @@ def scan_shard(shard_path):
                 members[info.name] = (info.offset_data, info.size)
     if not members:
         raise ValueError(f"no files in ref shard {shard_path}")
+    # A cut that lands on a block boundary makes tarfile stop early and report no
+    # error at all, so completeness has to be checked against the shard itself:
+    # a finished tar is whole-blocks long, ends with two zero blocks, and holds
+    # every member's data inside its own length.
+    if shard_size % tarfile.BLOCKSIZE:
+        raise ValueError(
+            f"ref shard {shard_path} is {shard_size} bytes, not a whole number "
+            f"of {tarfile.BLOCKSIZE}-byte blocks (still being written?)"
+        )
+    trailer = 2 * tarfile.BLOCKSIZE
+    with open(shard_path, "rb") as handle:
+        handle.seek(-min(trailer, shard_size), os.SEEK_END)
+        if handle.read() != b"\0" * trailer:
+            raise ValueError(
+                f"ref shard {shard_path} does not end in the two zero blocks "
+                f"that close a tar (truncated or still being written?)"
+            )
+    for name, (offset, size) in members.items():
+        if offset + size > shard_size:
+            raise ValueError(
+                f"ref shard {shard_path} is truncated: {name} needs "
+                f"{offset + size} bytes but the shard is {shard_size}"
+            )
     return members
 
 
@@ -67,6 +96,7 @@ def build_shard_index(shard_path, index_dir, *, overwrite=False):
     payload = {
         "format_version": FORMAT_VERSION,
         "shard": Path(shard_path).name,
+        "shard_size": Path(shard_path).stat().st_size,
         "members": {name: list(value) for name, value in members.items()},
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -84,7 +114,9 @@ def read_shard_index(shard_path, index_dir, *, build_if_missing=True):
             raise FileNotFoundError(f"missing ref member index: {out_path}")
         build_shard_index(shard_path, index_dir)
     payload = json.loads(out_path.read_text())
-    if payload.get("format_version") != FORMAT_VERSION:
+    if payload.get("format_version") != FORMAT_VERSION or payload.get(
+        "shard_size"
+    ) != Path(shard_path).stat().st_size:
         build_shard_index(shard_path, index_dir, overwrite=True)
         payload = json.loads(out_path.read_text())
     return {

@@ -186,6 +186,55 @@ def test_ref_member_index_reads_the_same_bytes_as_tarfile(tmp_path):
     assert sidecar.is_file()
 
 
+def test_member_index_refuses_a_half_written_shard(tmp_path):
+    root, _ = _build_trainset(tmp_path, [_row("keep-1")])
+    shard = root / "refs" / "shards" / "refs-000000.tar"
+    index_dir = ref_member_index.index_dir_for(root / "refs")
+    whole = shard.read_bytes()
+    with tarfile.open(shard) as archive:
+        first, second = archive.getmembers()[:2]
+    block = tarfile.BLOCKSIZE
+
+    def blocks(size):
+        return -(-size // block) * block
+
+    # The dangerous cut is the one tarfile does NOT complain about: on a block
+    # boundary, it lists the members it has seen and stops silently. Here that
+    # hides the second and third refs of the shard.
+    aligned = first.offset_data + blocks(first.size)
+    shard.write_bytes(whole[:aligned])
+    with tarfile.open(shard) as archive:
+        assert [info.name for info in archive] == [first.name]
+    for cut in (aligned, second.offset_data + second.size // 2, len(whole) // 2):
+        shard.write_bytes(whole[:cut])
+        try:
+            ref_member_index.build_shard_index(shard, index_dir)
+        except (ValueError, tarfile.TarError):
+            pass
+        else:  # pragma: no cover - the guard is the point of the test
+            raise AssertionError(f"expected the shard cut at {cut} to be rejected")
+        assert not ref_member_index.index_path_for(shard, index_dir).exists()
+
+    shard.write_bytes(whole)
+    members = ref_member_index.read_shard_index(shard, index_dir)
+    assert set(members) == {"spkA/000.wav", "spkA/001.wav", "spkB/000.wav"}
+
+
+def test_member_index_rebuilds_when_the_shard_size_changes(tmp_path):
+    root, _ = _build_trainset(tmp_path, [_row("keep-1")])
+    shard = root / "refs" / "shards" / "refs-000000.tar"
+    index_dir = ref_member_index.index_dir_for(root / "refs")
+    ref_member_index.build_shard_index(shard, index_dir)
+    sidecar = ref_member_index.index_path_for(shard, index_dir)
+    stale = json.loads(sidecar.read_text())
+    stale["shard_size"] = 12345
+    stale["members"] = {"gone.wav": [0, 0]}
+    sidecar.write_text(json.dumps(stale))
+    members = ref_member_index.read_shard_index(shard, index_dir)
+    assert "gone.wav" not in members
+    assert "spkA/000.wav" in members
+
+
 def test_memmapped_speaker_index_answers_like_the_dict(tmp_path):
     root, _ = _build_trainset(tmp_path, [_row("keep-1")])
     index_jsonl = root / "refs" / "speaker_index.jsonl"
