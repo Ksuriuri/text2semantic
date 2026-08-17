@@ -1,0 +1,500 @@
+# Copyright 2026
+# SPDX-License-Identifier: Apache-2.0
+"""One shared, memmapped row index per manifest jsonl.
+
+Reading a manifest with ``read_jsonl`` keeps every row in a Python list, which
+costs roughly 1.9 KB per 573-byte row: the 54 GB t2s-v1 train manifest needs
+~174 GiB that way, so eight ranks on one node cannot hold even one copy between
+them.  This module builds a small on-disk index instead::
+
+    <manifest>.index/meta.json      build parameters and row counts
+    <manifest>.index/offsets.u64    byte offset of each kept row
+    <manifest>.index/lengths.u32    byte length of each kept row
+
+Every rank memmaps the same two arrays and ``pread``s rows out of the same
+jsonl, so the node holds a single copy in page cache no matter how many ranks
+and DataLoader workers read it.  1.1 GB of index for 94M rows, and a row is
+parsed only when it is actually sampled.
+
+Filtering runs once, at build time, and only surviving rows get an entry, so
+``__getitem__`` does no filtering work and the training loop never sees a row it
+cannot use.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from array import array
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import numpy as np
+
+try:  # orjson parses these rows ~4x faster; the stdlib is a fine fallback.
+    import orjson
+
+    def _loads(payload):
+        return orjson.loads(payload)
+
+except ImportError:  # pragma: no cover - depends on the environment
+
+    def _loads(payload):
+        return json.loads(payload)
+
+
+FORMAT_VERSION = 1
+META_NAME = "meta.json"
+OFFSETS_NAME = "offsets.u64"
+LENGTHS_NAME = "lengths.u32"
+_FLUSH_ROWS = 1 << 20
+
+
+def index_dir_for(jsonl_path):
+    return Path(str(Path(jsonl_path).expanduser().resolve()) + ".index")
+
+
+@dataclass(frozen=True)
+class FilterParams:
+    """Everything that decides whether a manifest row is kept.
+
+    Recorded in ``meta.json`` so a run that changes, say, ``min_target_seconds``
+    rebuilds the index instead of silently training on the previous filter.
+    """
+
+    min_target_seconds: float | None = 0.5
+    max_target_seconds: float | None = 30.0
+    max_semantic_tokens: int | None = None
+    min_speaker_records: int = 2
+    refs_per_speaker: int = 0
+    ref_index: str | None = None
+
+    def as_meta(self):
+        return asdict(self)
+
+
+class ManifestIndex:
+    """Random access to the kept rows of a manifest jsonl.
+
+    ``prefiltered`` tells :class:`Text2SemanticDataset` that the filtering has
+    already happened, so it must not walk the rows again.
+    """
+
+    prefiltered = True
+
+    def __init__(self, jsonl_path, index_dir=None, *, code_root=None):
+        self.jsonl_path = Path(jsonl_path).expanduser().resolve()
+        self.index_dir = (
+            Path(index_dir).expanduser().resolve()
+            if index_dir is not None
+            else index_dir_for(self.jsonl_path)
+        )
+        self.meta = json.loads((self.index_dir / META_NAME).read_text())
+        self.offsets = np.memmap(
+            self.index_dir / OFFSETS_NAME, dtype="<u8", mode="r"
+        )
+        self.lengths = np.memmap(
+            self.index_dir / LENGTHS_NAME, dtype="<u4", mode="r"
+        )
+        if len(self.offsets) != len(self.lengths):
+            raise ValueError(f"corrupt manifest index: {self.index_dir}")
+        # Compact code paths are stored relative to the manifests/ directory
+        # ("../codes/ears/ears-000003.u2.bin"), so they only resolve against the
+        # manifest, never against whatever directory the job was launched from.
+        self.code_root = (
+            Path(code_root).expanduser().resolve()
+            if code_root is not None
+            else self.jsonl_path.parent
+        )
+        self.raw_size = int(self.meta.get("raw_rows", len(self.offsets)))
+        self.filtered_size = self.raw_size - len(self.offsets)
+        self._path_cache = {}
+        self._fd = None
+        self._fd_pid = None
+
+    def __len__(self):
+        return len(self.offsets)
+
+    def __iter__(self):
+        for index in range(len(self)):
+            yield self[index]
+
+    def __getitem__(self, index):
+        count = len(self)
+        index = int(index)
+        if index < 0:
+            index += count
+        if not 0 <= index < count:
+            raise IndexError(f"row {index} out of range ({count} rows)")
+        payload = os.pread(
+            self._handle(),
+            int(self.lengths[index]),
+            int(self.offsets[index]),
+        )
+        row = _loads(payload)
+        path = row.get("semantic_code_path")
+        if path is not None:
+            row["semantic_code_path"] = self._resolve(path)
+        return row
+
+    def _handle(self):
+        # DataLoader workers are forked, and a file descriptor shared across
+        # processes shares its offset too; pread does not use it, but a stale fd
+        # from before the fork is still worth avoiding.
+        pid = os.getpid()
+        if self._fd is None or self._fd_pid != pid:
+            self._fd = os.open(self.jsonl_path, os.O_RDONLY)
+            self._fd_pid = pid
+        return self._fd
+
+    def _resolve(self, path):
+        resolved = self._path_cache.get(path)
+        if resolved is None:
+            if os.path.isabs(path):
+                resolved = path
+            else:
+                resolved = os.path.normpath(
+                    os.path.join(self.code_root, path)
+                )
+            self._path_cache[path] = resolved
+        return resolved
+
+
+def _speaker_key(row):
+    speaker_id = row.get("speaker_id")
+    if speaker_id is None:
+        return None
+    language = row.get("language") or row.get("lang")
+    return language, str(speaker_id)
+
+
+def _fast_speaker_key(line):
+    """(language, speaker_id) straight out of the raw line, or None.
+
+    The packer writes flat rows with string values, so pulling the two fields
+    out textually skips a full parse of every row in the counting pass.  A row
+    that does not match this shape falls back to the real parser.
+    """
+    speaker_start = line.find('"speaker_id": "')
+    if speaker_start < 0:
+        return None
+    speaker_start += 15
+    speaker_end = line.find('"', speaker_start)
+    if speaker_end < 0:
+        return None
+    speaker_id = line[speaker_start:speaker_end]
+    if "\\" in speaker_id:
+        return None
+    language = None
+    language_start = line.find('"language": "')
+    if language_start >= 0:
+        language_start += 13
+        language_end = line.find('"', language_start)
+        if language_end < 0:
+            return None
+        language = line[language_start:language_end]
+        if "\\" in language:
+            return None
+    return language, speaker_id
+
+
+def _count_speakers(jsonl_path, log):
+    counts = {}
+    started = time.monotonic()
+    with open(jsonl_path, encoding="utf-8") as handle:
+        for row_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            key = _fast_speaker_key(line)
+            if key is None:
+                key = _speaker_key(_loads(line))
+            if key is not None:
+                counts[key] = counts.get(key, 0) + 1
+            if log is not None and row_number % (20 * _FLUSH_ROWS) == 0:
+                log(
+                    f"  counting speakers: {row_number:,} rows, "
+                    f"{len(counts):,} speakers, "
+                    f"{time.monotonic() - started:.0f}s"
+                )
+    return counts
+
+
+class _RefProbe:
+    """Cached 'does this speaker have a ref other than `exclude`' lookup.
+
+    ``SpeakerRefStore.has_usable_ref`` rebuilds the member list on every call,
+    which is far too slow across 94M rows; a speaker's member count answers the
+    question outright unless it has exactly one ref.
+    """
+
+    def __init__(self, ref_store):
+        self.ref_store = ref_store
+        self._cache = {}
+
+    def usable(self, key, exclude):
+        if key is None:
+            return False
+        entry = self._cache.get(key)
+        if entry is None:
+            members = self.ref_store.members(key)
+            entry = (len(members), members[0] if len(members) == 1 else None)
+            self._cache[key] = entry
+        count, only = entry
+        if count == 0:
+            return False
+        if count > 1:
+            return True
+        return only != exclude
+
+
+def _keep(row, params, speaker_counts, ref_probe):
+    text = row.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return False
+    key = _speaker_key(row)
+    if ref_probe is not None:
+        target_id = row.get("id")
+        if not ref_probe.usable(
+            key, None if target_id is None else str(target_id)
+        ):
+            return False
+    elif key is None:
+        return False
+    if (
+        key is not None
+        and params.min_speaker_records > 1
+        and speaker_counts.get(key, 0) < params.min_speaker_records
+    ):
+        return False
+    duration = row.get("duration")
+    if duration is not None:
+        duration = float(duration)
+        if (
+            params.max_target_seconds is not None
+            and duration > params.max_target_seconds
+        ):
+            return False
+        if (
+            params.min_target_seconds is not None
+            and duration < params.min_target_seconds
+        ):
+            return False
+    if params.max_semantic_tokens is not None:
+        length = row.get("semantic_code_length")
+        if length is not None and int(length) > params.max_semantic_tokens:
+            return False
+    return True
+
+
+def build(
+    jsonl_path,
+    *,
+    params,
+    ref_store=None,
+    index_dir=None,
+    log=print,
+):
+    """Write the row index for `jsonl_path` and return its directory.
+
+    ``meta.json`` is written last, so a build that dies half way leaves an
+    index that :func:`load` rejects rather than one it half trusts.
+    """
+    jsonl_path = Path(jsonl_path).expanduser().resolve()
+    index_dir = (
+        Path(index_dir).expanduser().resolve()
+        if index_dir is not None
+        else index_dir_for(jsonl_path)
+    )
+    index_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = index_dir / META_NAME
+    if meta_path.exists():
+        meta_path.unlink()
+
+    speaker_counts = {}
+    if params.min_speaker_records > 1:
+        if log is not None:
+            log(f"Indexing {jsonl_path}: counting speaker records")
+        speaker_counts = _count_speakers(jsonl_path, log)
+        if log is not None:
+            log(f"  {len(speaker_counts):,} speakers")
+
+    ref_probe = None if ref_store is None else _RefProbe(ref_store)
+    offsets = array("Q")
+    lengths = array("I")
+    # The arrays are written in native layout and read back as "<u8"/"<u4".
+    if sys.byteorder != "little" or offsets.itemsize != 8 or lengths.itemsize != 4:
+        raise RuntimeError("manifest_index needs little-endian 8/4-byte arrays.")
+    raw_rows = 0
+    started = time.monotonic()
+    with open(index_dir / OFFSETS_NAME, "wb") as offsets_out, open(
+        index_dir / LENGTHS_NAME, "wb"
+    ) as lengths_out:
+
+        def flush():
+            offsets_out.write(offsets.tobytes())
+            lengths_out.write(lengths.tobytes())
+            del offsets[:]
+            del lengths[:]
+
+        with open(jsonl_path, "rb") as handle:
+            offset = 0
+            for line in handle:
+                length = len(line)
+                start = offset
+                offset += length
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                raw_rows += 1
+                row = _loads(stripped)
+                if not _keep(row, params, speaker_counts, ref_probe):
+                    continue
+                offsets.append(start)
+                lengths.append(len(line.rstrip(b"\r\n")))
+                if len(offsets) >= _FLUSH_ROWS:
+                    flush()
+                    if log is not None:
+                        log(
+                            f"  indexed {raw_rows:,} rows, "
+                            f"{offsets_out.tell() // 8:,} kept, "
+                            f"{time.monotonic() - started:.0f}s"
+                        )
+            flush()
+        kept = offsets_out.tell() // 8
+
+    if kept == 0:
+        raise ValueError(
+            f"No usable rows in {jsonl_path} under {params.as_meta()}."
+        )
+    source = jsonl_path.stat()
+    meta = {
+        "format_version": FORMAT_VERSION,
+        "source": str(jsonl_path),
+        "source_size": source.st_size,
+        "source_mtime_ns": source.st_mtime_ns,
+        "raw_rows": raw_rows,
+        "kept_rows": kept,
+        "speakers": len(speaker_counts),
+        "filters": params.as_meta(),
+        "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True))
+    if log is not None:
+        log(
+            f"Indexed {jsonl_path}: kept {kept:,}/{raw_rows:,} rows in "
+            f"{time.monotonic() - started:.0f}s -> {index_dir}"
+        )
+    return index_dir
+
+
+def _stale(meta, jsonl_path, params):
+    if meta.get("format_version") != FORMAT_VERSION:
+        return "format version changed"
+    source = Path(jsonl_path).stat()
+    if meta.get("source_size") != source.st_size:
+        return "manifest size changed"
+    if meta.get("source_mtime_ns") != source.st_mtime_ns:
+        return "manifest mtime changed"
+    if meta.get("filters") != params.as_meta():
+        return "filter parameters changed"
+    return None
+
+
+def load(
+    jsonl_path,
+    *,
+    params,
+    ref_store=None,
+    index_dir=None,
+    code_root=None,
+    rebuild=False,
+    log=print,
+):
+    """Open the index for `jsonl_path`, building it when it is missing or stale.
+
+    Call this on the main process only, then let the other ranks call it again
+    once the build has finished: two ranks building the same index at once would
+    write the same files.
+    """
+    jsonl_path = Path(jsonl_path).expanduser().resolve()
+    index_dir = (
+        Path(index_dir).expanduser().resolve()
+        if index_dir is not None
+        else index_dir_for(jsonl_path)
+    )
+    meta_path = index_dir / META_NAME
+    reason = "index missing"
+    if not rebuild and meta_path.is_file():
+        try:
+            reason = _stale(json.loads(meta_path.read_text()), jsonl_path, params)
+        except (ValueError, OSError):
+            reason = "index unreadable"
+    if rebuild:
+        reason = "rebuild requested"
+    if reason is not None:
+        if log is not None:
+            log(f"Building manifest index for {jsonl_path.name}: {reason}")
+        build(
+            jsonl_path,
+            params=params,
+            ref_store=ref_store,
+            index_dir=index_dir,
+            log=log,
+        )
+    return ManifestIndex(jsonl_path, index_dir, code_root=code_root)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Build the shared row index for a manifest jsonl."
+    )
+    parser.add_argument("manifest")
+    parser.add_argument("--index_dir", default=None)
+    parser.add_argument("--min_target_seconds", type=float, default=0.5)
+    parser.add_argument("--max_target_seconds", type=float, default=30.0)
+    parser.add_argument("--max_semantic_tokens", type=int, default=None)
+    parser.add_argument("--min_speaker_records", type=int, default=2)
+    parser.add_argument("--refs_per_speaker", type=int, default=0)
+    parser.add_argument("--ref_index", default=None)
+    parser.add_argument("--loose_refs", action="store_true")
+    parser.add_argument("--rebuild", action="store_true")
+    args = parser.parse_args(argv)
+
+    ref_store = None
+    ref_index = args.ref_index
+    if not args.loose_refs:
+        from finetuning.ref_store import (
+            SpeakerRefStore,
+            default_ref_index_path,
+        )
+
+        if ref_index is None:
+            discovered = default_ref_index_path(args.manifest)
+            ref_index = None if discovered is None else str(discovered)
+        if ref_index is not None:
+            ref_store = SpeakerRefStore(
+                ref_index, refs_per_speaker=args.refs_per_speaker
+            )
+    params = FilterParams(
+        min_target_seconds=args.min_target_seconds,
+        max_target_seconds=args.max_target_seconds,
+        max_semantic_tokens=args.max_semantic_tokens,
+        min_speaker_records=args.min_speaker_records,
+        refs_per_speaker=args.refs_per_speaker,
+        ref_index=ref_index,
+    )
+    load(
+        args.manifest,
+        params=params,
+        ref_store=ref_store,
+        index_dir=args.index_dir,
+        rebuild=args.rebuild,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

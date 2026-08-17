@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from dotenv import load_dotenv
+from finetuning import manifest_index
 from finetuning.dataset import Text2SemanticDataset
 from finetuning.ref_store import SpeakerRefStore, default_ref_index_path
 from torch.optim import AdamW
@@ -39,7 +40,7 @@ def parse_args():
     parser.add_argument("--stats_path", required=True)
     parser.add_argument("--max_ref_seconds", type=float, default=20.0)
     parser.add_argument("--max_target_seconds", type=float, default=30.0)
-    parser.add_argument("--min_target_seconds", type=float, default=3.0)
+    parser.add_argument("--min_target_seconds", type=float, default=0.5)
     parser.add_argument("--min_speaker_records", type=int, default=2)
     parser.add_argument(
         "--ref_index",
@@ -70,6 +71,19 @@ def parse_args():
         "--loose_refs",
         action="store_true",
         help="Ignore packed refs and use loose audio_path files (legacy).",
+    )
+    parser.add_argument(
+        "--manifest_index_dir",
+        default=None,
+        help=(
+            "Where the shared row index lives. Default: <manifest>.index next "
+            "to the manifest itself."
+        ),
+    )
+    parser.add_argument(
+        "--rebuild_manifest_index",
+        action="store_true",
+        help="Rebuild the row index even when the cached one still matches.",
     )
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--eval_batch_size", type=int, default=2)
@@ -215,7 +229,7 @@ def speaker_statistics(*datasets):
     return dict(speaker_counts), dict(speaker_audio_paths)
 
 
-def resolve_ref_store(args):
+def resolve_ref_store(args, *, build_index_if_missing=True):
     if args.loose_refs:
         return None
     index_path = args.ref_index
@@ -231,6 +245,42 @@ def resolve_ref_store(args):
         ref_root=args.ref_root,
         cache_dir=args.ref_cache,
         refs_per_speaker=args.refs_per_speaker,
+        build_index_if_missing=build_index_if_missing,
+    )
+
+
+def manifest_filter_params(args, ref_store):
+    return manifest_index.FilterParams(
+        min_target_seconds=args.min_target_seconds,
+        max_target_seconds=args.max_target_seconds,
+        max_semantic_tokens=args.max_semantic_tokens,
+        min_speaker_records=args.min_speaker_records,
+        refs_per_speaker=args.refs_per_speaker,
+        ref_index=None if ref_store is None else str(ref_store.index_path),
+    )
+
+
+def manifest_index_dir(args, manifest_path):
+    if not args.manifest_index_dir:
+        return None
+    name = os.path.basename(os.path.abspath(manifest_path))
+    return os.path.join(args.manifest_index_dir, name + ".index")
+
+
+def open_manifest(manifest_path, args, ref_store, *, log=None):
+    """The manifest as a memmapped, prefiltered row index.
+
+    Every rank opens the same index files and preads the same jsonl, so a node
+    holds one copy of the manifest in page cache rather than one Python list per
+    rank.
+    """
+    return manifest_index.load(
+        manifest_path,
+        params=manifest_filter_params(args, ref_store),
+        ref_store=ref_store,
+        index_dir=manifest_index_dir(args, manifest_path),
+        rebuild=args.rebuild_manifest_index,
+        log=log,
     )
 
 
@@ -259,7 +309,8 @@ def build_dataset(
         ref_store=ref_store,
         min_speaker_records=args.min_speaker_records,
         max_target_seconds=args.max_target_seconds,
-        min_target_seconds=getattr(args, "min_target_seconds", 3.0),
+        min_target_seconds=getattr(args, "min_target_seconds", 0.5),
+        ref_max_seconds=getattr(args, "max_ref_seconds", 20.0),
         punctuation_dropout_prob=punctuation_dropout_prob,
         punctuation_dropout_keep_word_spaces=(
             args.punctuation_dropout_keep_word_spaces
@@ -270,16 +321,24 @@ def build_dataset(
 
 def add_speaker_features(batch, feature_extractor, max_ref_seconds):
     audio_paths = batch.pop("speaker_audio_paths", None)
-    if audio_paths is None:
+    waveforms = batch.pop("speaker_waveforms", None)
+    if audio_paths is None and waveforms is None:
         return batch
     if feature_extractor is None:
         raise ValueError(
             "A speaker feature extractor is required for audio-path batches."
         )
-    features, lengths = feature_extractor.encode_files(
-        audio_paths,
-        max_audio_seconds=max_ref_seconds,
-    )
+    if waveforms is not None:
+        # Packed refs arrive already decoded from the DataLoader workers.
+        features, lengths = feature_extractor.encode_audios(
+            waveforms,
+            max_audio_seconds=max_ref_seconds,
+        )
+    else:
+        features, lengths = feature_extractor.encode_files(
+            audio_paths,
+            max_audio_seconds=max_ref_seconds,
+        )
     batch["speaker_features"] = features
     batch["speaker_feature_lengths"] = lengths
     return batch
@@ -551,13 +610,23 @@ def train():
         model.gradient_checkpointing_enable()
         model.config.use_cache = False
 
-    train_data = read_jsonl(args.train_jsonl)
-    eval_data = read_jsonl(args.eval_jsonl)
-    ref_store = resolve_ref_store(args)
+    # Rank 0 builds the shared indexes (the speaker key table and the manifest
+    # row indexes); the other ranks then open the same files. Building on every
+    # rank would have eight processes writing the same index at once.
+    if accelerator.is_main_process:
+        prepared_refs = resolve_ref_store(args, build_index_if_missing=True)
+        for manifest_path in (args.train_jsonl, args.eval_jsonl):
+            open_manifest(
+                manifest_path, args, prepared_refs, log=accelerator.print
+            )
+        prepared_refs = None
+    accelerator.wait_for_everyone()
+    ref_store = resolve_ref_store(args, build_index_if_missing=False)
     if ref_store is not None:
         accelerator.print(
             f"Packed refs: index={ref_store.index_path} "
             f"speakers={len(ref_store):,} "
+            f"backend={ref_store.index_backend} "
             f"refs_per_speaker={args.refs_per_speaker or 'all packed'}"
         )
     else:
@@ -566,19 +635,19 @@ def train():
             "Pass --ref_index or place refs/speaker_index.jsonl next to "
             "manifests/ to use the default shard layout."
         )
-    train_speaker_counts, train_speaker_audio_paths = speaker_statistics(
-        train_data
-    )
-    eval_speaker_counts, eval_speaker_audio_paths = speaker_statistics(
-        eval_data
+    train_data = open_manifest(args.train_jsonl, args, ref_store)
+    eval_data = open_manifest(args.eval_jsonl, args, ref_store)
+    accelerator.print(
+        f"Manifest index: train {len(train_data):,} rows "
+        f"({train_data.index_dir}), eval {len(eval_data):,} rows"
     )
     train_dataset = build_dataset(
         train_data,
         tokenizer,
         model.config,
         args,
-        train_speaker_counts,
-        train_speaker_audio_paths,
+        None,
+        None,
         punctuation_dropout_prob=args.punctuation_dropout_prob,
         ref_store=ref_store,
     )
@@ -589,8 +658,8 @@ def train():
         tokenizer,
         model.config,
         args,
-        eval_speaker_counts,
-        eval_speaker_audio_paths,
+        None,
+        None,
         ref_store=ref_store,
     )
     accelerator.print(

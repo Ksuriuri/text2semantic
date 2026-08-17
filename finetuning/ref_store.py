@@ -14,8 +14,14 @@ Index row::
      "members": ["spk_1/000.flac", "spk_1/001.flac"]}
 
 A speaker's refs always live in one shard. Training picks among ``members``
-(``refs_per_speaker``; 0 means all packed refs). Members are extracted into a
-local cache so the existing W2V-BERT file encoder keeps working.
+(``refs_per_speaker``; 0 means all packed refs).
+
+``read_member`` returns a member's bytes straight out of the shard, using the
+offsets from :mod:`finetuning.ref_member_index`, so nothing is written to disk:
+a full extraction would be a second 8.5 TB copy of the refs, and at one training
+epoch every extracted file would be read about once, so the copy would never pay
+for itself. ``extract_member``/``pick_path`` keep the on-disk behaviour for the
+loose-file encoder path and for tests.
 """
 
 from __future__ import annotations
@@ -23,7 +29,10 @@ from __future__ import annotations
 import json
 import os
 import tarfile
+from collections import OrderedDict
 from pathlib import Path
+
+from finetuning import ref_member_index, speaker_index as speaker_index_table
 
 
 def speaker_key_from_row(row):
@@ -61,6 +70,11 @@ class SpeakerRefStore:
         ref_root=None,
         cache_dir=None,
         refs_per_speaker=0,
+        member_index_dir=None,
+        max_open_shards=8,
+        max_member_indexes=64,
+        index_backend="auto",
+        build_index_if_missing=True,
     ):
         self.index_path = Path(index_path).expanduser().resolve()
         if not self.index_path.is_file():
@@ -83,10 +97,44 @@ class SpeakerRefStore:
                 "T2S_REF_CACHE", str(self.ref_root / ".extract-cache")
             )
         self.cache_dir = Path(cache_dir)
-        self._index = self._load_index(self.index_path)
+        self.member_index_dir = Path(
+            member_index_dir
+            if member_index_dir is not None
+            else ref_member_index.index_dir_for(self.ref_root)
+        )
+        self.max_open_shards = max(1, int(max_open_shards))
+        self.max_member_indexes = max(1, int(max_member_indexes))
+        # Both caches are per process: DataLoader workers are forked, and an
+        # inherited file handle or parsed index would be shared state.
+        self._member_indexes = OrderedDict()
+        self._shard_handles = OrderedDict()
+        self._owner_pid = os.getpid()
+        # A big speaker index stays on disk: t2s-v1's is 5.2 GB of json, which
+        # becomes ~12 GB of dict per process, once per rank and per worker.
+        if index_backend == "auto":
+            index_backend = (
+                "memmap"
+                if self.index_path.suffix.lower() in {".jsonl", ".json"}
+                and self.index_path.stat().st_size
+                > speaker_index_table.MEMMAP_THRESHOLD_BYTES
+                else "ram"
+            )
+        if index_backend not in {"memmap", "ram"}:
+            raise ValueError(f"unknown index_backend {index_backend!r}")
+        self.index_backend = index_backend
+        if index_backend == "memmap":
+            self._index = None
+            self._table = speaker_index_table.load(
+                self.index_path,
+                build_if_missing=build_index_if_missing,
+                log=None,
+            )
+        else:
+            self._table = None
+            self._index = self._load_index(self.index_path)
 
     def __len__(self):
-        return len(self._index)
+        return len(self._table if self._index is None else self._index)
 
     def __contains__(self, key):
         return self._lookup(key) is not None
@@ -120,10 +168,87 @@ class SpeakerRefStore:
             return None
         return self.extract_member(entry["shard"], member)
 
-    def extract_member(self, shard_name, member):
+    def pick_ref(self, key, *, exclude=None, rng=None):
+        """``(shard name, member name)`` for a usable ref, or None."""
+        entry = self._lookup(key)
+        member = self.pick_member(key, exclude=exclude, rng=rng)
+        if entry is None or member is None:
+            return None
+        return entry["shard"], member
+
+    def read_ref(self, key, *, exclude=None, rng=None):
+        """``(member name, bytes)`` for a usable ref, or None. Nothing is written."""
+        picked = self.pick_ref(key, exclude=exclude, rng=rng)
+        if picked is None:
+            return None
+        shard_name, member = picked
+        return member, self.read_member(shard_name, member)
+
+    def read_member(self, shard_name, member):
+        """A member's bytes, read in place from the shard."""
+        member = self._safe_member(member, shard_name)
+        shard_path = self._shard_path(shard_name)
+        members = self._member_index(shard_path)
+        location = members.get(member)
+        if location is None:
+            raise FileNotFoundError(f"{member} not in {shard_path}")
+        offset, size = location
+        payload = os.pread(self._shard_handle(shard_path), size, offset)
+        if len(payload) != size:
+            raise OSError(
+                f"short read for {member} in {shard_path}: "
+                f"{len(payload)} of {size} bytes"
+            )
+        return payload
+
+    def _member_index(self, shard_path):
+        self._reset_after_fork()
+        key = str(shard_path)
+        cached = self._member_indexes.get(key)
+        if cached is not None:
+            self._member_indexes.move_to_end(key)
+            return cached
+        members = ref_member_index.read_shard_index(
+            shard_path, self.member_index_dir
+        )
+        self._member_indexes[key] = members
+        while len(self._member_indexes) > self.max_member_indexes:
+            self._member_indexes.popitem(last=False)
+        return members
+
+    def _shard_handle(self, shard_path):
+        self._reset_after_fork()
+        key = str(shard_path)
+        handle = self._shard_handles.get(key)
+        if handle is not None:
+            self._shard_handles.move_to_end(key)
+            return handle
+        handle = os.open(shard_path, os.O_RDONLY)
+        self._shard_handles[key] = handle
+        while len(self._shard_handles) > self.max_open_shards:
+            _, evicted = self._shard_handles.popitem(last=False)
+            os.close(evicted)
+        return handle
+
+    def _reset_after_fork(self):
+        pid = os.getpid()
+        if pid == self._owner_pid:
+            return
+        # The parent's descriptors belong to the parent; drop them without
+        # closing, since the parent is still using them.
+        self._shard_handles = OrderedDict()
+        self._member_indexes = OrderedDict()
+        self._owner_pid = pid
+
+    @staticmethod
+    def _safe_member(member, shard_name):
         member = str(member).replace("\\", "/").lstrip("/")
         if not member or member.startswith("../") or "/../" in member:
             raise ValueError(f"unsafe ref member {member!r} in {shard_name}")
+        return member
+
+    def extract_member(self, shard_name, member):
+        member = self._safe_member(member, shard_name)
         dest = self.cache_dir / Path(shard_name).stem / member
         if dest.is_file():
             return dest
@@ -152,6 +277,8 @@ class SpeakerRefStore:
             return None
         language, speaker_id = key
         speaker_id = str(speaker_id)
+        if self._index is None:
+            return self._table.get((language, speaker_id))
         direct = self._index.get((language, speaker_id))
         if direct is not None:
             return direct

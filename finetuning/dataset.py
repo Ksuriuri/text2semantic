@@ -1,8 +1,10 @@
 # Copyright 2026
 # SPDX-License-Identifier: Apache-2.0
 
+import io
 import random
 
+import librosa
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -30,12 +32,19 @@ class Text2SemanticDataset(Dataset):
         ref_store=None,
         min_speaker_records=2,
         max_target_seconds=30.0,
-        min_target_seconds=3.0,
+        min_target_seconds=0.5,
+        ref_max_seconds=20.0,
         punctuation_dropout_prob=0.0,
         punctuation_dropout_keep_word_spaces=True,
         seed=42,
     ):
-        self.raw_size = len(data)
+        # A prefiltered source (finetuning.manifest_index.ManifestIndex) has
+        # already applied every filter below and materializes one row at a time.
+        # Walking it here would parse all 94M rows of the t2s-v1 manifest three
+        # times over and then keep the survivors in a list, which is exactly the
+        # per-process copy the index exists to avoid.
+        self.prefiltered = bool(getattr(data, "prefiltered", False))
+        self.raw_size = int(getattr(data, "raw_size", len(data)))
         self.tokenizer = tokenizer
         self.semantic_vocab_size = semantic_vocab_size
         self.speech_bos_token_id = speech_bos_token_id
@@ -43,20 +52,30 @@ class Text2SemanticDataset(Dataset):
         self.speech_pad_token_id = speech_pad_token_id
         self.max_text_tokens = max_text_tokens
         self.max_semantic_tokens = max_semantic_tokens
-        self.speaker_counts = speaker_counts or self._count_speakers(data)
         self.ref_store = ref_store
-        self.speaker_audio_paths_by_id = (
-            speaker_audio_paths_by_id
-            if speaker_audio_paths_by_id is not None
-            else (
-                {}
-                if ref_store is not None
-                else self._collect_speaker_audio_paths(data)
+        if self.prefiltered:
+            self.speaker_counts = speaker_counts or {}
+            self.speaker_audio_paths_by_id = speaker_audio_paths_by_id or {}
+        else:
+            self.speaker_counts = speaker_counts or self._count_speakers(data)
+            self.speaker_audio_paths_by_id = (
+                speaker_audio_paths_by_id
+                if speaker_audio_paths_by_id is not None
+                else (
+                    {}
+                    if ref_store is not None
+                    else self._collect_speaker_audio_paths(data)
+                )
             )
-        )
         self.min_speaker_records = min_speaker_records
         self.max_target_seconds = max_target_seconds
         self.min_target_seconds = min_target_seconds
+        self.ref_max_seconds = ref_max_seconds
+        # Packed refs are read out of the shard and decoded here, in the
+        # DataLoader worker, so no ref ever lands on disk.
+        self.ref_audio_in_memory = ref_store is not None and hasattr(
+            ref_store, "read_ref"
+        )
         if not 0.0 <= punctuation_dropout_prob <= 1.0:
             raise ValueError("punctuation_dropout_prob must be in [0, 1].")
         self.punctuation_dropout_prob = punctuation_dropout_prob
@@ -65,8 +84,11 @@ class Text2SemanticDataset(Dataset):
         )
         self.seed = seed
         self._semantic_code_cache = {}
-        self.data = [item for item in data if self._is_usable(item)]
-        if not self.data:
+        if self.prefiltered:
+            self.data = data
+        else:
+            self.data = [item for item in data if self._is_usable(item)]
+        if not len(self.data):
             raise ValueError("No usable samples remain after dataset filtering.")
         self.filtered_size = self.raw_size - len(self.data)
 
@@ -186,8 +208,15 @@ class Text2SemanticDataset(Dataset):
         item = self.data[index]
         if not self._has_usable_text(item):
             raise ValueError("Each sample needs a non-empty string 'text'.")
-        speaker_audio_path = self._speaker_audio_path(item, index)
-        if speaker_audio_path is None:
+        speaker_audio = None
+        speaker_audio_path = None
+        if self.ref_audio_in_memory:
+            speaker_audio = self._speaker_audio(item, index)
+            missing_ref = speaker_audio is None
+        else:
+            speaker_audio_path = self._speaker_audio_path(item, index)
+            missing_ref = speaker_audio_path is None
+        if missing_ref:
             raise ValueError(
                 "Each sample needs a packed ref (speaker_index), "
                 "'ref_audio', or another clip of the same speaker."
@@ -208,7 +237,45 @@ class Text2SemanticDataset(Dataset):
                 (codes, torch.tensor([self.speech_eos_token_id]))
             ),
             "speaker_audio_path": speaker_audio_path,
+            "speaker_audio": speaker_audio,
         }
+
+    def _speaker_audio(self, item, index=None):
+        """The ref clip as a 16 kHz mono waveform, read from the shard in place.
+
+        An explicit ``ref_audio`` path still wins, so a manifest that names its
+        own ref file keeps working.
+        """
+        explicit = item.get("ref_audio") or item.get("ref_audio_path")
+        if explicit is not None:
+            if explicit == self._target_audio_path(item):
+                return None
+            return self._decode_audio(explicit, explicit)
+        speaker_key = self._speaker_key(item)
+        if speaker_key is None:
+            return None
+        rng = None if index is None else random.Random(self.seed + index)
+        exclude = item.get("id")
+        picked = self.ref_store.read_ref(
+            speaker_key,
+            exclude=None if exclude is None else str(exclude),
+            rng=rng,
+        )
+        if picked is None:
+            return None
+        member, payload = picked
+        return self._decode_audio(io.BytesIO(payload), member)
+
+    def _decode_audio(self, source, name):
+        audio, _ = librosa.load(
+            source,
+            sr=16000,
+            mono=True,
+            duration=self.ref_max_seconds,
+        )
+        if audio.size == 0:
+            raise ValueError(f"ref audio decoded to nothing: {name}")
+        return np.ascontiguousarray(audio, dtype=np.float32)
 
     def _has_speaker_ref(self, item):
         explicit = item.get("ref_audio") or item.get("ref_audio_path")
@@ -322,13 +389,21 @@ class Text2SemanticDataset(Dataset):
             speech_mask[row, :speech_length] = 1
             labels[row, :speech_length] = sample["labels"]
 
-        return {
+        batch = {
             "text_input_ids": text_ids,
             "text_attention_mask": text_mask,
             "speech_input_ids": speech_ids,
             "speech_attention_mask": speech_mask,
             "labels": labels,
-            "speaker_audio_paths": [
-                sample["speaker_audio_path"] for sample in samples
-            ],
         }
+        # In-memory refs travel as waveforms; the loose-file path still sends
+        # paths for the encoder to open itself.
+        if samples[0].get("speaker_audio") is not None:
+            batch["speaker_waveforms"] = [
+                sample["speaker_audio"] for sample in samples
+            ]
+        else:
+            batch["speaker_audio_paths"] = [
+                sample["speaker_audio_path"] for sample in samples
+            ]
+        return batch

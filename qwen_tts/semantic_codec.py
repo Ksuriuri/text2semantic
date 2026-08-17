@@ -375,17 +375,37 @@ class MaskGCTFeatureExtractor:
         if max_audio_seconds is not None and max_audio_seconds <= 0:
             raise ValueError("max_audio_seconds must be positive or None.")
 
+        audios = [
+            librosa.load(
+                Path(audio_path),
+                sr=16000,
+                mono=True,
+                duration=max_audio_seconds,
+            )[0]
+            for audio_path in audio_paths
+        ]
+        return self.encode_audios(audios, max_audio_seconds=max_audio_seconds)
+
+    @torch.inference_mode()
+    def encode_audios(self, audios, max_audio_seconds=15.0):
+        """Same as :meth:`encode_files`, for waveforms that are already decoded.
+
+        Packed refs are read out of their shard and decoded in the DataLoader
+        workers, so the training loop hands the waveforms straight over instead
+        of writing them out and reading them back.
+        """
+        if not audios:
+            raise ValueError("audios must not be empty.")
+        if max_audio_seconds is not None and max_audio_seconds <= 0:
+            raise ValueError("max_audio_seconds must be positive or None.")
+
         max_audio_samples = (
             None
             if max_audio_seconds is None
             else int(16000 * max_audio_seconds)
         )
-        audios = []
-        for audio_path in audio_paths:
-            audio, _ = librosa.load(Path(audio_path), sr=16000, mono=True)
-            if max_audio_samples is not None:
-                audio = audio[:max_audio_samples]
-            audios.append(audio)
+        if max_audio_samples is not None:
+            audios = [audio[:max_audio_samples] for audio in audios]
 
         inputs = self.feature_extractor(
             audios,
