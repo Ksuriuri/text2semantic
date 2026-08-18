@@ -37,6 +37,22 @@ INDEX_DIR_NAME = ".member-index"
 FORMAT_VERSION = 1
 
 
+def member_row_id(member, dataset=None):
+    """The manifest row id a tar member holds.
+
+    Both ref layouts name a member after the row it came from, so this is what
+    lets a ref be excluded from being its own target:
+    packed shards use ``<dataset>/<language>/<speaker>/<id>.flac`` and the source
+    tars use ``<dataset>__<id>.flac``.
+    """
+    name = str(member).replace("\\", "/").rsplit("/", 1)[-1]
+    stem = name.rsplit(".", 1)[0] if "." in name else name
+    prefix = f"{dataset}__"
+    if dataset and stem.startswith(prefix):
+        return stem[len(prefix) :]
+    return stem
+
+
 def index_dir_for(ref_root):
     override = os.environ.get("T2S_REF_MEMBER_INDEX")
     if override:

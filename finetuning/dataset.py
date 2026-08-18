@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from finetuning import speaker_index
 from qwen_tts.text_augment import strip_pause_marks
 from qwen_tts.text_template import tokenize_tts_prompt
 
@@ -53,6 +54,13 @@ class Text2SemanticDataset(Dataset):
         self.max_text_tokens = max_text_tokens
         self.max_semantic_tokens = max_semantic_tokens
         self.ref_store = ref_store
+        # The ref backend owns the key: packed refs are keyed by speaker within
+        # a language, source-tar refs by speaker within a dataset as well.
+        self.speaker_key_fields = tuple(
+            getattr(
+                ref_store, "speaker_key_fields", speaker_index.DEFAULT_KEY_FIELDS
+            )
+        )
         if self.prefiltered:
             self.speaker_counts = speaker_counts or {}
             self.speaker_audio_paths_by_id = speaker_audio_paths_by_id or {}
@@ -96,29 +104,22 @@ class Text2SemanticDataset(Dataset):
     def _target_audio_path(item):
         return item.get("audio") or item.get("audio_path")
 
-    @staticmethod
-    def _speaker_key(item):
-        speaker_id = item.get("speaker_id")
-        if speaker_id is None:
-            return None
-        language = item.get("language") or item.get("lang")
-        return language, speaker_id
+    def _speaker_key(self, item):
+        return speaker_index.row_key(item, self.speaker_key_fields)
 
-    @staticmethod
-    def _count_speakers(data):
+    def _count_speakers(self, data):
         counts = {}
         for item in data:
-            speaker_key = Text2SemanticDataset._speaker_key(item)
+            speaker_key = self._speaker_key(item)
             if speaker_key is not None:
                 counts[speaker_key] = counts.get(speaker_key, 0) + 1
         return counts
 
-    @classmethod
-    def _collect_speaker_audio_paths(cls, data):
+    def _collect_speaker_audio_paths(self, data):
         paths_by_id = {}
         for item in data:
-            speaker_key = cls._speaker_key(item)
-            audio_path = cls._target_audio_path(item)
+            speaker_key = self._speaker_key(item)
+            audio_path = self._target_audio_path(item)
             if speaker_key is None or audio_path is None:
                 continue
             paths_by_id.setdefault(speaker_key, [])

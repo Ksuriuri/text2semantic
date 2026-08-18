@@ -151,10 +151,25 @@ class SpeakerRefStore:
     def has_usable_ref(self, key, *, exclude=None):
         return self.pick_member(key, exclude=exclude) is not None
 
+    def ref_ids(self, key):
+        """The row ids these members are, for comparing against ``exclude``."""
+        return tuple(ref_member_index.member_row_id(name) for name in self.members(key))
+
     def pick_member(self, key, *, exclude=None, rng=None):
         names = list(self.members(key))
         if exclude:
-            names = [name for name in names if name != exclude]
+            # A shard member is named after the row it came from
+            # (<dataset>/<language>/<speaker>/<id>.flac), so the row id has to be
+            # compared against that name's id and not against the whole path --
+            # otherwise nothing ever matches and a clip can end up as its own
+            # ref, which teaches the model to copy.
+            exclude = str(exclude)
+            names = [
+                name
+                for name in names
+                if name != exclude
+                and ref_member_index.member_row_id(name) != exclude
+            ]
         if not names:
             return None
         if rng is None:

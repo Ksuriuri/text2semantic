@@ -286,3 +286,84 @@ def test_dataset_reads_refs_without_writing_them_out(tmp_path):
     assert "speaker_audio_paths" not in batch
     assert len(batch["speaker_waveforms"]) == 2
     assert not store.cache_dir.exists()
+
+
+def _row_named_trainset(tmp_path, rows, members_by_speaker):
+    """A trainset whose ref members are named after the rows, as the packer does.
+
+    ``pack_trainset`` writes ``<dataset>/<language>/<speaker>/<id>.flac``, so a
+    member name carries the id of the row it was packed from.
+    """
+    root = Path(tmp_path)
+    (root / "manifests").mkdir(parents=True)
+    (root / "codes" / "mini").mkdir(parents=True)
+    shards = root / "refs" / "shards"
+    shards.mkdir(parents=True)
+    codes = np.arange(64, dtype="<u2")
+    (root / "codes" / "mini" / "mini-000000.u2.bin").write_bytes(codes.tobytes())
+
+    payload = _wav_bytes()
+    with tarfile.open(shards / "refs-000000.tar", "w") as archive:
+        for members in members_by_speaker.values():
+            for name in members:
+                info = tarfile.TarInfo(name)
+                info.size = len(payload)
+                archive.addfile(info, fileobj=io.BytesIO(payload))
+    (root / "refs" / "speaker_index.jsonl").write_text(
+        "".join(
+            json.dumps(
+                {
+                    "language": "en",
+                    "speaker_id": speaker,
+                    "shard": "refs-000000.tar",
+                    "members": members,
+                }
+            )
+            + "\n"
+            for speaker, members in members_by_speaker.items()
+        ),
+        encoding="utf-8",
+    )
+    train = root / "manifests" / "train.jsonl"
+    train.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    return root, train
+
+
+def test_a_packed_ref_is_never_the_row_it_was_packed_from(tmp_path):
+    root, _ = _row_named_trainset(
+        tmp_path,
+        [_row("keep-1"), _row("keep-2")],
+        {
+            "spkA": ["mini/en/spkA/keep-1.wav", "mini/en/spkA/keep-2.wav"],
+            "spkB": ["mini/en/spkB/alone.wav"],
+        },
+    )
+    store = _store(root)
+
+    # exclude is a row id, and the member is named after that row: comparing it
+    # against the whole member path never matches, and the clip would be handed
+    # out as its own ref.
+    assert store.pick_member(("en", "spkA"), exclude="keep-1") == (
+        "mini/en/spkA/keep-2.wav"
+    )
+    assert store.ref_ids(("en", "spkB")) == ("alone",)
+    assert store.has_usable_ref(("en", "spkB"), exclude="alone") is False
+    assert store.read_ref(("en", "spkB"), exclude="alone") is None
+
+
+def test_a_row_whose_only_packed_ref_is_itself_is_filtered_out(tmp_path):
+    root, train = _row_named_trainset(
+        tmp_path,
+        [_row("keep-1"), _row("alone", speaker="spkB")],
+        {
+            "spkA": ["mini/en/spkA/keep-1.wav", "mini/en/spkA/keep-2.wav"],
+            "spkB": ["mini/en/spkB/alone.wav"],
+        },
+    )
+    index = manifest_index.load(
+        train, params=_params(), ref_store=_store(root), log=None
+    )
+    # Keeping "alone" would raise at read time instead: its only ref is itself.
+    assert [row["id"] for row in index] == ["keep-1"]

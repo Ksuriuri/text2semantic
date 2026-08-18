@@ -34,7 +34,7 @@ from pathlib import Path
 
 import numpy as np
 
-from finetuning import index_build
+from finetuning import index_build, speaker_index
 
 try:  # orjson parses these rows ~4x faster; the stdlib is a fine fallback.
     import orjson
@@ -48,7 +48,9 @@ except ImportError:  # pragma: no cover - depends on the environment
         return json.loads(payload)
 
 
-FORMAT_VERSION = 1
+# 2: the ref probe compares row ids instead of member names, so an index built
+# by version 1 keeps rows whose only ref is the row itself.
+FORMAT_VERSION = 2
 META_NAME = "meta.json"
 OFFSETS_NAME = "offsets.u64"
 LENGTHS_NAME = "lengths.u32"
@@ -73,9 +75,16 @@ class FilterParams:
     min_speaker_records: int = 2
     refs_per_speaker: int = 0
     ref_index: str | None = None
+    # Comma-joined rather than a tuple: as_meta() goes through json, and a tuple
+    # would come back as a list and compare unequal to itself on every load.
+    speaker_key: str = ",".join(speaker_index.DEFAULT_KEY_FIELDS)
 
     def as_meta(self):
         return asdict(self)
+
+    @property
+    def speaker_key_fields(self):
+        return tuple(field for field in self.speaker_key.split(",") if field)
 
 
 class ManifestIndex:
@@ -165,54 +174,62 @@ class ManifestIndex:
         return resolved
 
 
-def _speaker_key(row):
-    speaker_id = row.get("speaker_id")
-    if speaker_id is None:
-        return None
-    language = row.get("language") or row.get("lang")
-    return language, str(speaker_id)
+def _speaker_key(row, key_fields=speaker_index.DEFAULT_KEY_FIELDS):
+    return speaker_index.row_key(row, key_fields)
 
 
-def _fast_speaker_key(line):
-    """(language, speaker_id) straight out of the raw line, or None.
+def _fast_string_field(line, field):
+    """A flat ``"field": "value"`` out of the raw line, or None if not found.
 
-    The packer writes flat rows with string values, so pulling the two fields
-    out textually skips a full parse of every row in the counting pass.  A row
-    that does not match this shape falls back to the real parser.
+    Returns ``False`` for a value this shortcut must not decode (an escape), so
+    the caller can tell "absent" from "give up and parse properly".
     """
-    speaker_start = line.find('"speaker_id": "')
-    if speaker_start < 0:
+    marker = f'"{field}": "'
+    start = line.find(marker)
+    if start < 0:
         return None
-    speaker_start += 15
-    speaker_end = line.find('"', speaker_start)
-    if speaker_end < 0:
-        return None
-    speaker_id = line[speaker_start:speaker_end]
-    if "\\" in speaker_id:
-        return None
-    language = None
-    language_start = line.find('"language": "')
-    if language_start >= 0:
-        language_start += 13
-        language_end = line.find('"', language_start)
-        if language_end < 0:
-            return None
-        language = line[language_start:language_end]
-        if "\\" in language:
-            return None
-    return language, speaker_id
+    start += len(marker)
+    end = line.find('"', start)
+    if end < 0:
+        return False
+    value = line[start:end]
+    return False if "\\" in value else value
 
 
-def _count_speakers(jsonl_path, log):
+def _fast_speaker_key(line, key_fields=speaker_index.DEFAULT_KEY_FIELDS):
+    """The key tuple straight out of the raw line, or None.
+
+    The packer writes flat rows with string values, so pulling the fields out
+    textually skips a full parse of every row in the counting pass.  A row that
+    does not match this shape falls back to the real parser.
+    """
+    parts = []
+    for field in key_fields:
+        value = _fast_string_field(line, field)
+        if not value and field == "language":
+            # Same fallback as the parsed path; without it a manifest that
+            # writes "lang" would count under one key and filter under another,
+            # and every row would look like a single-record speaker.
+            value = _fast_string_field(line, "lang")
+        if value is False:
+            return None
+        if field == "speaker_id" and not value:
+            # Required, and an empty one keys as nothing at all.
+            return None
+        parts.append(value or None)
+    return tuple(parts)
+
+
+def _count_speakers(jsonl_path, log, key_fields=speaker_index.DEFAULT_KEY_FIELDS):
     counts = {}
     started = time.monotonic()
     with open(jsonl_path, encoding="utf-8") as handle:
         for row_number, line in enumerate(handle, start=1):
             if not line.strip():
                 continue
-            key = _fast_speaker_key(line)
+            key = _fast_speaker_key(line, key_fields)
             if key is None:
-                key = _speaker_key(_loads(line))
+                key = _speaker_key(_loads(line), key_fields)
             if key is not None:
                 counts[key] = counts.get(key, 0) + 1
             if log is not None and row_number % (20 * _FLUSH_ROWS) == 0:
@@ -228,12 +245,17 @@ class _RefProbe:
     """Cached 'does this speaker have a ref other than `exclude`' lookup.
 
     ``SpeakerRefStore.has_usable_ref`` rebuilds the member list on every call,
-    which is far too slow across 94M rows; a speaker's member count answers the
+    which is far too slow across 94M rows; a speaker's ref count answers the
     question outright unless it has exactly one ref.
+
+    The store is asked for row ids rather than member names, because ``exclude``
+    is a row id: a speaker whose only ref is the row being filtered has no
+    usable ref, and keeping that row would fail at read time instead.
     """
 
     def __init__(self, ref_store):
         self.ref_store = ref_store
+        self._ids = getattr(ref_store, "ref_ids", None) or ref_store.members
         self._cache = {}
 
     def usable(self, key, exclude):
@@ -241,8 +263,8 @@ class _RefProbe:
             return False
         entry = self._cache.get(key)
         if entry is None:
-            members = self.ref_store.members(key)
-            entry = (len(members), members[0] if len(members) == 1 else None)
+            ids = self._ids(key)
+            entry = (len(ids), ids[0] if len(ids) == 1 else None)
             self._cache[key] = entry
         count, only = entry
         if count == 0:
@@ -256,7 +278,7 @@ def _keep(row, params, speaker_counts, ref_probe):
     text = row.get("text")
     if not isinstance(text, str) or not text.strip():
         return False
-    key = _speaker_key(row)
+    key = _speaker_key(row, params.speaker_key_fields)
     if ref_probe is not None:
         target_id = row.get("id")
         if not ref_probe.usable(
@@ -320,7 +342,9 @@ def build(
     if params.min_speaker_records > 1:
         if log is not None:
             log(f"Indexing {jsonl_path}: counting speaker records")
-        speaker_counts = _count_speakers(jsonl_path, log)
+        speaker_counts = _count_speakers(
+            jsonl_path, log, params.speaker_key_fields
+        )
         if log is not None:
             log(f"  {len(speaker_counts):,} speakers")
 

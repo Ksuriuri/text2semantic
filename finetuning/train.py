@@ -25,6 +25,7 @@ from finetuning.checkpoint_policy import (
 )
 from finetuning.dataset import Text2SemanticDataset
 from finetuning.ref_store import SpeakerRefStore, default_ref_index_path
+from finetuning import source_ref_store, speaker_index
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
@@ -59,6 +60,35 @@ def parse_args():
             "Path to refs/speaker_index.jsonl (or .parquet). Default: look "
             "next to --train_jsonl for ../refs/speaker_index.jsonl. "
             "Packed speaker refs are the default read path."
+        ),
+    )
+    parser.add_argument(
+        "--ref_backend",
+        choices=("packed", "source_tar"),
+        default="packed",
+        help=(
+            "Where refs come from. 'packed' reads the trainset's ref shards; "
+            "'source_tar' reads every clip a speaker has straight out of the "
+            "source audio tars by byte range, which needs --ref_source_bucket "
+            "(or --ref_source_root for a local mirror)."
+        ),
+    )
+    parser.add_argument(
+        "--ref_source_bucket",
+        default=None,
+        help="GCS bucket holding preprocessed/<dataset>/audio/*.tar.",
+    )
+    parser.add_argument(
+        "--ref_source_project",
+        default=None,
+        help="GCP project to bill the ref reads to. Default: ambient.",
+    )
+    parser.add_argument(
+        "--ref_source_root",
+        default=None,
+        help=(
+            "Local directory mirroring the bucket layout, used instead of "
+            "--ref_source_bucket when the tars are already on this machine."
         ),
     )
     parser.add_argument(
@@ -257,20 +287,18 @@ def target_audio_path(item):
     return item.get("audio") or item.get("audio_path")
 
 
-def speaker_key(item):
-    speaker_id = item.get("speaker_id")
-    if speaker_id is None:
-        return None
-    language = item.get("language") or item.get("lang")
-    return language, speaker_id
+def speaker_key(item, key_fields=speaker_index.DEFAULT_KEY_FIELDS):
+    return speaker_index.row_key(item, key_fields)
 
 
-def speaker_statistics(*datasets):
+def speaker_statistics(
+    *datasets, key_fields=speaker_index.DEFAULT_KEY_FIELDS
+):
     speaker_counts = Counter()
     speaker_audio_paths = defaultdict(list)
     for data in datasets:
         for item in data:
-            key = speaker_key(item)
+            key = speaker_key(item, key_fields)
             if key is None:
                 continue
             speaker_counts[key] += 1
@@ -286,6 +314,10 @@ def speaker_statistics(*datasets):
 def resolve_ref_store(args, *, build_index_if_missing=True):
     if args.loose_refs:
         return None
+    if args.ref_backend == "source_tar":
+        return resolve_source_ref_store(
+            args, build_index_if_missing=build_index_if_missing
+        )
     index_path = args.ref_index
     if index_path:
         index_path = os.path.expanduser(index_path)
@@ -303,6 +335,44 @@ def resolve_ref_store(args, *, build_index_if_missing=True):
     )
 
 
+def resolve_source_ref_store(args, *, build_index_if_missing=True):
+    """The source-tar ref store: every clip of a speaker, read by byte range."""
+    index_path = args.ref_index
+    if index_path:
+        index_path = os.path.expanduser(index_path)
+    else:
+        discovered = source_ref_store.default_index_path(args.train_jsonl)
+        index_path = str(discovered) if discovered is not None else None
+    if not index_path:
+        raise SystemExit(
+            "--ref_backend source_tar needs --ref_index pointing at "
+            f"refs/{source_ref_store.INDEX_NAME}."
+        )
+    if args.ref_source_root:
+        reader = source_ref_store.LocalRangeReader(args.ref_source_root)
+    elif args.ref_source_bucket:
+        reader = source_ref_store.GcsRangeReader(
+            args.ref_source_bucket, project=args.ref_source_project
+        )
+    else:
+        raise SystemExit(
+            "--ref_backend source_tar needs --ref_source_bucket or "
+            "--ref_source_root."
+        )
+    return source_ref_store.SourceTarRefStore(
+        index_path,
+        reader=reader,
+        refs_per_speaker=args.refs_per_speaker,
+        build_index_if_missing=build_index_if_missing,
+    )
+
+
+def speaker_key_fields(ref_store):
+    return tuple(
+        getattr(ref_store, "speaker_key_fields", speaker_index.DEFAULT_KEY_FIELDS)
+    )
+
+
 def manifest_filter_params(args, ref_store):
     return manifest_index.FilterParams(
         min_target_seconds=args.min_target_seconds,
@@ -311,6 +381,7 @@ def manifest_filter_params(args, ref_store):
         min_speaker_records=args.min_speaker_records,
         refs_per_speaker=args.refs_per_speaker,
         ref_index=None if ref_store is None else str(ref_store.index_path),
+        speaker_key=",".join(speaker_key_fields(ref_store)),
     )
 
 
