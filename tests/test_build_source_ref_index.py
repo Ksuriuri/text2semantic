@@ -579,6 +579,23 @@ def test_the_split_counts_what_it_dropped(tmp_path):
     assert counts["manifests"] == [manifest]
 
 
+def test_appending_to_a_manifest_redoes_the_split(tmp_path):
+    # A new dataset joins the trainset by appending rows to train.jsonl, so the
+    # manifest list is unchanged and only the size grows. Matching on the name
+    # alone reported "already split" and built the index from the old rows.
+    bucket = tmp_path / "bucket"
+    rows = [_row("ears", "ears__p001_a", "ears__p001")]
+    manifest = _manifest(bucket, "manifests/train.jsonl", rows)
+    _split(tmp_path, [manifest])
+
+    rows.append(_row("laion_emolia_en", "laion_emolia__EN_a", "laion__EN_s"))
+    _manifest(bucket, "manifests/train.jsonl", rows)
+    rows_dir, rebuilt = _split(tmp_path, [manifest])
+
+    assert rebuilt is True
+    assert (rows_dir / "laion_emolia_en.tsv").is_file()
+
+
 def test_the_split_is_not_redone_but_a_changed_manifest_list_is(tmp_path):
     bucket = tmp_path / "bucket"
     first = _manifest(

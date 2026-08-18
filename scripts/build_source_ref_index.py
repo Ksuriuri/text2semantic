@@ -298,13 +298,22 @@ def split_manifests(
     rows_dir = Path(work_dir) / "rows"
     done_marker = rows_dir / "_COMPLETE"
     manifests = list(manifests)
+    # A dataset gets added by appending rows to train.jsonl, so the manifest
+    # keeps its name and only grows: matching on the name alone would report
+    # "already split" and quietly build the index from the old rows.
+    sizes = {manifest: blobs.size(manifest) for manifest in manifests}
     if done_marker.is_file():
-        previous = json.loads(done_marker.read_text()).get("manifests")
-        if previous == manifests:
+        marker = json.loads(done_marker.read_text())
+        previous = marker.get("manifests")
+        previous_sizes = marker.get("manifest_sizes")
+        if previous == manifests and previous_sizes == sizes:
             log(f"rows already split: {rows_dir}")
             return rows_dir, False
         # Resuming is only safe when it resumes the same job.
-        log(f"re-splitting: manifests changed from {previous} to {manifests}")
+        log(
+            f"re-splitting: manifests changed from {previous} ({previous_sizes}) "
+            f"to {manifests} ({sizes})"
+        )
         done_marker.unlink()
     if rows_dir.is_dir():
         for stale in rows_dir.glob("*.tsv"):
@@ -316,6 +325,7 @@ def split_manifests(
 
     counts = {
         "manifests": manifests,
+        "manifest_sizes": sizes,
         "rows": 0,
         "kept": 0,
         "no_speaker": 0,
