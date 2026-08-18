@@ -32,6 +32,8 @@ from pathlib import Path
 
 import numpy as np
 
+from finetuning import index_build
+
 try:  # matches finetuning.manifest_index; the stdlib fallback is fine
     import orjson
 
@@ -116,16 +118,18 @@ def build(jsonl_path, index_dir=None, *, log=print):
     key_offsets = array("Q")
     row_offsets = array("Q")
     row_lengths = array("I")
-    with open(index_dir / KEYS_NAME, "wb") as keys_out:
+    publisher = index_build.IndexPublisher(index_dir)
+    with publisher, open(publisher.path(KEYS_NAME), "wb") as keys_out:
         for key, row_offset, row_length in entries:
             key_offsets.append(keys_out.tell())
             keys_out.write(key)
             row_offsets.append(row_offset)
             row_lengths.append(row_length)
         key_offsets.append(keys_out.tell())
-    (index_dir / KEY_OFFSETS_NAME).write_bytes(key_offsets.tobytes())
-    (index_dir / ROW_OFFSETS_NAME).write_bytes(row_offsets.tobytes())
-    (index_dir / ROW_LENGTHS_NAME).write_bytes(row_lengths.tobytes())
+        publisher.path(KEY_OFFSETS_NAME).write_bytes(key_offsets.tobytes())
+        publisher.path(ROW_OFFSETS_NAME).write_bytes(row_offsets.tobytes())
+        publisher.path(ROW_LENGTHS_NAME).write_bytes(row_lengths.tobytes())
+    publisher.publish()
 
     source = jsonl_path.stat()
     meta_path.write_text(
@@ -270,8 +274,8 @@ def load(
 ):
     """Open the key table, building it when missing or stale.
 
-    Build on one rank only: several ranks building the same table at once would
-    write the same files.
+    Safe from every rank on every node; the build is serialised by an exclusive
+    lock on the index directory (see finetuning/index_build.py).
     """
     jsonl_path = Path(jsonl_path).expanduser().resolve()
     index_dir = (
@@ -279,25 +283,39 @@ def load(
         if index_dir is not None
         else index_dir_for(jsonl_path)
     )
-    meta_path = index_dir / META_NAME
-    reason = "index missing"
-    if not rebuild and meta_path.is_file():
-        try:
-            reason = _stale(json.loads(meta_path.read_text()), jsonl_path)
-        except (ValueError, OSError):
-            reason = "index unreadable"
-    if rebuild:
-        reason = "rebuild requested"
+    reason = _build_reason(index_dir, jsonl_path, rebuild)
     if reason is not None:
         if not build_if_missing:
             raise FileNotFoundError(
                 f"speaker index table for {jsonl_path} is not usable "
                 f"({reason}); build it on the main process first."
             )
-        if log is not None:
-            log(f"Building speaker index table for {jsonl_path.name}: {reason}")
-        build(jsonl_path, index_dir, log=log)
+        with index_build.build_lock(index_dir, log=log) as lock:
+            if lock.waited:
+                reason = _build_reason(
+                    index_dir, jsonl_path, rebuild and not lock.waited
+                )
+            if reason is not None:
+                if log is not None:
+                    log(
+                        f"Building speaker index table for {jsonl_path.name}: "
+                        f"{reason}"
+                    )
+                build(jsonl_path, index_dir, log=log)
     return MemmappedSpeakerIndex(jsonl_path, index_dir)
+
+
+def _build_reason(index_dir, jsonl_path, rebuild):
+    """Why this key table needs building, or None when it is usable."""
+    if rebuild:
+        return "rebuild requested"
+    meta_path = Path(index_dir) / META_NAME
+    if not meta_path.is_file():
+        return "index missing"
+    try:
+        return _stale(json.loads(meta_path.read_text()), jsonl_path)
+    except (ValueError, OSError):
+        return "index unreadable"
 
 
 def main(argv=None):

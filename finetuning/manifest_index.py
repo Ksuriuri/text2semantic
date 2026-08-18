@@ -34,6 +34,8 @@ from pathlib import Path
 
 import numpy as np
 
+from finetuning import index_build
+
 try:  # orjson parses these rows ~4x faster; the stdlib is a fine fallback.
     import orjson
 
@@ -312,6 +314,7 @@ def build(
     meta_path = index_dir / META_NAME
     if meta_path.exists():
         meta_path.unlink()
+    publisher = index_build.IndexPublisher(index_dir)
 
     speaker_counts = {}
     if params.min_speaker_records > 1:
@@ -329,8 +332,8 @@ def build(
         raise RuntimeError("manifest_index needs little-endian 8/4-byte arrays.")
     raw_rows = 0
     started = time.monotonic()
-    with open(index_dir / OFFSETS_NAME, "wb") as offsets_out, open(
-        index_dir / LENGTHS_NAME, "wb"
+    with publisher, open(publisher.path(OFFSETS_NAME), "wb") as offsets_out, open(
+        publisher.path(LENGTHS_NAME), "wb"
     ) as lengths_out:
 
         def flush():
@@ -366,9 +369,13 @@ def build(
         kept = offsets_out.tell() // 8
 
     if kept == 0:
+        publisher.discard()
         raise ValueError(
             f"No usable rows in {jsonl_path} under {params.as_meta()}."
         )
+    # Only now do the row arrays become visible; meta.json below is what makes
+    # them usable.
+    publisher.publish()
     source = jsonl_path.stat()
     meta = {
         "format_version": FORMAT_VERSION,
@@ -415,9 +422,11 @@ def load(
 ):
     """Open the index for `jsonl_path`, building it when it is missing or stale.
 
-    Call this on the main process only, then let the other ranks call it again
-    once the build has finished: two ranks building the same index at once would
-    write the same files.
+    Safe to call from every rank on every node: the build takes an exclusive
+    lock on the index directory, and a rank that waited for that lock re-checks
+    staleness rather than rebuilding what it just waited for.  Calling it on one
+    process first is still cheaper -- the other ranks then find the index
+    already there -- but it is no longer a correctness requirement.
     """
     jsonl_path = Path(jsonl_path).expanduser().resolve()
     index_dir = (
@@ -425,26 +434,39 @@ def load(
         if index_dir is not None
         else index_dir_for(jsonl_path)
     )
-    meta_path = index_dir / META_NAME
-    reason = "index missing"
-    if not rebuild and meta_path.is_file():
-        try:
-            reason = _stale(json.loads(meta_path.read_text()), jsonl_path, params)
-        except (ValueError, OSError):
-            reason = "index unreadable"
-    if rebuild:
-        reason = "rebuild requested"
+    reason = _build_reason(index_dir, jsonl_path, params, rebuild)
     if reason is not None:
-        if log is not None:
-            log(f"Building manifest index for {jsonl_path.name}: {reason}")
-        build(
-            jsonl_path,
-            params=params,
-            ref_store=ref_store,
-            index_dir=index_dir,
-            log=log,
-        )
+        with index_build.build_lock(index_dir, log=log) as lock:
+            if lock.waited:
+                # Whoever held the lock was almost certainly building this same
+                # index; a second build would only overwrite it with itself.
+                reason = _build_reason(
+                    index_dir, jsonl_path, params, rebuild and not lock.waited
+                )
+            if reason is not None:
+                if log is not None:
+                    log(f"Building manifest index for {jsonl_path.name}: {reason}")
+                build(
+                    jsonl_path,
+                    params=params,
+                    ref_store=ref_store,
+                    index_dir=index_dir,
+                    log=log,
+                )
     return ManifestIndex(jsonl_path, index_dir, code_root=code_root)
+
+
+def _build_reason(index_dir, jsonl_path, params, rebuild):
+    """Why this index needs building, or None when it is usable as it stands."""
+    if rebuild:
+        return "rebuild requested"
+    meta_path = Path(index_dir) / META_NAME
+    if not meta_path.is_file():
+        return "index missing"
+    try:
+        return _stale(json.loads(meta_path.read_text()), jsonl_path, params)
+    except (ValueError, OSError):
+        return "index unreadable"
 
 
 def main(argv=None):

@@ -307,19 +307,23 @@ def manifest_index_dir(args, manifest_path):
     return os.path.join(args.manifest_index_dir, name + ".index")
 
 
-def open_manifest(manifest_path, args, ref_store, *, log=None):
+def open_manifest(manifest_path, args, ref_store, *, log=None, rebuild=False):
     """The manifest as a memmapped, prefiltered row index.
 
     Every rank opens the same index files and preads the same jsonl, so a node
     holds one copy of the manifest in page cache rather than one Python list per
     rank.
+
+    ``rebuild`` belongs to the build phase only: passing it on every rank's open
+    would rebuild the index once per rank, one after another, behind the build
+    lock.
     """
     return manifest_index.load(
         manifest_path,
         params=manifest_filter_params(args, ref_store),
         ref_store=ref_store,
         index_dir=manifest_index_dir(args, manifest_path),
-        rebuild=args.rebuild_manifest_index,
+        rebuild=rebuild,
         log=log,
     )
 
@@ -722,14 +726,22 @@ def train():
         model.gradient_checkpointing_enable()
         model.config.use_cache = False
 
-    # Rank 0 builds the shared indexes (the speaker key table and the manifest
-    # row indexes); the other ranks then open the same files. Building on every
-    # rank would have eight processes writing the same index at once.
-    if accelerator.is_main_process:
+    # One process per *node* builds the shared indexes (the speaker key table
+    # and the manifest row indexes), because the index directories sit on each
+    # node's local disk: gating this on the global main process would leave the
+    # second node without indexes, and its eight ranks would then all build the
+    # same files at once. When the trainset is on a shared filesystem instead,
+    # the two node builders serialise on the index build lock and the second one
+    # finds the index already there.
+    if accelerator.is_local_main_process:
         prepared_refs = resolve_ref_store(args, build_index_if_missing=True)
         for manifest_path in (args.train_jsonl, args.eval_jsonl):
             open_manifest(
-                manifest_path, args, prepared_refs, log=accelerator.print
+                manifest_path,
+                args,
+                prepared_refs,
+                log=accelerator.print,
+                rebuild=args.rebuild_manifest_index,
             )
         prepared_refs = None
     accelerator.wait_for_everyone()

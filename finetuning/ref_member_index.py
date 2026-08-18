@@ -100,7 +100,12 @@ def build_shard_index(shard_path, index_dir, *, overwrite=False):
         "members": {name: list(value) for name, value in members.items()},
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = out_path.with_suffix(".json.part")
+    # The pid matters: sidecars are built lazily by whichever rank first samples
+    # a speaker in that shard, so with 16 ranks and their DataLoader workers two
+    # processes can scan the same shard at once.  A shared ".part" name would
+    # have both of them truncating and writing one file, and the rename would
+    # then publish a mixture of the two.
+    tmp_path = out_path.with_suffix(f".json.part-{os.getpid()}")
     tmp_path.write_text(json.dumps(payload, separators=(",", ":")))
     tmp_path.replace(out_path)
     return out_path
