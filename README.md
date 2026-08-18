@@ -47,6 +47,10 @@ bash scripts/launch_webui.sh
 `refs/shards/*.tar`）。布局、字段和启动参数见
 [docs/train-ref-shards.md](docs/train-ref-shards.md)。没有 index 时回退到散文件。
 
+也可以用 `--ref_backend source_tar` 直接从原始 `preprocessed/<dataset>/audio/*.tar`
+按字节区间读 ref（一次 ranged GET，不下整包），这样一个 speaker 的**全部**片段都是
+候选，而不只是打包时挑出的那几条。同上文档。
+
 旧的 JSONL 仍可显式提供 `ref_audio`，或提供 `speaker_id` 从同一 speaker 的其他
 散落音频里选参考；无法找到独立参考音频的样本会被过滤：
 
