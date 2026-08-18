@@ -264,8 +264,8 @@ class Text2SemanticDataset(Dataset):
         )
         if picked is None:
             return None
-        member, payload = picked
-        return self._decode_audio(io.BytesIO(payload), member)
+        name, payload = picked
+        return self._decode_audio(io.BytesIO(payload), name)
 
     def _decode_audio(self, source, name):
         audio, _ = librosa.load(

@@ -58,13 +58,13 @@ def test_a_ref_is_one_ranged_read_of_the_source_tar(tmp_path):
     reader = FakeReader({(TAR, 512): b"fLaC-first"})
     store = _store(
         tmp_path,
-        [_row(refs=[(TAR, "ears__p001_a.flac", 512, 10)])],
+        [_row(refs=[(TAR, "ears__p001_a", 512, 10)])],
         reader=reader,
     )
 
-    member, payload = store.read_ref(("ears", "en", "p001"))
+    row_id, payload = store.read_ref(("ears", "en", "p001"))
 
-    assert member == "ears__p001_a.flac"
+    assert row_id == "ears__p001_a"
     assert payload == b"fLaC-first"
     # Exactly one read, of exactly the member's bytes: no tar is opened and no
     # sidecar is fetched at training time.
@@ -75,22 +75,22 @@ def test_the_same_speaker_id_in_two_datasets_is_two_speakers(tmp_path):
     store = _store(
         tmp_path,
         [
-            _row(dataset="ears", refs=[(TAR, "ears__p001_a.flac", 512, 4)]),
+            _row(dataset="ears", refs=[(TAR, "ears__p001_a", 512, 4)]),
             _row(
                 dataset="vctk",
                 refs=[("preprocessed/vctk/audio/vctk-000000.tar",
-                       "vctk__p001_x.flac", 2048, 4)],
+                       "vctk__p001_x", 2048, 4)],
             ),
         ],
     )
 
-    assert store.pick_ref(("ears", "en", "p001"))[1] == "ears__p001_a.flac"
-    assert store.pick_ref(("vctk", "en", "p001"))[1] == "vctk__p001_x.flac"
+    assert store.pick_ref(("ears", "en", "p001"))[1] == "ears__p001_a"
+    assert store.pick_ref(("vctk", "en", "p001"))[1] == "vctk__p001_x"
     assert ("Genshin", "en", "p001") not in store
 
 
 def test_a_two_part_key_is_refused_rather_than_guessed(tmp_path):
-    store = _store(tmp_path, [_row(refs=[(TAR, "ears__p001_a.flac", 512, 4)])])
+    store = _store(tmp_path, [_row(refs=[(TAR, "ears__p001_a", 512, 4)])])
     with pytest.raises(ValueError):
         store.pick_ref(("en", "p001"))
 
@@ -101,23 +101,51 @@ def test_the_target_clip_is_never_its_own_ref(tmp_path):
         [
             _row(
                 refs=[
-                    (TAR, "ears__p001_a.flac", 512, 4),
-                    (TAR, "ears__p001_b.flac", 1024, 4),
+                    (TAR, "ears__p001_a", 512, 4),
+                    (TAR, "ears__p001_b", 1024, 4),
                 ]
             )
         ],
     )
     key = ("ears", "en", "p001")
 
-    # exclude is a manifest row id, and the member name carries it after the
-    # dataset prefix.
-    assert store.pick_ref(key, exclude="ears__p001_a")[1] == "ears__p001_b.flac"
-    assert store.pick_ref(key, exclude="ears__p001_b")[1] == "ears__p001_a.flac"
+    # exclude is a manifest row id, and so is a ref's second field, so the
+    # comparison needs no rule for turning a filename back into an id.
+    assert store.pick_ref(key, exclude="ears__p001_a")[1] == "ears__p001_b"
+    assert store.pick_ref(key, exclude="ears__p001_b")[1] == "ears__p001_a"
+
+
+def test_exclusion_holds_when_the_member_name_is_a_sanitized_id(tmp_path):
+    # These two ids differ only in characters the packer flattens: both land on
+    # Genshin__en_Unknown_vo_x.flac and Genshin__en_Unknown_vo_y.flac. While the
+    # index carried member names, "exclude" was compared against a name it could
+    # never equal, so a clip was handed out as its own reference.
+    first = "Genshin__en/#Unknown/vo_x"
+    second = "Genshin__en/#Unknown/vo_y"
+    store = _store(
+        tmp_path,
+        [
+            _row(
+                dataset="Genshin",
+                speaker="Genshin__#Unknown_en",
+                refs=[
+                    ("preprocessed/Genshin/audio/Genshin-000000.tar",
+                     first, 512, 4),
+                    ("preprocessed/Genshin/audio/Genshin-000000.tar",
+                     second, 1024, 4),
+                ],
+            )
+        ],
+    )
+    key = ("Genshin", "en", "Genshin__#Unknown_en")
+
+    assert store.pick_ref(key, exclude=first)[1] == second
+    assert store.pick_ref(key, exclude=second)[1] == first
 
 
 def test_a_speaker_whose_only_clip_is_the_target_has_no_ref(tmp_path):
     store = _store(
-        tmp_path, [_row(refs=[(TAR, "ears__p001_a.flac", 512, 4)])]
+        tmp_path, [_row(refs=[(TAR, "ears__p001_a", 512, 4)])]
     )
     key = ("ears", "en", "p001")
 
@@ -132,8 +160,8 @@ def test_ref_ids_are_row_ids_so_the_manifest_probe_can_compare_them(tmp_path):
         [
             _row(
                 refs=[
-                    (TAR, "ears__p001_a.flac", 512, 4),
-                    (TAR, "ears__p001_b.flac", 1024, 4),
+                    (TAR, "ears__p001_a", 512, 4),
+                    (TAR, "ears__p001_b", 1024, 4),
                 ]
             )
         ],
@@ -148,15 +176,15 @@ def test_refs_per_speaker_caps_the_candidates(tmp_path):
     rows = [
         _row(
             refs=[
-                (TAR, f"ears__p001_{index}.flac", 512 * (index + 1), 4)
+                (TAR, f"ears__p001_{index}", 512 * (index + 1), 4)
                 for index in range(5)
             ]
         )
     ]
     store = _store(tmp_path, rows, refs_per_speaker=2)
-    assert store.members(("ears", "en", "p001")) == (
-        "ears__p001_0.flac",
-        "ears__p001_1.flac",
+    assert store.ref_ids(("ears", "en", "p001")) == (
+        "ears__p001_0",
+        "ears__p001_1",
     )
 
 
@@ -166,7 +194,7 @@ def test_a_random_pick_spreads_over_every_clip(tmp_path):
     rows = [
         _row(
             refs=[
-                (TAR, f"ears__p001_{index}.flac", 512 * (index + 1), 4)
+                (TAR, f"ears__p001_{index}", 512 * (index + 1), 4)
                 for index in range(20)
             ]
         )
@@ -183,8 +211,8 @@ def test_a_random_pick_spreads_over_every_clip(tmp_path):
 
 def test_the_memmapped_backend_answers_like_the_dict(tmp_path):
     rows = [
-        _row(refs=[(TAR, "ears__p001_a.flac", 512, 4)]),
-        _row(speaker="p002", refs=[(TAR, "ears__p002_a.flac", 1024, 4)]),
+        _row(refs=[(TAR, "ears__p001_a", 512, 4)]),
+        _row(speaker="p002", refs=[(TAR, "ears__p002_a", 1024, 4)]),
     ]
     index_path = _index(tmp_path, rows)
     ram = SourceTarRefStore(
@@ -208,7 +236,7 @@ def test_the_memmapped_backend_answers_like_the_dict(tmp_path):
 
 
 def test_a_table_keyed_on_the_wrong_fields_is_rebuilt(tmp_path):
-    rows = [_row(refs=[(TAR, "ears__p001_a.flac", 512, 4)])]
+    rows = [_row(refs=[(TAR, "ears__p001_a", 512, 4)])]
     index_path = _index(tmp_path, rows)
     # Built as if it were a packed index: same file, same mtime, wrong keys.
     speaker_index.build(index_path, log=None)
@@ -217,12 +245,12 @@ def test_a_table_keyed_on_the_wrong_fields_is_rebuilt(tmp_path):
         index_path, reader=FakeReader(), index_backend="memmap"
     )
 
-    assert store.pick_ref(("ears", "en", "p001"))[1] == "ears__p001_a.flac"
+    assert store.pick_ref(("ears", "en", "p001"))[1] == "ears__p001_a"
 
 
 def test_a_missing_table_is_not_built_off_the_main_rank(tmp_path):
     index_path = _index(
-        tmp_path, [_row(refs=[(TAR, "ears__p001_a.flac", 512, 4)])]
+        tmp_path, [_row(refs=[(TAR, "ears__p001_a", 512, 4)])]
     )
     with pytest.raises(FileNotFoundError, match="main process"):
         SourceTarRefStore(
@@ -314,7 +342,7 @@ def test_the_index_is_discovered_next_to_the_manifests(tmp_path):
     train = root / "manifests" / "train.jsonl"
     train.write_text("", encoding="utf-8")
     assert default_index_path(train) is None
-    _index(tmp_path, [_row(refs=[(TAR, "ears__p001_a.flac", 512, 4)])])
+    _index(tmp_path, [_row(refs=[(TAR, "ears__p001_a", 512, 4)])])
     assert default_index_path(train) == (
         root / "refs" / "source_speaker_index.jsonl"
     )
@@ -326,8 +354,8 @@ def test_an_index_row_without_refs_is_rejected(tmp_path):
 
 
 def test_source_refs_row_coerces_the_json_types():
-    entry = source_refs_row({"refs": [[TAR, "ears__p001_a.flac", "512", "10"]]})
-    assert entry["refs"] == ((TAR, "ears__p001_a.flac", 512, 10),)
+    entry = source_refs_row({"refs": [[TAR, "ears__p001_a", "512", "10"]]})
+    assert entry["refs"] == ((TAR, "ears__p001_a", 512, 10),)
 
 
 class _Tok:
@@ -380,7 +408,7 @@ def test_two_datasets_sharing_a_speaker_id_never_swap_refs(tmp_path):
             _source_tar(
                 mirror,
                 dataset,
-                [f"{dataset}__p001_a.flac", f"{dataset}__p001_b.flac"],
+                [f"{dataset}__p001_a", f"{dataset}__p001_b"],
             )
         )
     (root / "codes" / "mini").mkdir(parents=True)
@@ -395,9 +423,9 @@ def test_two_datasets_sharing_a_speaker_id_never_swap_refs(tmp_path):
                 "language": "en",
                 "speaker_id": "p001",
                 "refs": [
-                    list(located[f"{dataset}__p001_{suffix}.flac"][:1])
-                    + [f"{dataset}__p001_{suffix}.flac"]
-                    + list(located[f"{dataset}__p001_{suffix}.flac"][1:])
+                    list(located[f"{dataset}__p001_{suffix}"][:1])
+                    + [f"{dataset}__p001_{suffix}"]
+                    + list(located[f"{dataset}__p001_{suffix}"][1:])
                     for suffix in ("a", "b")
                 ],
             }

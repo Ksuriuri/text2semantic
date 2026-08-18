@@ -12,20 +12,25 @@ Index row (``refs/source_speaker_index.jsonl``)::
 
     {"dataset": "ears", "language": "en", "speaker_id": "p001",
      "refs": [["preprocessed/ears/audio/ears-000000.tar",
-               "ears__p001_emo_adoration_freeform.flac", 512, 382599], ...]}
+               "ears__p001_emo_adoration_freeform", 512, 382599], ...]}
 
-The offsets come from the per-tar sidecars written by the header scan; keeping
-them in the index means a ref costs exactly one ranged GET at training time,
-with no sidecar to fetch and no tar to open.
+A ref is ``(tar, row id, offset, size)``. The offsets come from the per-tar
+sidecars written by the header scan; keeping them in the index means a ref costs
+exactly one ranged GET at training time, with no sidecar to fetch and no tar to
+open.
 
 Two things this store must get right:
 
 * The key is ``(dataset, language, speaker_id)``. Speaker ids are only unique
   within a dataset -- ``p001`` exists in several of them and is not the same
   person -- so a two-part key would quietly hand out another speaker's voice.
-* A ref must not be the clip being predicted. A member is named ``<id>.<ext>``
-  after the row it holds -- the id already carries its own dataset prefix -- so
-  ``exclude`` is matched against that id as well as against the raw member name.
+* A ref must not be the clip being predicted. That is why the second field is
+  the row id and not the tar member name: the packer sanitized ids into
+  filenames (``Genshin__en/#Unknown/vo_x`` became
+  ``Genshin__en_Unknown_vo_x.flac``, and a podcast member drops the episode hash
+  its id repeats), so a member name cannot be turned back into the id it came
+  from, and comparing ``exclude`` against one excluded nothing on three of the
+  four largest datasets. The index carries the id, so the comparison is exact.
 """
 
 from __future__ import annotations
@@ -36,18 +41,17 @@ from collections import OrderedDict
 from pathlib import Path
 
 from finetuning import speaker_index as speaker_index_table
-from finetuning.ref_member_index import member_row_id
 
 KEY_FIELDS = ("dataset", "language", "speaker_id")
 INDEX_NAME = "source_speaker_index.jsonl"
 
 
 def source_refs_row(row):
-    """The source-tar row shape: a list of ``(tar, member, offset, size)``."""
+    """The source-tar row shape: a list of ``(tar, row id, offset, size)``."""
     refs = []
     for entry in row.get("refs") or ():
-        tar, member, offset, size = entry
-        refs.append((str(tar), str(member), int(offset), int(size)))
+        tar, row_id, offset, size = entry
+        refs.append((str(tar), str(row_id), int(offset), int(size)))
     return {"refs": tuple(refs)}
 
 
@@ -193,19 +197,15 @@ class SourceTarRefStore:
             refs = refs[: self.refs_per_speaker]
         return tuple(refs)
 
-    def members(self, key):
-        """Member names only, so manifest_index's ref probe can count them."""
-        return tuple(ref[1] for ref in self.refs(key))
-
     def ref_ids(self, key):
-        """The row ids these refs are, for comparing against ``exclude``."""
-        return tuple(member_row_id(ref[1]) for ref in self.refs(key))
+        """The row ids these refs are, so a ref probe can count or compare them."""
+        return tuple(ref[1] for ref in self.refs(key))
 
     def has_usable_ref(self, key, *, exclude=None):
         return self.pick_ref(key, exclude=exclude) is not None
 
     def pick_ref(self, key, *, exclude=None, rng=None):
-        """``(tar, member, offset, size)`` for a usable ref, or None."""
+        """``(tar, row id, offset, size)`` for a usable ref, or None."""
         candidates = [
             ref for ref in self.refs(key) if not self._excluded(ref[1], exclude)
         ]
@@ -216,19 +216,16 @@ class SourceTarRefStore:
         return candidates[rng.randrange(len(candidates))]
 
     def read_ref(self, key, *, exclude=None, rng=None):
-        """``(member name, bytes)`` for a usable ref, or None."""
+        """``(row id, bytes)`` for a usable ref, or None."""
         picked = self.pick_ref(key, exclude=exclude, rng=rng)
         if picked is None:
             return None
-        tar, member, offset, size = picked
-        return member, self.reader.read(tar, offset, size)
+        tar, row_id, offset, size = picked
+        return row_id, self.reader.read(tar, offset, size)
 
     @staticmethod
-    def _excluded(member, exclude):
-        if exclude is None:
-            return False
-        exclude = str(exclude)
-        return member == exclude or member_row_id(member) == exclude
+    def _excluded(row_id, exclude):
+        return exclude is not None and row_id == str(exclude)
 
     def _lookup(self, key):
         if key is None:
