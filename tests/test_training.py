@@ -1,5 +1,6 @@
 import json
 import os
+import signal
 from types import SimpleNamespace
 
 import torch
@@ -9,11 +10,20 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from transformers import Qwen3_5TextConfig
 
+from finetuning.checkpoint_policy import (
+    ACTION_NONE,
+    ACTION_PERSISTENT,
+    ACTION_ROLLING,
+    CheckpointPolicy,
+)
 from finetuning.train import (
+    PreemptionFlag,
     add_speaker_features,
     build_dataset,
     build_optimizer,
+    decide_checkpoint,
     evaluate,
+    latest_checkpoint,
     load_resume_state,
     learning_rates_by_group,
     parse_args,
@@ -56,10 +66,11 @@ def test_parse_args_defaults_match_dataset_limits(monkeypatch):
     assert args.max_train_steps == 100000
     assert args.num_epochs is None
     assert args.logging_steps == 10
-    assert args.eval_steps == 10000
-    assert args.checkpointing_steps == 1000
+    assert args.eval_steps == 1000
+    assert args.checkpointing_steps == 50
+    assert args.checkpointing_min_interval_minutes == 30.0
     assert args.checkpoint_total_limit == 2
-    assert args.keep_checkpointing_steps == 10000
+    assert args.keep_checkpointing_steps == 5000
     assert args.seed == 42
     assert args.max_ref_seconds == 20.0
     assert args.max_target_seconds == 30.0
@@ -212,6 +223,83 @@ def test_rotate_checkpoints_keeps_latest_regular_steps(tmp_path):
         "checkpoint-step-4000",
     ]
     assert (tmp_path / "checkpoint-keep-step-4000").is_dir()
+
+
+def write_checkpoint_dir(root, name, *, finished=True):
+    path = root / name
+    path.mkdir()
+    (path / "accelerator_state").mkdir()
+    if finished:
+        with open(path / "trainer_state.json", "w", encoding="utf-8") as handle:
+            json.dump({"epoch": 0, "step_in_epoch": 1, "global_step": 1}, handle)
+    return path
+
+
+def test_latest_checkpoint_spans_both_prefixes(tmp_path):
+    write_checkpoint_dir(tmp_path, "checkpoint-step-4950")
+    write_checkpoint_dir(tmp_path, "checkpoint-keep-step-5000")
+
+    assert latest_checkpoint(tmp_path) == str(
+        tmp_path / "checkpoint-keep-step-5000"
+    )
+
+
+def test_latest_checkpoint_skips_a_half_written_directory(tmp_path):
+    write_checkpoint_dir(tmp_path, "checkpoint-step-100")
+    # Killed between save_state and trainer_state.json: resuming from this
+    # would raise, so it must not be picked as "latest".
+    write_checkpoint_dir(tmp_path, "checkpoint-step-150", finished=False)
+
+    assert latest_checkpoint(tmp_path) == str(tmp_path / "checkpoint-step-100")
+
+
+def test_latest_checkpoint_is_none_on_a_fresh_output_dir(tmp_path):
+    assert latest_checkpoint(tmp_path / "missing") is None
+    assert latest_checkpoint(tmp_path) is None
+
+
+def test_decide_checkpoint_follows_the_policy():
+    accelerator = Accelerator(cpu=True)
+    clock = SimpleNamespace(now=0.0)
+    policy = CheckpointPolicy(
+        rolling_steps=50,
+        persistent_steps=5000,
+        min_interval_seconds=1800.0,
+        clock=lambda: clock.now,
+    )
+
+    assert decide_checkpoint(accelerator, policy, 50) == (ACTION_NONE, False)
+    clock.now = 1800.0
+    assert decide_checkpoint(accelerator, policy, 1050) == (ACTION_ROLLING, False)
+    assert decide_checkpoint(accelerator, policy, 5000) == (
+        ACTION_PERSISTENT,
+        False,
+    )
+
+
+def test_decide_checkpoint_turns_preemption_into_an_off_schedule_save():
+    accelerator = Accelerator(cpu=True)
+    policy = CheckpointPolicy(
+        rolling_steps=50,
+        persistent_steps=5000,
+        min_interval_seconds=1800.0,
+        clock=lambda: 0.0,
+    )
+
+    # Step 17 is neither a multiple of 50 nor past the interval; the signal
+    # still has to produce a checkpoint, and the caller has to be told to stop.
+    assert decide_checkpoint(accelerator, policy, 17, preempting=True) == (
+        ACTION_ROLLING,
+        True,
+    )
+
+
+def test_preemption_flag_records_the_signal():
+    flag = PreemptionFlag()
+    assert flag.triggered is False
+    flag._handle(signal.SIGTERM, None)
+    assert flag.triggered is True
+    assert flag.signal_number == signal.SIGTERM
 
 
 def test_evaluation_reports_semantic_and_eos_metrics():

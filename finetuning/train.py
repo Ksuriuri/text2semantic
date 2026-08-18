@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 from collections import Counter, defaultdict
 
 import torch
@@ -13,6 +14,15 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed
 from dotenv import load_dotenv
 from finetuning import manifest_index
+from finetuning.checkpoint_policy import (
+    ACTION_NONE,
+    ACTION_PERSISTENT,
+    ACTION_ROLLING,
+    PERSISTENT_PREFIX,
+    ROLLING_PREFIX,
+    CheckpointPolicy,
+    checkpoint_dir_name,
+)
 from finetuning.dataset import Text2SemanticDataset
 from finetuning.ref_store import SpeakerRefStore, default_ref_index_path
 from torch.optim import AdamW
@@ -123,12 +133,38 @@ def parse_args():
     )
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--logging_steps", type=int, default=10)
-    parser.add_argument("--eval_steps", type=int, default=10000)
-    parser.add_argument("--checkpointing_steps", type=int, default=1000)
+    parser.add_argument("--eval_steps", type=int, default=1000)
+    parser.add_argument(
+        "--checkpointing_steps",
+        type=int,
+        default=50,
+        help=(
+            "Rolling checkpoints land on multiples of this step count, but "
+            "only once --checkpointing_min_interval_minutes has also passed. "
+            "The step multiple sets the granularity; the interval sets the rate."
+        ),
+    )
+    parser.add_argument(
+        "--checkpointing_min_interval_minutes",
+        type=float,
+        default=30.0,
+        help=(
+            "Minimum wall-clock minutes between checkpoints of any kind. "
+            "0 disables the time gate and saves on every --checkpointing_steps."
+        ),
+    )
     parser.add_argument("--checkpoint_total_limit", type=int, default=2)
-    parser.add_argument("--keep_checkpointing_steps", type=int, default=10000)
+    parser.add_argument("--keep_checkpointing_steps", type=int, default=5000)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--resume_from_checkpoint")
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        help=(
+            "Checkpoint directory to resume from, or 'auto' to pick the "
+            "newest checkpoint under --output_model_path (nothing to resume "
+            "from is not an error, so a preempted job can be relaunched with "
+            "the same command line)."
+        ),
+    )
     parser.add_argument("--wandb_run_name")
     parser.add_argument(
         "--gradient_checkpointing",
@@ -159,6 +195,10 @@ def parse_args():
         parser.error("--adam_epsilon must be positive.")
     if args.checkpointing_steps <= 0:
         parser.error("--checkpointing_steps must be positive.")
+    if args.checkpointing_min_interval_minutes < 0:
+        parser.error(
+            "--checkpointing_min_interval_minutes must be non-negative."
+        )
     if args.checkpoint_total_limit < 0:
         parser.error("--checkpoint_total_limit must be non-negative.")
     if args.keep_checkpointing_steps <= 0:
@@ -530,7 +570,7 @@ def learning_rates_by_group(optimizer):
     return lrs
 
 
-def sorted_checkpoints(output_dir, prefix="checkpoint-step-"):
+def sorted_checkpoints(output_dir, prefix=ROLLING_PREFIX):
     if not os.path.isdir(output_dir):
         return []
     checkpoints = []
@@ -551,6 +591,78 @@ def rotate_checkpoints(output_dir, limit):
         checkpoints = sorted_checkpoints(output_dir)[:-limit]
     for checkpoint in checkpoints:
         shutil.rmtree(checkpoint)
+
+
+def latest_checkpoint(output_dir):
+    """The newest resumable checkpoint, rolling or persistent.
+
+    A persistent save suppresses the rolling save on the same step, so the
+    newest state can live under either prefix and both have to be considered.
+    Only directories that finished writing (``trainer_state.json`` is written
+    last) count, so a checkpoint interrupted mid-write is skipped rather than
+    failing the resume.
+    """
+    candidates = []
+    for prefix in (ROLLING_PREFIX, PERSISTENT_PREFIX):
+        for path in sorted_checkpoints(output_dir, prefix):
+            step = int(os.path.basename(path)[len(prefix) :])
+            if os.path.isfile(os.path.join(path, "trainer_state.json")):
+                candidates.append((step, path))
+    if not candidates:
+        return None
+    # Ties (same step under both prefixes) resolve to the persistent one, which
+    # sorts second by path; either holds identical state.
+    return max(candidates, key=lambda item: (item[0], item[1]))[1]
+
+
+class PreemptionFlag:
+    """Set when the node is being taken away.
+
+    A Spot node gets roughly 30 seconds' notice, delivered as SIGTERM to the
+    processes on *that* node only -- the other node in a multi-node job hears
+    nothing.  So the flag is local, and the training loop has to agree on it
+    collectively (see ``decide_checkpoint``) or the ranks that saw the signal
+    would enter the save barriers alone and hang.
+    """
+
+    def __init__(self):
+        self.triggered = False
+        self.signal_number = None
+
+    def install(self):
+        # SIGUSR1 is the manual equivalent: "checkpoint and stop cleanly".
+        for number in (signal.SIGTERM, signal.SIGUSR1):
+            signal.signal(number, self._handle)
+        return self
+
+    def _handle(self, signal_number, _frame):
+        self.triggered = True
+        self.signal_number = signal_number
+
+
+def decide_checkpoint(accelerator, policy, global_step, preempting=False):
+    """One checkpoint decision, identical on every rank.
+
+    Both inputs are rank-local: wall clock differs between machines, and a
+    preemption signal reaches one node only.  Saving is collective, so a
+    disagreement here is a hang rather than a wrong file.  One max-reduce
+    settles both -- rank 0 is the only rank that proposes an action, and the
+    preemption flag is true for everyone if it is true for anyone.
+    """
+    proposal = policy.action(global_step) if accelerator.is_main_process else 0
+    signal_state = torch.tensor(
+        [proposal, 1 if preempting else 0],
+        dtype=torch.int64,
+        device=accelerator.device,
+    )
+    signal_state = accelerator.reduce(signal_state, reduction="max")
+    action, preempting_anywhere = (int(value) for value in signal_state.tolist())
+    if preempting_anywhere and action == ACTION_NONE:
+        # Best effort: 30 seconds is not enough for 28 GB of optimizer state on
+        # every node, so this is a bonus save, not the thing keeping the run
+        # safe.  The rolling interval is what bounds the loss.
+        action = ACTION_ROLLING
+    return action, bool(preempting_anywhere)
 
 
 def run_evaluation(
@@ -740,20 +852,45 @@ def train():
     start_epoch = 0
     resume_step = 0
     global_step = 0
-    if args.resume_from_checkpoint:
+    resume_from = args.resume_from_checkpoint
+    if resume_from == "auto":
+        # A preempted job is relaunched with the same command line, so "resume
+        # from whatever is newest, or start fresh" has to be expressible.
+        resume_from = latest_checkpoint(args.output_model_path)
+        accelerator.print(
+            f"Auto-resume: {resume_from or 'no checkpoint found, starting fresh'}"
+        )
+    if resume_from:
         start_epoch, resume_step, global_step = load_resume_state(
-            accelerator, args.resume_from_checkpoint
+            accelerator, resume_from
         )
         accelerator.print(
-            f"Resumed from {args.resume_from_checkpoint} at "
+            f"Resumed from {resume_from} at "
             f"epoch={start_epoch}, step={resume_step}, global_step={global_step}"
         )
+
+    preemption = PreemptionFlag().install()
+    policy = CheckpointPolicy(
+        rolling_steps=args.checkpointing_steps,
+        persistent_steps=args.keep_checkpointing_steps,
+        min_interval_seconds=args.checkpointing_min_interval_minutes * 60.0,
+    )
+    accelerator.print(
+        f"Checkpoints: rolling on step %{args.checkpointing_steps} and "
+        f">={args.checkpointing_min_interval_minutes:g} min since the last "
+        f"save, keeping {args.checkpoint_total_limit}; persistent every "
+        f"{args.keep_checkpointing_steps} steps; eval every {args.eval_steps} "
+        "steps"
+    )
 
     model.train()
     epoch = start_epoch
     last_eval_step = 0
-    while global_step < total_steps and (
-        args.num_epochs is None or epoch < args.num_epochs
+    stopping = False
+    while (
+        not stopping
+        and global_step < total_steps
+        and (args.num_epochs is None or epoch < args.num_epochs)
     ):
         if epoch == start_epoch and resume_step:
             active_dataloader = accelerator.skip_first_batches(
@@ -800,37 +937,44 @@ def train():
                             "new_modules"
                         ]
                     accelerator.log(log_values, step=global_step)
-                if global_step % args.checkpointing_steps == 0:
+                action, preempting = decide_checkpoint(
+                    accelerator,
+                    policy,
+                    global_step,
+                    preempting=preemption.triggered,
+                )
+                if action != ACTION_NONE:
                     save_checkpoint(
                         accelerator,
                         model,
                         tokenizer,
                         os.path.join(
                             args.output_model_path,
-                            f"checkpoint-step-{global_step}",
+                            checkpoint_dir_name(action, global_step),
                         ),
                         epoch=epoch,
                         step_in_epoch=step + 1,
                         global_step=global_step,
                     )
-                    if accelerator.is_main_process:
+                    policy.record_save()
+                    if action == ACTION_ROLLING and accelerator.is_main_process:
+                        # Persistent checkpoints use their own prefix and are
+                        # never rotated.
                         rotate_checkpoints(
                             args.output_model_path, args.checkpoint_total_limit
                         )
                     accelerator.wait_for_everyone()
-                if global_step % args.keep_checkpointing_steps == 0:
-                    save_checkpoint(
-                        accelerator,
-                        model,
-                        tokenizer,
-                        os.path.join(
-                            args.output_model_path,
-                            f"checkpoint-keep-step-{global_step}",
-                        ),
-                        epoch=epoch,
-                        step_in_epoch=step + 1,
-                        global_step=global_step,
+                    accelerator.print(
+                        f"Step {global_step} | saved "
+                        f"{checkpoint_dir_name(action, global_step)}"
                     )
+                if preempting:
+                    accelerator.print(
+                        f"Step {global_step} | preemption signalled, stopping "
+                        "after the checkpoint above"
+                    )
+                    stopping = True
+                    break
                 if global_step % args.eval_steps == 0:
                     run_evaluation(
                         model,
@@ -846,7 +990,8 @@ def train():
 
         resume_step = 0
         epoch += 1
-    if global_step and global_step != last_eval_step:
+    # A preempted job has seconds left, not the minutes an eval pass takes.
+    if not stopping and global_step and global_step != last_eval_step:
         run_evaluation(
             model,
             eval_dataloader,
