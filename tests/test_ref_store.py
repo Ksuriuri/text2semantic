@@ -98,6 +98,7 @@ def test_resolve_ref_store_autodiscovers(tmp_path, monkeypatch):
     _, train, index = _build_trainset(tmp_path)
     args = type("A", (), {})()
     args.loose_refs = False
+    args.ref_backend = "packed"
     args.ref_index = None
     args.ref_root = None
     args.ref_cache = None

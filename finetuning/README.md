@@ -70,9 +70,16 @@ uv run accelerate launch finetuning/train.py \
   --new_module_lr 2e-4 \
   --weight_decay 0.01 \
   --warmup_ratio 0.03 \
-  --max_train_steps 100000 \
+  --num_epochs 1 \
   --gradient_accumulation_steps 4
 ```
+
+Run length comes from exactly one of `--num_epochs` or `--max_train_steps`;
+passing neither is an error. Warmup and the cosine decay are sized off whichever
+is given, so `--num_epochs 1` keeps the schedule matched to the manifest as the
+trainset grows, while `--max_train_steps` is for deliberately training a fixed
+fraction of an epoch. Setting one to a number the other contradicts is what used
+to decay the learning rate to zero partway through a run.
 
 The Qwen3.5 backbone is loaded from pretrained weights. The independent
 8195-entry speech embedding, 8195-class output head, and IndexTTS2-style

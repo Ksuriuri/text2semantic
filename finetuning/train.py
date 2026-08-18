@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 import os
 import shutil
 import signal
@@ -134,8 +135,26 @@ def parse_args():
     parser.add_argument("--adam_beta2", type=float, default=0.95)
     parser.add_argument("--adam_epsilon", type=float, default=1e-8)
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
-    parser.add_argument("--max_train_steps", type=int, default=100000)
-    parser.add_argument("--num_epochs", type=int)
+    # Exactly one of these sets the run length, because the cosine schedule is
+    # built from it: a step count that outlives the epoch limit decays the LR to
+    # zero mid-training, and one that undershoots stops the run with the LR still
+    # high. There is deliberately no default -- silently training 100k steps when
+    # the caller meant one epoch is the failure this replaces.
+    parser.add_argument(
+        "--max_train_steps",
+        type=int,
+        default=None,
+        help="Fixed run length in optimizer steps. Mutually exclusive with "
+        "--num_epochs.",
+    )
+    parser.add_argument(
+        "--num_epochs",
+        type=int,
+        default=None,
+        help="Run length in passes over the manifest. The step count, warmup "
+        "and cosine decay are derived from the manifest size, so they follow "
+        "the dataset instead of needing to be recomputed by hand.",
+    )
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--max_text_tokens", type=int)
@@ -219,7 +238,12 @@ def parse_args():
     args = parser.parse_args()
     if not 0 <= args.warmup_ratio < 1:
         parser.error("--warmup_ratio must be in [0, 1).")
-    if args.max_train_steps <= 0:
+    if (args.max_train_steps is None) == (args.num_epochs is None):
+        parser.error(
+            "set exactly one of --num_epochs (run length follows the manifest) "
+            "or --max_train_steps (fixed step count)."
+        )
+    if args.max_train_steps is not None and args.max_train_steps <= 0:
         parser.error("--max_train_steps must be positive.")
     if args.num_epochs is not None and args.num_epochs <= 0:
         parser.error("--num_epochs must be positive when set.")
@@ -654,6 +678,23 @@ def should_decay_parameter(parameter_name, parameter):
     return not any(term in lowered for term in no_decay_terms)
 
 
+def steps_for_epochs(
+    num_batches, num_processes, gradient_accumulation_steps, num_epochs
+):
+    """Optimizer steps in `num_epochs` passes over an unsharded dataloader.
+
+    Called before `accelerator.prepare`, so `num_batches` is the whole-manifest
+    batch count and the per-rank count has to be derived: accelerate hands every
+    rank the same number of batches, rounding up, so a run that would leave one
+    rank a batch short still takes the extra step.
+    """
+    if num_batches <= 0:
+        raise ValueError("num_batches must be positive")
+    batches_per_rank = math.ceil(num_batches / num_processes)
+    steps_per_epoch = math.ceil(batches_per_rank / gradient_accumulation_steps)
+    return steps_per_epoch * num_epochs
+
+
 def build_optimizer(model, args):
     groups = {
         ("backbone", True): [],
@@ -956,7 +997,22 @@ def train():
     accelerator.print(f"Full-parameter training: {trainable:,} parameters")
 
     optimizer = build_optimizer(model, args)
-    total_steps = args.max_train_steps
+    if args.num_epochs is not None:
+        total_steps = steps_for_epochs(
+            len(train_dataloader),
+            accelerator.num_processes,
+            args.gradient_accumulation_steps,
+            args.num_epochs,
+        )
+        accelerator.print(
+            f"Run length: {args.num_epochs} epoch(s) over "
+            f"{len(train_dataset):,} rows = {total_steps:,} steps at "
+            f"{args.batch_size * accelerator.num_processes * args.gradient_accumulation_steps}"
+            " rows/step"
+        )
+    else:
+        total_steps = args.max_train_steps
+        accelerator.print(f"Run length: {total_steps:,} steps (fixed)")
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=int(total_steps * args.warmup_ratio),

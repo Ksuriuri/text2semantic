@@ -128,7 +128,7 @@ uv run accelerate launch finetuning/train.py \
   --batch_size 2 \
   --lr 4e-5 \
   --new_module_lr 2e-4 \
-  --max_train_steps 100000 \
+  --num_epochs 1 \
   --gradient_accumulation_steps 4
 ```
 

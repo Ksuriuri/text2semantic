@@ -1,8 +1,10 @@
 import json
+import math
 import os
 import signal
 from types import SimpleNamespace
 
+import pytest
 import torch
 from accelerate import Accelerator
 from torch.optim import AdamW
@@ -35,6 +37,7 @@ from finetuning.train import (
     speaker_key,
     speaker_statistics,
     sorted_checkpoints,
+    steps_for_epochs,
 )
 from qwen_tts.core.models import (
     Text2SemanticConfig,
@@ -61,13 +64,15 @@ def test_parse_args_defaults_match_dataset_limits(monkeypatch):
             "w2v",
             "--stats_path",
             "stats.pt",
+            "--num_epochs",
+            "1",
         ],
     )
     args = parse_args()
     assert args.lr == 4e-5
     assert args.new_module_lr == 2e-4
-    assert args.max_train_steps == 100000
-    assert args.num_epochs is None
+    assert args.max_train_steps is None
+    assert args.num_epochs == 1
     assert args.logging_steps == 10
     assert args.eval_steps == 1000
     assert args.checkpointing_steps == 50
@@ -80,6 +85,61 @@ def test_parse_args_defaults_match_dataset_limits(monkeypatch):
     assert args.min_speaker_records == 2
     assert args.punctuation_dropout_prob == 0.1
     assert args.punctuation_dropout_keep_word_spaces is True
+
+
+def _run_length_argv(*extra):
+    return [
+        "train.py",
+        "--train_jsonl",
+        "train.jsonl",
+        "--eval_jsonl",
+        "eval.jsonl",
+        "--w2v_bert_path",
+        "w2v",
+        "--stats_path",
+        "stats.pt",
+        *extra,
+    ]
+
+
+def test_parse_args_requires_a_run_length(monkeypatch):
+    # Neither flag used to mean "100k steps", which silently ignored a caller
+    # who meant one epoch. Refusing is the point of the change.
+    monkeypatch.setattr("sys.argv", _run_length_argv())
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
+def test_parse_args_rejects_both_run_lengths(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        _run_length_argv("--num_epochs", "1", "--max_train_steps", "1000"),
+    )
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
+def test_steps_for_epochs_rounds_each_division_up():
+    # 1000 batches over 3 ranks is 334 per rank (not 333), and 334 batches at
+    # accum 4 is 84 steps (not 83): a partial batch and a partial accumulation
+    # window both still cost a step, and rounding either down would end the
+    # cosine decay before the epoch does.
+    assert steps_for_epochs(1000, 3, 4, 1) == 84
+    assert steps_for_epochs(1000, 3, 4, 2) == 168
+
+
+def test_steps_for_epochs_is_exact_when_nothing_divides_short():
+    assert steps_for_epochs(960, 8, 3, 1) == 40
+    assert steps_for_epochs(960, 8, 1, 1) == 120
+
+
+def test_steps_for_epochs_matches_the_t2s_v1_manifest():
+    # The number this exists to produce: 99,374,464 rows at batch 32 on 16 GPUs
+    # with no accumulation is 512 rows/step, so one epoch is 194,091 steps -- not
+    # the 100,000 the old default would have scheduled.
+    rows = 99_374_464
+    batches = math.ceil(rows / 32)
+    assert steps_for_epochs(batches, 16, 1, 1) == 194_091
 
 
 def test_speaker_statistics_are_split_local():
@@ -182,20 +242,7 @@ def test_accelerator_checkpoint_restores_full_training_state(tmp_path):
 
 
 def test_optimizer_uses_lr_groups_and_no_decay_defaults(monkeypatch):
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "train.py",
-            "--train_jsonl",
-            "train.jsonl",
-            "--eval_jsonl",
-            "eval.jsonl",
-            "--w2v_bert_path",
-            "w2v",
-            "--stats_path",
-            "stats.pt",
-        ],
-    )
+    monkeypatch.setattr("sys.argv", _run_length_argv("--num_epochs", "1"))
     args = parse_args()
     optimizer = build_optimizer(tiny_model(), args)
     group_names = {group["name"] for group in optimizer.param_groups}
