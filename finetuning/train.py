@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from dotenv import load_dotenv
-from finetuning import manifest_index
+from finetuning import checkpoint_remote, manifest_index
 from finetuning.checkpoint_policy import (
     ACTION_NONE,
     ACTION_PERSISTENT,
@@ -155,14 +155,24 @@ def parse_args():
     )
     parser.add_argument("--checkpoint_total_limit", type=int, default=2)
     parser.add_argument("--keep_checkpointing_steps", type=int, default=5000)
+    parser.add_argument(
+        "--checkpoint_remote_dir",
+        help=(
+            "gs:// prefix to mirror checkpoints to. A Spot preemption takes "
+            "the machine and its disk, so on Spot this is what makes the run "
+            "resumable at all; with it set, 'auto' resume reads from here."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--resume_from_checkpoint",
         help=(
             "Checkpoint directory to resume from, or 'auto' to pick the "
-            "newest checkpoint under --output_model_path (nothing to resume "
-            "from is not an error, so a preempted job can be relaunched with "
-            "the same command line)."
+            "newest checkpoint (the newest complete one on "
+            "--checkpoint_remote_dir when that is set, otherwise the newest "
+            "under --output_model_path). Nothing to resume from is not an "
+            "error, so a preempted job can be relaunched with the same "
+            "command line."
         ),
     )
     parser.add_argument("--wandb_run_name")
@@ -203,6 +213,10 @@ def parse_args():
         parser.error("--checkpoint_total_limit must be non-negative.")
     if args.keep_checkpointing_steps <= 0:
         parser.error("--keep_checkpointing_steps must be positive.")
+    if args.checkpoint_remote_dir and not checkpoint_remote.is_remote(
+        args.checkpoint_remote_dir
+    ):
+        parser.error("--checkpoint_remote_dir must be a gs:// URI.")
     if args.logging_steps <= 0:
         parser.error("--logging_steps must be positive.")
     if args.eval_steps <= 0:
@@ -490,6 +504,52 @@ def save_checkpoint(
                 indent=2,
             )
     accelerator.wait_for_everyone()
+
+
+def mirror_checkpoint(accelerator, local_dir, remote_prefix, *, log=None):
+    """Copy a just-saved checkpoint to object storage.
+
+    Every node uploads its own directory: ``save_state`` writes the model and
+    optimizer only from the main process but ``random_states_<rank>.pkl`` from
+    every rank, so with node-local disks neither node holds a complete
+    checkpoint on its own.  The marker goes on last, from one process, once both
+    nodes are done -- it is the only thing that distinguishes a finished upload
+    from one a preemption cut in half.
+    """
+    if not remote_prefix:
+        return None
+    remote_dir = checkpoint_remote.join(remote_prefix, os.path.basename(local_dir))
+    if accelerator.is_local_main_process:
+        checkpoint_remote.upload(local_dir, remote_dir)
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        checkpoint_remote.mark_complete(remote_dir)
+    accelerator.wait_for_everyone()
+    if log is not None:
+        log(f"Mirrored {os.path.basename(local_dir)} -> {remote_dir}")
+    return remote_dir
+
+
+def fetch_remote_checkpoint(accelerator, remote_prefix, output_dir, *, log=None):
+    """Make the newest complete remote checkpoint available locally.
+
+    With a remote prefix configured it is the only source of truth for resume,
+    local directories are ignored: a node that survived a preemption may still
+    hold a checkpoint whose upload never finished, and letting each node pick
+    its own newest local one would have the two nodes resume from different
+    weights -- which DDP does not detect, it just trains on wrong gradients.
+    """
+    remote_dir = checkpoint_remote.latest_complete(remote_prefix)
+    if remote_dir is None:
+        return None
+    local_dir = os.path.join(output_dir, os.path.basename(remote_dir))
+    if accelerator.is_local_main_process:
+        os.makedirs(local_dir, exist_ok=True)
+        if log is not None:
+            log(f"Downloading {remote_dir} -> {local_dir}")
+        checkpoint_remote.download(remote_dir, local_dir)
+    accelerator.wait_for_everyone()
+    return local_dir
 
 
 def load_resume_state(accelerator, checkpoint):
@@ -868,7 +928,15 @@ def train():
     if resume_from == "auto":
         # A preempted job is relaunched with the same command line, so "resume
         # from whatever is newest, or start fresh" has to be expressible.
-        resume_from = latest_checkpoint(args.output_model_path)
+        if args.checkpoint_remote_dir:
+            resume_from = fetch_remote_checkpoint(
+                accelerator,
+                args.checkpoint_remote_dir,
+                args.output_model_path,
+                log=accelerator.print,
+            )
+        else:
+            resume_from = latest_checkpoint(args.output_model_path)
         accelerator.print(
             f"Auto-resume: {resume_from or 'no checkpoint found, starting fresh'}"
         )
@@ -892,7 +960,8 @@ def train():
         f">={args.checkpointing_min_interval_minutes:g} min since the last "
         f"save, keeping {args.checkpoint_total_limit}; persistent every "
         f"{args.keep_checkpointing_steps} steps; eval every {args.eval_steps} "
-        "steps"
+        "steps; mirrored to "
+        f"{args.checkpoint_remote_dir or 'local disk only'}"
     )
 
     model.train()
@@ -956,18 +1025,27 @@ def train():
                     preempting=preemption.triggered,
                 )
                 if action != ACTION_NONE:
+                    checkpoint_dir = os.path.join(
+                        args.output_model_path,
+                        checkpoint_dir_name(action, global_step),
+                    )
                     save_checkpoint(
                         accelerator,
                         model,
                         tokenizer,
-                        os.path.join(
-                            args.output_model_path,
-                            checkpoint_dir_name(action, global_step),
-                        ),
+                        checkpoint_dir,
                         epoch=epoch,
                         step_in_epoch=step + 1,
                         global_step=global_step,
                     )
+                    mirror_checkpoint(
+                        accelerator,
+                        checkpoint_dir,
+                        args.checkpoint_remote_dir,
+                        log=accelerator.print,
+                    )
+                    # After the upload, so a save that only made it to local
+                    # disk is not counted as one that survives the machine.
                     policy.record_save()
                     if action == ACTION_ROLLING and accelerator.is_main_process:
                         # Persistent checkpoints use their own prefix and are
@@ -975,6 +1053,11 @@ def train():
                         rotate_checkpoints(
                             args.output_model_path, args.checkpoint_total_limit
                         )
+                        if args.checkpoint_remote_dir:
+                            checkpoint_remote.rotate(
+                                args.checkpoint_remote_dir,
+                                args.checkpoint_total_limit,
+                            )
                     accelerator.wait_for_everyone()
                     accelerator.print(
                         f"Step {global_step} | saved "

@@ -147,8 +147,21 @@ cosine warmup scheduler 会分别衰减各参数组的学习率，并保持二�
 训练指标、验证 loss、token accuracy 和 EOS accuracy 写入
 `haoyuanhuang22-jcxy/text2semantic` W&B project。API key 不应写进脚本或提交到仓库。
 
-默认每 1000 个 optimizer step 保存一个可恢复 checkpoint，只保留最新 2 个普通
-`checkpoint-step-*`；每 10000 step 额外保存一个 `checkpoint-keep-step-*`，不会自动删除。
+滚动 checkpoint 需要同时满足两个条件才会保存：step 是 `--checkpointing_steps`
+（默认 50）的整数倍，**且**距上次保存已超过
+`--checkpointing_min_interval_minutes`（默认 30 分钟）。step 倍数决定粒度，时间
+间隔决定频率；`checkpoint-step-*` 只保留最新
+`--checkpoint_total_limit`（默认 2）个。每 `--keep_checkpointing_steps`
+（默认 5000）step 保存一个 `checkpoint-keep-step-*`，永不轮转删除。收到 `SIGTERM`
+或 `SIGUSR1` 会额外存一次并干净退出。
+
+抢占式机器上加 `--checkpoint_remote_dir gs://bucket/prefix`：每次保存都会镜像到
+对象存储（每台机器各自上传自己写的文件），最后写 `_UPLOAD_COMPLETE` 标记，因此
+恢复时不会挑到被抢占打断的半个 checkpoint。配了远端前缀后
+`--resume_from_checkpoint auto` 只认远端最新的完整 checkpoint，忽略本地目录 ——
+抢占后存活的那台机器上可能留着一个上传没完成的 checkpoint，而两台机器从不同权重
+恢复，DDP 是不会报错的。
+
 断点续训：
 
 ```bash

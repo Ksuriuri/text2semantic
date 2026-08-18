@@ -132,6 +132,20 @@ uv run accelerate launch finetuning/train.py \
   --resume_from_checkpoint output/checkpoint-step-1000
 ```
 
-By default, resumable `checkpoint-step-*` directories are saved every 1000
-optimizer steps and only the latest two are retained. Every 10000 steps,
-`checkpoint-keep-step-*` is also saved and is not rotated.
+A rolling `checkpoint-step-*` is saved when two conditions hold at once: the
+global step is a multiple of `--checkpointing_steps` (default 50) *and* at least
+`--checkpointing_min_interval_minutes` (default 30) have passed since the last
+save. The step multiple sets the granularity, the interval sets the rate; only
+the latest `--checkpoint_total_limit` (default 2) are kept. Every
+`--keep_checkpointing_steps` (default 5000) steps a `checkpoint-keep-step-*` is
+saved instead, and those are never rotated. A `SIGTERM` or `SIGUSR1` forces one
+last checkpoint off schedule and then stops the run cleanly.
+
+On preemptible hardware add `--checkpoint_remote_dir gs://bucket/prefix`. Each
+save is then mirrored to object storage, every node uploading the files it
+wrote, and a `_UPLOAD_COMPLETE` marker is written last so a resume can never
+pick up an upload that a preemption cut short. With a remote prefix configured,
+`--resume_from_checkpoint auto` reads the newest complete *remote* checkpoint
+and ignores local directories: a node that survived a preemption may still hold
+a checkpoint whose upload never finished, and two nodes resuming from different
+weights is not something DDP detects.

@@ -10,6 +10,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from transformers import Qwen3_5TextConfig
 
+from finetuning import checkpoint_remote
 from finetuning.checkpoint_policy import (
     ACTION_NONE,
     ACTION_PERSISTENT,
@@ -23,7 +24,9 @@ from finetuning.train import (
     build_optimizer,
     decide_checkpoint,
     evaluate,
+    fetch_remote_checkpoint,
     latest_checkpoint,
+    mirror_checkpoint,
     load_resume_state,
     learning_rates_by_group,
     parse_args,
@@ -292,6 +295,95 @@ def test_decide_checkpoint_turns_preemption_into_an_off_schedule_save():
         ACTION_ROLLING,
         True,
     )
+
+
+def fake_remote(monkeypatch, *, latest=None):
+    """Replace the gcloud calls with a recorder."""
+    calls = []
+
+    def upload(local_dir, remote_dir):
+        calls.append(("upload", str(local_dir), remote_dir))
+
+    def mark_complete(remote_dir):
+        calls.append(("mark_complete", remote_dir))
+
+    def download(remote_dir, local_dir):
+        calls.append(("download", remote_dir, str(local_dir)))
+
+    def latest_complete(prefix):
+        calls.append(("latest_complete", prefix))
+        return latest
+
+    monkeypatch.setattr(checkpoint_remote, "upload", upload)
+    monkeypatch.setattr(checkpoint_remote, "mark_complete", mark_complete)
+    monkeypatch.setattr(checkpoint_remote, "download", download)
+    monkeypatch.setattr(checkpoint_remote, "latest_complete", latest_complete)
+    return calls
+
+
+def test_mirror_checkpoint_marks_complete_after_uploading(monkeypatch):
+    calls = fake_remote(monkeypatch)
+    accelerator = Accelerator(cpu=True)
+
+    remote_dir = mirror_checkpoint(
+        accelerator, "/out/checkpoint-step-50", "gs://b/run"
+    )
+
+    assert remote_dir == "gs://b/run/checkpoint-step-50"
+    # Order is the whole point: a marker written before the upload finishes
+    # would advertise a partial checkpoint as resumable.
+    assert calls == [
+        ("upload", "/out/checkpoint-step-50", "gs://b/run/checkpoint-step-50"),
+        ("mark_complete", "gs://b/run/checkpoint-step-50"),
+    ]
+
+
+def test_mirror_checkpoint_is_a_no_op_without_a_remote_dir(monkeypatch):
+    calls = fake_remote(monkeypatch)
+    accelerator = Accelerator(cpu=True)
+
+    assert mirror_checkpoint(accelerator, "/out/checkpoint-step-50", None) is None
+    assert calls == []
+
+
+def test_fetch_remote_checkpoint_downloads_the_newest_complete_one(
+    monkeypatch, tmp_path
+):
+    calls = fake_remote(monkeypatch, latest="gs://b/run/checkpoint-step-1000")
+    accelerator = Accelerator(cpu=True)
+
+    local = fetch_remote_checkpoint(accelerator, "gs://b/run", tmp_path)
+
+    assert local == str(tmp_path / "checkpoint-step-1000")
+    assert (tmp_path / "checkpoint-step-1000").is_dir()
+    assert calls[-1] == (
+        "download",
+        "gs://b/run/checkpoint-step-1000",
+        str(tmp_path / "checkpoint-step-1000"),
+    )
+
+
+def test_fetch_remote_checkpoint_ignores_local_checkpoints(monkeypatch, tmp_path):
+    # This node survived the preemption and still has step 1100 on disk, but its
+    # upload never completed. Resuming from it would leave the two nodes on
+    # different weights, so the remote checkpoint wins.
+    write_checkpoint_dir(tmp_path, "checkpoint-step-1100")
+    fake_remote(monkeypatch, latest="gs://b/run/checkpoint-step-1000")
+    accelerator = Accelerator(cpu=True)
+
+    assert fetch_remote_checkpoint(accelerator, "gs://b/run", tmp_path) == str(
+        tmp_path / "checkpoint-step-1000"
+    )
+
+
+def test_fetch_remote_checkpoint_starts_fresh_on_an_empty_prefix(
+    monkeypatch, tmp_path
+):
+    calls = fake_remote(monkeypatch, latest=None)
+    accelerator = Accelerator(cpu=True)
+
+    assert fetch_remote_checkpoint(accelerator, "gs://b/run", tmp_path) is None
+    assert calls == [("latest_complete", "gs://b/run")]
 
 
 def test_preemption_flag_records_the_signal():
