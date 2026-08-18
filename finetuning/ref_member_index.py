@@ -37,20 +37,31 @@ INDEX_DIR_NAME = ".member-index"
 FORMAT_VERSION = 1
 
 
-def member_row_id(member, dataset=None):
+AUDIO_SUFFIXES = frozenset(
+    {"flac", "wav", "mp3", "ogg", "opus", "m4a", "aac", "webm"}
+)
+
+
+def member_row_id(member):
     """The manifest row id a tar member holds.
 
     Both ref layouts name a member after the row it came from, so this is what
-    lets a ref be excluded from being its own target:
-    packed shards use ``<dataset>/<language>/<speaker>/<id>.flac`` and the source
-    tars use ``<dataset>__<id>.flac``.
+    lets a ref be excluded from being its own target: packed shards use
+    ``<dataset>/<language>/<speaker>/<id>.flac`` and the source tars use
+    ``<id>.flac``.  The id already carries its own dataset prefix
+    (``ears__p045_emo_adoration_freeform``, and note
+    ``laion_emolia__ZH_...`` under dataset ``laion_emolia_zh``), so nothing may
+    be stripped off the front: doing so produced an id that matched no row, and
+    a ref could then be handed out as its own target.
+
+    Only a known audio extension comes off the end, because a row id may
+    perfectly well contain a dot.
     """
     name = str(member).replace("\\", "/").rsplit("/", 1)[-1]
-    stem = name.rsplit(".", 1)[0] if "." in name else name
-    prefix = f"{dataset}__"
-    if dataset and stem.startswith(prefix):
-        return stem[len(prefix) :]
-    return stem
+    stem, dot, suffix = name.rpartition(".")
+    if dot and suffix.lower() in AUDIO_SUFFIXES:
+        return stem
+    return name
 
 
 def index_dir_for(ref_root):

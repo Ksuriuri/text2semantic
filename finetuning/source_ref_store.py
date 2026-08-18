@@ -23,9 +23,9 @@ Two things this store must get right:
 * The key is ``(dataset, language, speaker_id)``. Speaker ids are only unique
   within a dataset -- ``p001`` exists in several of them and is not the same
   person -- so a two-part key would quietly hand out another speaker's voice.
-* A ref must not be the clip being predicted. The member name encodes the row
-  id (``<dataset>__<id>.<ext>``), so ``exclude`` is matched against that id as
-  well as against the raw member name.
+* A ref must not be the clip being predicted. A member is named ``<id>.<ext>``
+  after the row it holds -- the id already carries its own dataset prefix -- so
+  ``exclude`` is matched against that id as well as against the raw member name.
 """
 
 from __future__ import annotations
@@ -199,19 +199,15 @@ class SourceTarRefStore:
 
     def ref_ids(self, key):
         """The row ids these refs are, for comparing against ``exclude``."""
-        dataset = None if key is None else key[0]
-        return tuple(member_row_id(ref[1], dataset) for ref in self.refs(key))
+        return tuple(member_row_id(ref[1]) for ref in self.refs(key))
 
     def has_usable_ref(self, key, *, exclude=None):
         return self.pick_ref(key, exclude=exclude) is not None
 
     def pick_ref(self, key, *, exclude=None, rng=None):
         """``(tar, member, offset, size)`` for a usable ref, or None."""
-        dataset = None if key is None else key[0]
         candidates = [
-            ref
-            for ref in self.refs(key)
-            if not self._excluded(ref[1], dataset, exclude)
+            ref for ref in self.refs(key) if not self._excluded(ref[1], exclude)
         ]
         if not candidates:
             return None
@@ -228,11 +224,11 @@ class SourceTarRefStore:
         return member, self.reader.read(tar, offset, size)
 
     @staticmethod
-    def _excluded(member, dataset, exclude):
+    def _excluded(member, exclude):
         if exclude is None:
             return False
         exclude = str(exclude)
-        return member == exclude or member_row_id(member, dataset) == exclude
+        return member == exclude or member_row_id(member) == exclude
 
     def _lookup(self, key):
         if key is None:

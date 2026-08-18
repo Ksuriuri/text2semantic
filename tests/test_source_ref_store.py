@@ -111,8 +111,8 @@ def test_the_target_clip_is_never_its_own_ref(tmp_path):
 
     # exclude is a manifest row id, and the member name carries it after the
     # dataset prefix.
-    assert store.pick_ref(key, exclude="p001_a")[1] == "ears__p001_b.flac"
-    assert store.pick_ref(key, exclude="p001_b")[1] == "ears__p001_a.flac"
+    assert store.pick_ref(key, exclude="ears__p001_a")[1] == "ears__p001_b.flac"
+    assert store.pick_ref(key, exclude="ears__p001_b")[1] == "ears__p001_a.flac"
 
 
 def test_a_speaker_whose_only_clip_is_the_target_has_no_ref(tmp_path):
@@ -122,8 +122,8 @@ def test_a_speaker_whose_only_clip_is_the_target_has_no_ref(tmp_path):
     key = ("ears", "en", "p001")
 
     assert store.has_usable_ref(key) is True
-    assert store.has_usable_ref(key, exclude="p001_a") is False
-    assert store.read_ref(key, exclude="p001_a") is None
+    assert store.has_usable_ref(key, exclude="ears__p001_a") is False
+    assert store.read_ref(key, exclude="ears__p001_a") is None
 
 
 def test_ref_ids_are_row_ids_so_the_manifest_probe_can_compare_them(tmp_path):
@@ -138,7 +138,10 @@ def test_ref_ids_are_row_ids_so_the_manifest_probe_can_compare_them(tmp_path):
             )
         ],
     )
-    assert store.ref_ids(("ears", "en", "p001")) == ("p001_a", "p001_b")
+    assert store.ref_ids(("ears", "en", "p001")) == (
+        "ears__p001_a",
+        "ears__p001_b",
+    )
 
 
 def test_refs_per_speaker_caps_the_candidates(tmp_path):
@@ -285,10 +288,24 @@ def test_the_local_reader_rejects_a_short_read(tmp_path):
         reader.read(TAR, 0, 4096)
 
 
-def test_row_ids_survive_a_member_name_without_a_dataset_prefix():
-    assert member_row_id("ears__p001_a.flac", "ears") == "p001_a"
-    assert member_row_id("mini/en/spkA/keep-1.flac") == "keep-1"
-    assert member_row_id("ears__p001_a.flac") == "ears__p001_a"
+def test_a_member_name_keeps_the_dataset_prefix_the_row_id_has():
+    # Real ids already carry their prefix, so stripping one produced an id that
+    # matched no row and let a clip become its own ref.
+    assert member_row_id("ears__p045_emo_adoration.flac") == "ears__p045_emo_adoration"
+    # dataset laion_emolia_zh, ids prefixed laion_emolia__: no prefix arithmetic
+    # would have got this right either.
+    assert (
+        member_row_id("laion_emolia__ZH_B00039_S01897_W000000.flac")
+        == "laion_emolia__ZH_B00039_S01897_W000000"
+    )
+    # A packed shard member, same rule.
+    assert (
+        member_row_id("Genshin/en/Genshin__x_en/Genshin__en_x_vo_01.flac")
+        == "Genshin__en_x_vo_01"
+    )
+    # Only a known audio extension comes off: an id may contain a dot.
+    assert member_row_id("ears__p045_v1.2.flac") == "ears__p045_v1.2"
+    assert member_row_id("ears__p045_v1.2") == "ears__p045_v1.2"
 
 
 def test_the_index_is_discovered_next_to_the_manifests(tmp_path):
@@ -393,7 +410,7 @@ def test_two_datasets_sharing_a_speaker_id_never_swap_refs(tmp_path):
         "".join(
             json.dumps(
                 {
-                    "id": f"p001_{suffix}",
+                    "id": f"{dataset}__p001_{suffix}",
                     "text": "hello there",
                     "dataset": dataset,
                     "language": "en",
