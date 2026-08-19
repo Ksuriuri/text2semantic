@@ -385,6 +385,13 @@ class Supervisor:
         if not main_ip:
             self.log(f"no internal IP for {self.nodes[0]} yet")
             return False
+        # A launch happens because at least one rank is down, and a torchrun job
+        # missing a rank is already dead -- the survivors are blocked in a
+        # collective. They still hold the unit name, and `systemd-run --unit` on a
+        # loaded unit fails with "already loaded or has a fragment file", so
+        # without this the first still-active node fails the whole launch and the
+        # run never restarts.
+        self.stop_job()
         extra = "".join(f"--setenv={shlex.quote(item)} " for item in self.env)
         limits = "".join(f"--property={shlex.quote(item)} " for item in self.properties)
         for rank, name in enumerate(self.nodes):

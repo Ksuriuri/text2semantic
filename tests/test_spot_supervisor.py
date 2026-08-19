@@ -155,6 +155,26 @@ def test_launch_passes_rank_zero_the_main_ip_and_ranks_the_rest():
     assert all("T2S_NUM_MACHINES=2" in command for command in launches)
 
 
+def test_launch_stops_a_surviving_unit_before_starting_its_replacement():
+    # One rank crashed, the others are still "active" -- blocked in a collective
+    # waiting for it. systemd-run cannot reuse a unit name that is still loaded,
+    # so a launch that did not stop them first would fail on the first survivor
+    # and never restart the run.
+    cloud = FakeCloud(
+        {"node-0": "RUNNING", "node-1": "RUNNING"}, active=("node-0",),
+        ip="10.140.0.9",
+    )
+
+    assert supervisor(cloud).launch() is True
+
+    commands = [command for action, _, command in
+                [a for a in cloud.actions if a[0] == "ssh"]]
+    stops = [i for i, command in enumerate(commands) if "systemctl stop" in command]
+    runs = [i for i, command in enumerate(commands) if "systemd-run" in command]
+    assert len(stops) == 2 and len(runs) == 2
+    assert max(stops) < min(runs)
+
+
 def test_launch_waits_until_a_new_node_has_an_ip():
     cloud = FakeCloud({"node-0": "RUNNING", "node-1": "RUNNING"}, ip="")
     assert supervisor(cloud).launch() is False
