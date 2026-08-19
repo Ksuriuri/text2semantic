@@ -1,6 +1,7 @@
 import random
 from array import array
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
@@ -16,6 +17,7 @@ from qwen_tts.semantic_codec import (
     MaskGCTFeatureExtractor,
     MaskGCTSemanticTokenizer,
     RepCodec,
+    SpeakerMelExtractor,
 )
 from qwen_tts.text_augment import strip_pause_marks
 
@@ -531,9 +533,14 @@ def test_maskgct_feature_extractor_batches_and_masks_padding(monkeypatch):
             hidden_states[17] = torch.ones(2, 5, 4)
             return type("Output", (), {"hidden_states": hidden_states})()
 
+    mel_extractor = SpeakerMelExtractor.__new__(SpeakerMelExtractor)
+    mel_extractor.feature_extractor = FeatureExtractor()
+
     extractor = MaskGCTFeatureExtractor.__new__(MaskGCTFeatureExtractor)
     extractor.device = torch.device("cpu")
-    extractor.feature_extractor = FeatureExtractor()
+    extractor.dtype = torch.float32
+    extractor.mel_extractor = mel_extractor
+    extractor.feature_extractor = mel_extractor.feature_extractor
     extractor.semantic_model = SemanticModel()
     extractor.mean = torch.zeros(4)
     extractor.std = torch.ones(4)
@@ -864,3 +871,91 @@ def test_sequence_assembly_keeps_gradients_flowing_to_every_input():
     assert model.speech_embedding.weight.grad is not None
     assert model.speech_embedding.weight.grad.abs().sum() > 0
     assert model.get_input_embeddings().weight.grad.abs().sum() > 0
+
+
+def test_worker_computed_mel_reaches_the_same_features(monkeypatch):
+    """The split must be a move, not a change: same numbers, different process.
+
+    encode_audios() is now mel_extractor() followed by encode_features(), and
+    the DataLoader worker calls the first half. If the two halves disagreed, the
+    speaker conditioning would silently change the moment --num_workers > 0.
+    """
+
+    class FeatureExtractor:
+        def __call__(
+            self,
+            audios,
+            sampling_rate,
+            padding,
+            return_attention_mask,
+            return_tensors,
+        ):
+            width = max(len(audio) for audio in audios)
+            features = torch.zeros(len(audios), width, 3)
+            mask = torch.zeros(len(audios), width, dtype=torch.long)
+            for row, audio in enumerate(audios):
+                features[row, : len(audio)] = torch.arange(1, len(audio) + 1)[
+                    :, None
+                ].float()
+                mask[row, : len(audio)] = 1
+            return BatchFeature(
+                {"input_features": features, "attention_mask": mask}
+            )
+
+    class SemanticModel:
+        def __call__(self, input_features, attention_mask, output_hidden_states):
+            hidden_states = [None] * 18
+            hidden_states[17] = input_features.float().sum(dim=-1, keepdim=True)
+            hidden_states[17] = hidden_states[17].expand(-1, -1, 4).contiguous()
+            return type("Output", (), {"hidden_states": hidden_states})()
+
+    mel_extractor = SpeakerMelExtractor.__new__(SpeakerMelExtractor)
+    mel_extractor.feature_extractor = FeatureExtractor()
+    extractor = MaskGCTFeatureExtractor.__new__(MaskGCTFeatureExtractor)
+    extractor.device = torch.device("cpu")
+    extractor.dtype = torch.float32
+    extractor.mel_extractor = mel_extractor
+    extractor.feature_extractor = mel_extractor.feature_extractor
+    extractor.semantic_model = SemanticModel()
+    extractor.mean = torch.zeros(4)
+    extractor.std = torch.ones(4)
+
+    audios = [np.arange(4, dtype=np.float32), np.arange(7, dtype=np.float32)]
+    inline_features, inline_lengths = extractor.encode_audios(
+        audios, max_audio_seconds=None
+    )
+    # What a worker would put in the batch, then what the step does with it.
+    worker_mel, worker_mask = mel_extractor(audios, max_audio_seconds=None)
+    split_features, split_lengths = extractor.encode_features(
+        worker_mel, worker_mask
+    )
+
+    assert torch.equal(inline_features, split_features)
+    assert torch.equal(inline_lengths, split_lengths)
+    assert inline_lengths.tolist() == [4, 7]
+
+
+def test_the_mel_extractor_truncates_to_max_ref_seconds():
+    # The truncation used to live in encode_audios; if it had not moved with the
+    # mel, a 20 s cap would silently become "whatever the shard holds".
+    class FeatureExtractor:
+        def __call__(self, audios, **kwargs):
+            width = max(len(audio) for audio in audios)
+            return BatchFeature(
+                {
+                    "input_features": torch.zeros(len(audios), width, 3),
+                    "attention_mask": torch.ones(
+                        len(audios), width, dtype=torch.long
+                    ),
+                }
+            )
+
+    mel_extractor = SpeakerMelExtractor.__new__(SpeakerMelExtractor)
+    mel_extractor.feature_extractor = FeatureExtractor()
+    audios = [np.zeros(16000 * 3, dtype=np.float32)]
+    features, _ = mel_extractor(audios, max_audio_seconds=1.0)
+    assert features.size(1) == 16000
+    with pytest.raises(ValueError):
+        mel_extractor(audios, max_audio_seconds=0)
+    with pytest.raises(ValueError):
+        mel_extractor([], max_audio_seconds=1.0)

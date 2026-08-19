@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
+import torch
 
 from finetuning import manifest_index, ref_member_index, speaker_index
 from finetuning.dataset import Text2SemanticDataset
@@ -286,6 +287,47 @@ def test_dataset_reads_refs_without_writing_them_out(tmp_path):
     assert "speaker_audio_paths" not in batch
     assert len(batch["speaker_waveforms"]) == 2
     assert not store.cache_dir.exists()
+
+
+def test_a_mel_extractor_moves_the_log_mel_into_collate(tmp_path):
+    """With one supplied, the batch carries the mel instead of the waveform.
+
+    The training step used to run this on the main process while the GPU waited;
+    collate_fn runs in the workers, which are otherwise idle.
+    """
+    root, train = _build_trainset(tmp_path, [_row("keep-1"), _row("keep-2")])
+    store = _store(root)
+    index = manifest_index.load(train, params=_params(), ref_store=store, log=None)
+
+    class MelExtractor:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, audios, max_audio_seconds):
+            self.calls.append((len(audios), max_audio_seconds))
+            width = max(audio.size for audio in audios)
+            return (
+                torch.zeros(len(audios), width, 3),
+                torch.ones(len(audios), width, dtype=torch.long),
+            )
+
+    mel_extractor = MelExtractor()
+    dataset = Text2SemanticDataset(
+        index,
+        _Tok(),
+        ref_store=store,
+        ref_max_seconds=7.5,
+        speaker_mel_extractor=mel_extractor,
+    )
+    batch = dataset.collate_fn([dataset[0], dataset[1]])
+
+    assert "speaker_waveforms" not in batch
+    assert "speaker_audio_paths" not in batch
+    assert batch["speaker_input_features"].shape == (2, 16000, 3)
+    assert batch["speaker_feature_attention_mask"].shape == (2, 16000)
+    # The cap has to reach the worker, or --max_ref_seconds stops meaning
+    # anything on this path.
+    assert mel_extractor.calls == [(2, 7.5)]
 
 
 def _row_named_trainset(tmp_path, rows, members_by_speaker):

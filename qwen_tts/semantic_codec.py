@@ -372,6 +372,40 @@ class RepCodec(nn.Module):
         return x
 
 
+class SpeakerMelExtractor:
+    """The CPU half of :class:`MaskGCTFeatureExtractor`: the 80-bin log-mel.
+
+    Split out so a DataLoader worker can own it. In the training loop this ran
+    inline on the main process, single-threaded, for batch_size ref clips per
+    rank per step -- 912 ms of a 3.955 s B200 step at batch_size 32 and the 20 s
+    padded ref length, with the GPU idle throughout. It holds no model weights,
+    so a copy per worker costs nothing.
+    """
+
+    def __init__(self, w2v_bert_path):
+        self.feature_extractor = SeamlessM4TFeatureExtractor.from_pretrained(
+            w2v_bert_path
+        )
+
+    def __call__(self, audios, max_audio_seconds=15.0):
+        """(input_features, attention_mask) on the CPU, padded to the batch."""
+        if not audios:
+            raise ValueError("audios must not be empty.")
+        if max_audio_seconds is not None and max_audio_seconds <= 0:
+            raise ValueError("max_audio_seconds must be positive or None.")
+        if max_audio_seconds is not None:
+            limit = int(16000 * max_audio_seconds)
+            audios = [audio[:limit] for audio in audios]
+        inputs = self.feature_extractor(
+            audios,
+            sampling_rate=16000,
+            padding=True,
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+        return inputs.input_features, inputs.get("attention_mask")
+
+
 class MaskGCTFeatureExtractor:
     """Frozen W2V-BERT layer-17 feature extractor used by MaskGCT.
 
@@ -393,9 +427,8 @@ class MaskGCTFeatureExtractor:
     ):
         self.device = torch.device(device)
         self.dtype = resolve_float_dtype(dtype)
-        self.feature_extractor = SeamlessM4TFeatureExtractor.from_pretrained(
-            w2v_bert_path
-        )
+        self.mel_extractor = SpeakerMelExtractor(w2v_bert_path)
+        self.feature_extractor = self.mel_extractor.feature_extractor
         self.semantic_model = Wav2Vec2BertModel.from_pretrained(
             w2v_bert_path, torch_dtype=self.dtype
         ).to(self.device, dtype=self.dtype)
@@ -436,23 +469,18 @@ class MaskGCTFeatureExtractor:
         if max_audio_seconds is not None and max_audio_seconds <= 0:
             raise ValueError("max_audio_seconds must be positive or None.")
 
-        max_audio_samples = (
-            None
-            if max_audio_seconds is None
-            else int(16000 * max_audio_seconds)
+        return self.encode_features(
+            *self.mel_extractor(audios, max_audio_seconds=max_audio_seconds)
         )
-        if max_audio_samples is not None:
-            audios = [audio[:max_audio_samples] for audio in audios]
 
-        inputs = self.feature_extractor(
-            audios,
-            sampling_rate=16000,
-            padding=True,
-            return_attention_mask=True,
-            return_tensors="pt",
-        )
-        input_features = inputs.input_features.to(self.device, self.dtype)
-        attention_mask = inputs.get("attention_mask")
+    @torch.inference_mode()
+    def encode_features(self, input_features, attention_mask=None):
+        """The GPU half: layer-17 features from an already computed log-mel.
+
+        Callable directly so the mel can be produced in a DataLoader worker
+        rather than inline in the training step.
+        """
+        input_features = input_features.to(self.device, self.dtype)
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.device)
 

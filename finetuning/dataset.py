@@ -35,6 +35,7 @@ class Text2SemanticDataset(Dataset):
         max_target_seconds=30.0,
         min_target_seconds=0.5,
         ref_max_seconds=20.0,
+        speaker_mel_extractor=None,
         punctuation_dropout_prob=0.0,
         punctuation_dropout_keep_word_spaces=True,
         seed=42,
@@ -54,6 +55,9 @@ class Text2SemanticDataset(Dataset):
         self.max_text_tokens = max_text_tokens
         self.max_semantic_tokens = max_semantic_tokens
         self.ref_store = ref_store
+        # When set, collate_fn computes the ref log-mel here in the worker
+        # instead of leaving it inline in the training step.
+        self.speaker_mel_extractor = speaker_mel_extractor
         # The ref backend owns the key: packed refs are keyed by speaker within
         # a language, source-tar refs by speaker within a dataset as well.
         self.speaker_key_fields = tuple(
@@ -400,9 +404,16 @@ class Text2SemanticDataset(Dataset):
         # In-memory refs travel as waveforms; the loose-file path still sends
         # paths for the encoder to open itself.
         if samples[0].get("speaker_audio") is not None:
-            batch["speaker_waveforms"] = [
-                sample["speaker_audio"] for sample in samples
-            ]
+            waveforms = [sample["speaker_audio"] for sample in samples]
+            if self.speaker_mel_extractor is None:
+                batch["speaker_waveforms"] = waveforms
+            else:
+                features, mask = self.speaker_mel_extractor(
+                    waveforms,
+                    max_audio_seconds=self.ref_max_seconds,
+                )
+                batch["speaker_input_features"] = features
+                batch["speaker_feature_attention_mask"] = mask
         else:
             batch["speaker_audio_paths"] = [
                 sample["speaker_audio_path"] for sample in samples

@@ -70,6 +70,17 @@ def parse_args():
             "normalised and fed to a trainable encoder."
         ),
     )
+    parser.add_argument(
+        "--speaker_mel_in_workers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Compute the ref log-mel in the DataLoader workers instead of "
+            "inline in the training step. It is pure CPU work that took 912 ms "
+            "of a 3.955 s B200 step with the GPU idle, and the workers are "
+            "otherwise idle. Needs --num_workers > 0."
+        ),
+    )
     parser.add_argument("--max_target_seconds", type=float, default=30.0)
     parser.add_argument("--min_target_seconds", type=float, default=0.5)
     parser.add_argument("--min_speaker_records", type=int, default=2)
@@ -478,6 +489,7 @@ def build_dataset(
     *,
     punctuation_dropout_prob=0.0,
     ref_store=None,
+    speaker_mel_extractor=None,
 ):
     return Text2SemanticDataset(
         data,
@@ -495,6 +507,7 @@ def build_dataset(
         max_target_seconds=args.max_target_seconds,
         min_target_seconds=getattr(args, "min_target_seconds", 0.5),
         ref_max_seconds=getattr(args, "max_ref_seconds", 20.0),
+        speaker_mel_extractor=speaker_mel_extractor,
         punctuation_dropout_prob=punctuation_dropout_prob,
         punctuation_dropout_keep_word_spaces=(
             args.punctuation_dropout_keep_word_spaces
@@ -506,13 +519,22 @@ def build_dataset(
 def add_speaker_features(batch, feature_extractor, max_ref_seconds):
     audio_paths = batch.pop("speaker_audio_paths", None)
     waveforms = batch.pop("speaker_waveforms", None)
-    if audio_paths is None and waveforms is None:
+    mel_features = batch.pop("speaker_input_features", None)
+    mel_mask = batch.pop("speaker_feature_attention_mask", None)
+    if audio_paths is None and waveforms is None and mel_features is None:
         return batch
     if feature_extractor is None:
         raise ValueError(
             "A speaker feature extractor is required for audio-path batches."
         )
-    if waveforms is not None:
+    if mel_features is not None:
+        # The log-mel was already computed in a DataLoader worker; only the
+        # frozen W2V-BERT forward is left for this process to do.
+        features, lengths = feature_extractor.encode_features(
+            mel_features,
+            mel_mask,
+        )
+    elif waveforms is not None:
         # Packed refs arrive already decoded from the DataLoader workers.
         features, lengths = feature_extractor.encode_audios(
             waveforms,
@@ -942,6 +964,14 @@ def train():
         device=accelerator.device,
         dtype=args.speaker_encoder_dtype,
     )
+    # Hand the CPU log-mel to the DataLoader workers unless asked not to. With
+    # --num_workers 0 there are no workers, so it would run in this process
+    # either way and the indirection would only cost a second mel extractor.
+    speaker_mel_extractor = (
+        speaker_feature_extractor.mel_extractor
+        if args.speaker_mel_in_workers and args.num_workers > 0
+        else None
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(args.base_model_path)
     if tokenizer.pad_token_id is None:
@@ -1004,6 +1034,7 @@ def train():
         None,
         punctuation_dropout_prob=args.punctuation_dropout_prob,
         ref_store=ref_store,
+        speaker_mel_extractor=speaker_mel_extractor,
     )
     # The eval split keeps its punctuation: an augmented eval set would
     # make the loss/accuracy curve move for reasons unrelated to training.
@@ -1015,6 +1046,7 @@ def train():
         None,
         None,
         ref_store=ref_store,
+        speaker_mel_extractor=speaker_mel_extractor,
     )
     accelerator.print(
         f"Train samples: {len(train_dataset):,}/{train_dataset.raw_size:,} "
