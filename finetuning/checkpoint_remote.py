@@ -111,6 +111,37 @@ def mark_complete(remote_dir, *, run=_run):
     return marker
 
 
+_GCS_NO_MATCH = "matched no objects"
+
+
+def _list(command, *, run):
+    """Run a listing command, treating "the prefix holds nothing" as no output.
+
+    Both CLIs exit non-zero when a prefix matches no object, and at the start of
+    a run the checkpoint prefix legitimately matches nothing -- which is exactly
+    when `--resume_from_checkpoint auto` has to answer "begin at step 0" instead
+    of raising CalledProcessError on every rank.
+
+    What must not be swallowed with it is a real failure: a listing error that
+    reads as an empty prefix is how a broken sync hides for hours. The two are
+    distinguishable because an empty listing says nothing at all -- `aws s3 ls`
+    prints neither stdout nor stderr -- while AccessDenied, a missing bucket or
+    expired credentials always explain themselves on stderr. `gcloud storage ls`
+    is the one exception, having chosen to phrase "nothing here" as an error, so
+    its exact wording is matched and nothing else is.
+    """
+    try:
+        return run(command)
+    except subprocess.CalledProcessError as error:
+        stdout = error.stdout or ""
+        stderr = error.stderr or ""
+        if stdout.strip():
+            raise
+        if stderr.strip() and _GCS_NO_MATCH not in stderr:
+            raise
+        return subprocess.CompletedProcess(command, 0, "", stderr)
+
+
 def _marker_uris(remote_prefix, *, run):
     """Every COMPLETE_MARKER object under the prefix, as full URIs.
 
@@ -121,14 +152,16 @@ def _marker_uris(remote_prefix, *, run):
     prefix = str(remote_prefix).rstrip("/")
     if scheme_of(prefix) == S3:
         bucket = prefix[len(S3) :].split("/", 1)[0]
-        result = run(["aws", "s3", "ls", "--recursive", f"{prefix}/"])
+        result = _list(["aws", "s3", "ls", "--recursive", f"{prefix}/"], run=run)
         uris = []
         for line in result.stdout.splitlines():
             fields = line.split(maxsplit=3)
             if len(fields) == 4:
                 uris.append(f"{S3}{bucket}/{fields[3]}")
         return uris
-    result = run(["gcloud", "storage", "ls", join(prefix, f"**/{COMPLETE_MARKER}")])
+    result = _list(
+        ["gcloud", "storage", "ls", join(prefix, f"**/{COMPLETE_MARKER}")], run=run
+    )
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 

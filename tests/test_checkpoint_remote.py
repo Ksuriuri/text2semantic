@@ -1,4 +1,7 @@
+import subprocess
 import types
+
+import pytest
 
 from finetuning import checkpoint_remote
 
@@ -207,6 +210,41 @@ def test_s3_listing_ignores_objects_that_are_not_markers():
         checkpoint_remote.latest_complete("s3://b/run", run=run)
         == "s3://b/run/checkpoint-step-100"
     )
+
+
+def test_s3_empty_prefix_is_no_checkpoint_rather_than_a_crash():
+    # What the real CLI does, and what FakeS3Run above does not: `aws s3 ls` on a
+    # prefix holding nothing exits 1 with no output at all. That is the state of
+    # the checkpoint prefix on step 0 of a fresh run, so raising there kills every
+    # rank at startup -- which is how the 8-node launch died.
+    def run(command):
+        raise subprocess.CalledProcessError(1, command, output="", stderr="")
+
+    assert checkpoint_remote.latest_complete("s3://b/run", run=run) is None
+
+
+def test_gcs_empty_prefix_is_no_checkpoint_rather_than_a_crash():
+    # gcloud phrases the same nothing as an error on stderr.
+    def run(command):
+        raise subprocess.CalledProcessError(
+            1, command, output="", stderr="ERROR: ... matched no objects.\n"
+        )
+
+    assert checkpoint_remote.latest_complete("gs://b/run", run=run) is None
+
+
+def test_a_listing_failure_that_explains_itself_still_raises():
+    # The distinction that keeps the tolerance above honest: AccessDenied and an
+    # empty prefix produce the same exit code, and only the first says why. A
+    # silent resume from "no checkpoints" after a credential expiry would restart
+    # a 33,287-step run at zero.
+    def run(command):
+        raise subprocess.CalledProcessError(
+            1, command, output="", stderr="An error occurred (AccessDenied)\n"
+        )
+
+    with pytest.raises(subprocess.CalledProcessError):
+        checkpoint_remote.latest_complete("s3://b/run", run=run)
 
 
 def test_s3_rotate_deletes_with_a_trailing_slash():
