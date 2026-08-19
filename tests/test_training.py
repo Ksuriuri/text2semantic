@@ -10,7 +10,11 @@ from accelerate import Accelerator
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
-from transformers import Qwen3_5TextConfig, get_cosine_schedule_with_warmup
+from transformers import (
+    Qwen3_5TextConfig,
+    get_constant_schedule_with_warmup,
+    get_cosine_schedule_with_warmup,
+)
 
 from finetuning import checkpoint_remote
 from finetuning.checkpoint_policy import (
@@ -162,7 +166,8 @@ def test_schedule_steps_for_accelerate_scales_by_processes():
 
 
 def _lr_trace(monkeypatch, num_processes, warmup_scheduler_steps,
-              total_scheduler_steps, optimizer_steps, probe_steps):
+              total_scheduler_steps, optimizer_steps, probe_steps,
+              schedule="cosine"):
     """LR after each of `probe_steps` optimizer steps, through real accelerate.
 
     Drives `accelerate.scheduler.AcceleratedScheduler` itself rather than a
@@ -177,11 +182,17 @@ def _lr_trace(monkeypatch, num_processes, warmup_scheduler_steps,
     )
     parameter = torch.nn.Parameter(torch.zeros(1))
     optimizer = torch.optim.SGD([parameter], lr=BASE_LR)
-    inner = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=warmup_scheduler_steps,
-        num_training_steps=total_scheduler_steps,
-    )
+    if schedule == "constant":
+        inner = get_constant_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_scheduler_steps,
+        )
+    else:
+        inner = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_scheduler_steps,
+            num_training_steps=total_scheduler_steps,
+        )
     wrapped = AcceleratedScheduler(
         inner,
         [SimpleNamespace(step_was_skipped=False)],
@@ -246,6 +257,28 @@ def test_unscaled_schedule_is_the_bug_this_guards_against(monkeypatch):
     assert trace[spent] < cosine_lr(spent, warmup, steps) * 0.01
     # ...and then the LR climbs back up, which a cosine decay never does.
     assert trace[steps // 2] > trace[spent] * 100
+
+
+def test_constant_schedule_warms_up_then_never_moves(monkeypatch):
+    # --lr_schedule constant is what the t2s-v1 run uses: the run length is a
+    # budget decision, so the LR of the steps already taken must not depend on
+    # where the run happens to stop.  Warmup still needs the num_processes
+    # scaling; everything after it is flat at peak.
+    processes, steps = 32, 1_000
+    warmup = int(steps * 0.03)
+    trace = _lr_trace(
+        monkeypatch,
+        processes,
+        schedule_steps_for_accelerate(warmup, processes, False),
+        schedule_steps_for_accelerate(steps, processes, False),
+        steps,
+        probe_steps={warmup // 2, warmup, steps // 2, steps},
+        schedule="constant",
+    )
+    assert trace[warmup // 2] == pytest.approx(BASE_LR * 0.5, rel=1e-3)
+    assert trace[warmup] == pytest.approx(BASE_LR, rel=1e-6)
+    assert trace[steps // 2] == pytest.approx(BASE_LR, rel=1e-12)
+    assert trace[steps] == pytest.approx(BASE_LR, rel=1e-12)
 
 
 def test_scaled_schedule_reproduces_the_4x5090_measurement(monkeypatch):

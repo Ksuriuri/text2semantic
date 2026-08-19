@@ -29,7 +29,11 @@ from finetuning.ref_store import SpeakerRefStore, default_ref_index_path
 from finetuning import source_ref_store, speaker_index
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
+from transformers import (
+    AutoTokenizer,
+    get_constant_schedule_with_warmup,
+    get_cosine_schedule_with_warmup,
+)
 
 from qwen_tts.core.models import Text2SemanticForCausalLM
 from qwen_tts.semantic_codec import MaskGCTFeatureExtractor
@@ -135,6 +139,18 @@ def parse_args():
     parser.add_argument("--adam_beta2", type=float, default=0.95)
     parser.add_argument("--adam_epsilon", type=float, default=1e-8)
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
+    parser.add_argument(
+        "--lr_schedule",
+        choices=("cosine", "constant"),
+        default="cosine",
+        help=(
+            "Shape after warmup. 'cosine' decays to zero over the run; "
+            "'constant' holds the peak LR, which is what a run whose length "
+            "is a budget decision rather than a convergence plan wants -- "
+            "stopping or extending it then does not change the LR of the "
+            "steps already taken."
+        ),
+    )
     # Exactly one of these sets the run length, because the cosine schedule is
     # built from it: a step count that outlives the epoch limit decays the LR to
     # zero mid-training, and one that undershoots stops the run with the LR still
@@ -1047,15 +1063,24 @@ def train():
         warmup_steps, accelerator.num_processes, accelerator.split_batches
     )
     accelerator.print(
-        f"LR schedule: warmup {warmup_steps:,} / total {total_steps:,} optimizer "
-        f"steps, built as {schedule_warmup:,} / {schedule_total:,} scheduler steps "
-        f"for {accelerator.num_processes} process(es)"
+        f"LR schedule: {args.lr_schedule}, warmup {warmup_steps:,} / total "
+        f"{total_steps:,} optimizer steps, built as {schedule_warmup:,} / "
+        f"{schedule_total:,} scheduler steps for "
+        f"{accelerator.num_processes} process(es)"
     )
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=schedule_warmup,
-        num_training_steps=schedule_total,
-    )
+    if args.lr_schedule == "constant":
+        # Only warmup needs the run length; after it the LR never moves, so a
+        # run that is cut short or extended keeps the same LR history.
+        scheduler = get_constant_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=schedule_warmup,
+        )
+    else:
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=schedule_warmup,
+            num_training_steps=schedule_total,
+        )
     (
         model,
         optimizer,

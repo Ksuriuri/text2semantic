@@ -91,6 +91,13 @@ there. A checkpoint written before that fix carries scheduler state in the old,
 unmultiplied space, so resuming it on the fixed code makes the LR jump; start
 such a run fresh instead.
 
+`--lr_schedule` picks the shape after warmup: `cosine` (default) decays to zero
+over the run length, `constant` holds the peak LR forever. Use `constant` when
+the run length is a budget decision rather than a convergence plan -- stopping
+early or adding steps then does not retroactively change the LR of the steps
+already taken, which a cosine sized off the old length does. Warmup is scaled
+for the prepared scheduler either way.
+
 The Qwen3.5 backbone is loaded from pretrained weights. The independent
 8195-entry speech embedding, 8195-class output head, and IndexTTS2-style
 Conformer + Perceiver speaker encoder are random and trainable. A frozen
