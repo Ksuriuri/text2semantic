@@ -290,6 +290,15 @@ def parse_args():
         default="flash_attention_2",
         choices=("flash_attention_2", "sdpa", "eager"),
     )
+    parser.add_argument(
+        "--liger",
+        action="store_true",
+        help=(
+            "Replace the Qwen backbone's RMSNorm and SwiGLU MLP with "
+            "Liger-Kernel's fused Triton versions. Same math, fewer kernel "
+            "launches and fewer activation tensors."
+        ),
+    )
     args = parser.parse_args()
     if not 0 <= args.warmup_ratio < 1:
         parser.error("--warmup_ratio must be in [0, 1).")
@@ -343,6 +352,34 @@ def parse_args():
     if not 0 <= args.punctuation_dropout_prob <= 1:
         parser.error("--punctuation_dropout_prob must be in [0, 1].")
     return args
+
+
+def apply_liger(model):
+    """Swap the Qwen backbone's RMSNorm and SwiGLU MLP for Liger's fused kernels.
+
+    Only those two. Liger's headline kernel is a fused linear cross-entropy that
+    never materialises the logits, but it cannot be used here: the loss is taken
+    over `speech_head`, not the Qwen LM head, and train.py needs the logits
+    afterwards for the per-token accuracy metrics. The backbone is also a
+    `Qwen3_5TextModel`, not a `Qwen3_5ForCausalLM`, so the causal-LM forward the
+    patcher would rewrite is never called.
+
+    RoPE is left alone as well: it is patched at the module level rather than on
+    the instance, and this model calls the backbone with its own position ids.
+    RMSNorm and SwiGLU are the safe pair -- same math, one Triton kernel instead
+    of a chain of pointwise ops, and no separate activation tensor per op, which
+    is what matters when the batch is what we are trying to grow.
+    """
+    from liger_kernel.transformers.monkey_patch import apply_liger_kernel_to_qwen3_5
+
+    apply_liger_kernel_to_qwen3_5(
+        rope=False,
+        cross_entropy=False,
+        fused_linear_cross_entropy=False,
+        rms_norm=True,
+        swiglu=True,
+        model=model.backbone,
+    )
 
 
 def read_jsonl(path):
@@ -1011,6 +1048,8 @@ def train():
         attn_implementation=args.attn_implementation,
     )
     model.requires_grad_(True)
+    if args.liger:
+        apply_liger(model)
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
         model.config.use_cache = False

@@ -13,8 +13,20 @@ license-files = ["LICENSE"]
 dependencies = [
     "accelerate==1.12.0",
     "einops>=0.8.1",
+    # Not optional, despite the name. Qwen3.5 is a hybrid model: 18 of its 24
+    # layers are linear attention (gated delta rule), and without this package
+    # transformers silently falls back to a float32 chunk loop written in torch.
+    # It only warns, so the cost shows up as a per-micro-batch overhead that no
+    # amount of batching amortises -- measured at 7.47 s/step on 8xH100 against
+    # 5.03 s with the fused Triton kernels. Pure Triton, so no nvcc is needed.
+    # The other half of that warning, causal-conv1d, is not worth a CUDA
+    # toolchain: its fallback is a single F.conv1d.
+    "flash-linear-attention>=0.5.2",
     "google-cloud-storage>=2.14",
     "huggingface-hub",
+    # Fused RMSNorm and SwiGLU for the Qwen backbone, behind --liger. Verified
+    # bit-exact against the transformers modules on this config.
+    "liger-kernel>=0.8.2",
     "librosa",
     "numpy",
     "packaging",
