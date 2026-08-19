@@ -710,3 +710,157 @@ def test_punctuation_dropout_rejects_probabilities_outside_the_unit_range():
         _dropout_dataset(RecordingTokenizer(), punctuation_dropout_prob=1.5)
     with pytest.raises(ValueError):
         _dropout_dataset(RecordingTokenizer(), punctuation_dropout_prob=-0.1)
+
+
+def _row_loop_training_inputs(
+    speaker_embeds,
+    text_embeds,
+    speech_embeds,
+    text_attention_mask,
+    speech_attention_mask,
+):
+    """The row loop that _build_training_inputs used to be, kept as the oracle.
+
+    The vectorised version has to agree with this bit for bit, for every shape
+    of padding, or the speedup is worthless.
+    """
+    text_lengths = text_attention_mask.sum(dim=1).long()
+    speech_lengths = speech_attention_mask.sum(dim=1).long()
+    total_lengths = text_lengths + speech_lengths + speaker_embeds.size(1)
+    max_total_length = int(total_lengths.max().item())
+    inputs_embeds = text_embeds.new_zeros(
+        text_embeds.size(0), max_total_length, text_embeds.size(-1)
+    )
+    attention_mask = text_attention_mask.new_zeros(
+        text_embeds.size(0), max_total_length
+    )
+    speech_starts = []
+    for row in range(text_embeds.size(0)):
+        text_length = int(text_lengths[row])
+        speech_length = int(speech_lengths[row])
+        sequence = torch.cat(
+            (
+                speaker_embeds[row],
+                text_embeds[row, :text_length],
+                speech_embeds[row, :speech_length],
+            ),
+            dim=0,
+        )
+        inputs_embeds[row, : sequence.size(0)] = sequence
+        attention_mask[row, : sequence.size(0)] = 1
+        speech_starts.append(speaker_embeds.size(1) + text_length)
+    return inputs_embeds, attention_mask, speech_starts, speech_lengths
+
+
+@pytest.mark.parametrize(
+    "text_lengths,speech_lengths",
+    [
+        ([2, 2], [3, 3]),          # no padding at all
+        ([3, 1], [4, 2]),          # both sides ragged
+        ([1, 3], [4, 1]),          # the longest text is not the longest speech
+        ([4, 4, 1, 2], [1, 5, 5, 3]),
+        ([2], [3]),                # batch of one
+    ],
+)
+def test_vectorised_sequence_assembly_matches_the_row_loop(
+    text_lengths, speech_lengths
+):
+    torch.manual_seed(0)
+    model = tiny_model()
+    batch_size = len(text_lengths)
+    text_width = max(text_lengths)
+    speech_width = max(speech_lengths)
+
+    text_input_ids = torch.randint(0, 32, (batch_size, text_width))
+    speech_input_ids = torch.randint(0, 16, (batch_size, speech_width))
+    text_attention_mask = torch.zeros(batch_size, text_width, dtype=torch.long)
+    speech_attention_mask = torch.zeros(batch_size, speech_width, dtype=torch.long)
+    for row, length in enumerate(text_lengths):
+        text_attention_mask[row, :length] = 1
+    for row, length in enumerate(speech_lengths):
+        speech_attention_mask[row, :length] = 1
+
+    speaker = speaker_inputs(batch_size)
+    with torch.no_grad():
+        got = model._build_training_inputs(
+            text_input_ids,
+            text_attention_mask,
+            speech_input_ids,
+            speech_attention_mask,
+            speaker["speaker_features"],
+            speaker["speaker_feature_lengths"],
+        )
+        speaker_embeds = model._encode_speaker_prefix(
+            speaker["speaker_features"],
+            speaker["speaker_feature_lengths"],
+        )
+        text_embeds = model.get_input_embeddings()(text_input_ids)
+        speech_embeds = model.speech_embedding(speech_input_ids)
+        want = _row_loop_training_inputs(
+            speaker_embeds.to(dtype=text_embeds.dtype),
+            text_embeds,
+            speech_embeds.to(dtype=text_embeds.dtype),
+            text_attention_mask,
+            speech_attention_mask,
+        )
+
+    assert torch.equal(got[0], want[0])
+    assert torch.equal(got[1], want[1])
+    assert got[2].tolist() == want[2]
+    assert torch.equal(got[3], want[3])
+
+
+@pytest.mark.parametrize(
+    "text_lengths,speech_lengths",
+    [([2, 2], [3, 3]), ([3, 1], [4, 2]), ([1, 4, 2], [5, 1, 3])],
+)
+def test_gathered_speech_hidden_matches_the_row_loop(text_lengths, speech_lengths):
+    torch.manual_seed(1)
+    batch_size = len(text_lengths)
+    speech_width = max(speech_lengths)
+    prefix_length = 4
+    hidden_size = 6
+
+    speech_lengths_t = torch.tensor(speech_lengths, dtype=torch.long)
+    speech_starts = prefix_length + torch.tensor(text_lengths, dtype=torch.long)
+    total = int((speech_starts + speech_lengths_t).max())
+    hidden_states = torch.randn(batch_size, total, hidden_size)
+
+    want = hidden_states.new_zeros(batch_size, speech_width, hidden_size)
+    for row in range(batch_size):
+        start = int(speech_starts[row])
+        length = int(speech_lengths_t[row])
+        want[row, :length] = hidden_states[row, start : start + length]
+
+    got = Text2SemanticForCausalLM._gather_speech_hidden(
+        hidden_states, speech_starts, speech_lengths_t, speech_width
+    )
+    assert torch.equal(got, want)
+
+
+def test_sequence_assembly_keeps_gradients_flowing_to_every_input():
+    """The scatters must not silently detach an input the loop used to reach."""
+    torch.manual_seed(2)
+    model = tiny_model()
+    text_input_ids = torch.randint(0, 32, (2, 3))
+    speech_input_ids = torch.randint(0, 16, (2, 4))
+    text_attention_mask = torch.tensor([[1, 1, 1], [1, 1, 0]])
+    speech_attention_mask = torch.tensor([[1, 1, 1, 1], [1, 1, 1, 0]])
+    speaker = speaker_inputs(2)
+    speaker["speaker_features"].requires_grad_(True)
+
+    inputs_embeds, _, _, _ = model._build_training_inputs(
+        text_input_ids,
+        text_attention_mask,
+        speech_input_ids,
+        speech_attention_mask,
+        speaker["speaker_features"],
+        speaker["speaker_feature_lengths"],
+    )
+    inputs_embeds.sum().backward()
+
+    assert speaker["speaker_features"].grad is not None
+    assert torch.isfinite(speaker["speaker_features"].grad).all()
+    assert model.speech_embedding.weight.grad is not None
+    assert model.speech_embedding.weight.grad.abs().sum() > 0
+    assert model.get_input_embeddings().weight.grad.abs().sum() > 0

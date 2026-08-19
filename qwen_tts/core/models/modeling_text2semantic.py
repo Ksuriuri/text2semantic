@@ -224,39 +224,100 @@ class Text2SemanticForCausalLM(PreTrainedModel):
         speaker_embeds = speaker_embeds.to(dtype=text_embeds.dtype)
         speech_embeds = speech_embeds.to(dtype=text_embeds.dtype)
 
+        batch_size = text_input_ids.size(0)
+        prefix_length = speaker_embeds.size(1)
+        hidden_size = text_embeds.size(-1)
+        device = text_embeds.device
+
         text_lengths = text_attention_mask.sum(dim=1).long()
         speech_lengths = speech_attention_mask.sum(dim=1).long()
-        total_lengths = text_lengths + speech_lengths + speaker_embeds.size(1)
+        speech_starts = prefix_length + text_lengths
+        total_lengths = speech_starts + speech_lengths
+        # The one device sync left: the padded width has to reach the host to
+        # size the buffer. Everything below stays on the device, because a
+        # Python loop over the batch cost 2 * batch_size syncs per step here and
+        # the GPU drains on every one of them.
         max_total_length = int(total_lengths.max().item())
-        inputs_embeds = text_embeds.new_zeros(
-            text_input_ids.size(0),
-            max_total_length,
-            text_embeds.size(-1),
+
+        # Rows are assembled with two scatters. One spare trailing column
+        # absorbs the padded source positions and is sliced off afterwards, so
+        # no index has to be computed on the host.
+        dump_column = max_total_length
+        scratch = text_embeds.new_zeros(
+            batch_size,
+            max_total_length + 1,
+            hidden_size,
         )
-        attention_mask = text_attention_mask.new_zeros(
-            text_input_ids.size(0),
-            max_total_length,
+
+        text_positions = torch.arange(text_embeds.size(1), device=device)
+        text_dest = torch.where(
+            text_positions.unsqueeze(0) < text_lengths.unsqueeze(1),
+            prefix_length + text_positions.unsqueeze(0).expand(batch_size, -1),
+            dump_column,
         )
-        speech_starts = []
-        for row in range(text_input_ids.size(0)):
-            text_length = int(text_lengths[row])
-            speech_length = int(speech_lengths[row])
-            valid_text = text_embeds[row, :text_length]
-            valid_speech = speech_embeds[row, :speech_length]
-            speech_start = speaker_embeds.size(1) + text_length
-            sequence = torch.cat(
-                (speaker_embeds[row], valid_text, valid_speech),
-                dim=0,
-            )
-            inputs_embeds[row, : sequence.size(0)] = sequence
-            attention_mask[row, : sequence.size(0)] = 1
-            speech_starts.append(speech_start)
+        scratch = scratch.scatter(
+            1,
+            text_dest.unsqueeze(-1).expand(-1, -1, hidden_size),
+            text_embeds,
+        )
+
+        speech_positions = torch.arange(speech_embeds.size(1), device=device)
+        speech_dest = torch.where(
+            speech_positions.unsqueeze(0) < speech_lengths.unsqueeze(1),
+            speech_starts.unsqueeze(1) + speech_positions.unsqueeze(0),
+            dump_column,
+        )
+        scratch = scratch.scatter(
+            1,
+            speech_dest.unsqueeze(-1).expand(-1, -1, hidden_size),
+            speech_embeds,
+        )
+
+        # Neither scatter targets [0, prefix_length), so the speaker prefix can
+        # simply be prepended.
+        inputs_embeds = torch.cat(
+            (speaker_embeds, scratch[:, prefix_length:max_total_length]),
+            dim=1,
+        )
+        attention_mask = (
+            torch.arange(max_total_length, device=device).unsqueeze(0)
+            < total_lengths.unsqueeze(1)
+        ).to(dtype=text_attention_mask.dtype)
         return (
             inputs_embeds,
             attention_mask,
             speech_starts,
             speech_lengths,
         )
+
+    @staticmethod
+    def _gather_speech_hidden(
+        hidden_states,
+        speech_starts,
+        speech_lengths,
+        speech_width,
+    ):
+        """Pull each row's speech span out of the packed sequence.
+
+        One gather rather than a row loop, for the same reason as
+        :meth:`_build_training_inputs`: the loop's int(speech_lengths[row]) was
+        a device sync per row, and this one sits between the backbone forward
+        and the loss, so it stalls the step twice over (once again in backward,
+        as batch_size separate slice-assign gradients).
+        """
+        device = hidden_states.device
+        positions = torch.arange(speech_width, device=device)
+        keep = positions.unsqueeze(0) < speech_lengths.unsqueeze(1)
+        # Padded rows read a clamped index and are then zeroed, which is what
+        # the row loop left behind by never writing them.
+        index = (speech_starts.unsqueeze(1) + positions.unsqueeze(0)).clamp(
+            max=hidden_states.size(1) - 1
+        )
+        gathered = hidden_states.gather(
+            1,
+            index.unsqueeze(-1).expand(-1, -1, hidden_states.size(-1)),
+        )
+        return gathered * keep.unsqueeze(-1).to(dtype=gathered.dtype)
 
     def _build_generation_prompt(
         self,
@@ -345,17 +406,12 @@ class Text2SemanticForCausalLM(PreTrainedModel):
             use_cache=use_cache,
             **kwargs,
         )
-        speech_hidden = outputs.last_hidden_state.new_zeros(
-            speech_input_ids.size(0),
+        speech_hidden = self._gather_speech_hidden(
+            outputs.last_hidden_state,
+            speech_starts,
+            speech_lengths,
             speech_input_ids.size(1),
-            outputs.last_hidden_state.size(-1),
         )
-        for row, speech_start in enumerate(speech_starts):
-            speech_length = int(speech_lengths[row])
-            speech_hidden[row, :speech_length] = outputs.last_hidden_state[
-                row,
-                speech_start : speech_start + speech_length,
-            ]
         logits = self.speech_head(speech_hidden)
         loss = None
         if labels is not None:
