@@ -95,6 +95,12 @@ class Text2SemanticDataset(Dataset):
             punctuation_dropout_keep_word_spaces
         )
         self.seed = seed
+        # A row whose ref cannot be read is replaced by another row, this many
+        # tries before giving up. Eight is generous for a lost shard and still
+        # small enough that a manifest with no readable refs at all fails fast
+        # instead of walking the whole dataset per sample.
+        self.ref_substitution_attempts = 8
+        self.substituted_rows = 0
         self._semantic_code_cache = {}
         if self.prefiltered:
             self.data = data
@@ -210,6 +216,50 @@ class Text2SemanticDataset(Dataset):
         return torch.tensor(ids, dtype=torch.long)
 
     def __getitem__(self, index):
+        sample = self._sample(index)
+        if sample is not None:
+            return sample
+        # The row passed the manifest's ref filter -- which can only consult the
+        # speaker index -- and then turned out to have no ref that is actually
+        # readable. On t2s-v1 this is one shard the packer rewrote after a restart:
+        # 24 speakers lost every member the index still names for them, and one such
+        # row took a 64-rank job down in a DataLoader worker.
+        #
+        # A ref from a different speaker is not an option: it would teach the model
+        # the wrong voice for the text. So the row itself is replaced, by a
+        # deterministic draw from elsewhere in the manifest rather than by index + 1,
+        # because rows of one speaker sit together and the neighbour is likely to be
+        # broken in the same way. Seeded by string, which random.Random hashes
+        # stably, so every rank and every relaunch substitutes identically.
+        rng = random.Random(f"ref-substitute:{self.seed}:{index}")
+        for _ in range(self.ref_substitution_attempts):
+            other = rng.randrange(len(self.data))
+            sample = self._sample(other)
+            if sample is not None:
+                self._count_substitution(index, other)
+                return sample
+        raise ValueError(
+            "Each sample needs a packed ref (speaker_index), "
+            "'ref_audio', or another clip of the same speaker; "
+            f"row {index} and {self.ref_substitution_attempts} substitutes for it "
+            "all lack one, which is a broken manifest rather than a lost shard."
+        )
+
+    def _count_substitution(self, index, other):
+        self.substituted_rows += 1
+        # Loud once, then at every power of ten: a handful of rows is a known bad
+        # shard, while a count that keeps climbing is a different problem and must
+        # not be invisible just because the run stayed up.
+        count = self.substituted_rows
+        if 10 ** (len(str(count)) - 1) == count:
+            print(
+                f"[dataset] row {index} has no readable ref; trained on row "
+                f"{other} instead ({count} substitutions so far)",
+                flush=True,
+            )
+
+    def _sample(self, index):
+        """The training sample for ``index``, or None when its ref is unreadable."""
         item = self.data[index]
         if not self._has_usable_text(item):
             raise ValueError("Each sample needs a non-empty string 'text'.")
@@ -222,10 +272,7 @@ class Text2SemanticDataset(Dataset):
             speaker_audio_path = self._speaker_audio_path(item, index)
             missing_ref = speaker_audio_path is None
         if missing_ref:
-            raise ValueError(
-                "Each sample needs a packed ref (speaker_index), "
-                "'ref_audio', or another clip of the same speaker."
-            )
+            return None
         codes = self._semantic_codes(item)
         if codes.numel() == 0:
             raise ValueError("semantic_codes must not be empty.")

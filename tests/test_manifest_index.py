@@ -4,6 +4,7 @@ import tarfile
 from pathlib import Path
 
 import numpy as np
+import pytest
 import soundfile as sf
 import torch
 
@@ -287,6 +288,78 @@ def test_dataset_reads_refs_without_writing_them_out(tmp_path):
     assert "speaker_audio_paths" not in batch
     assert len(batch["speaker_waveforms"]) == 2
     assert not store.cache_dir.exists()
+
+
+def _drop_speaker_from_shard(root, keep):
+    """Rewrite the shard with only `keep`, leaving the speaker index alone.
+
+    This is what a shard the packer restarted on looks like: the index still
+    names members for a speaker whose refs are no longer in the tar. The
+    manifest filter cannot see it, because it can only read the index.
+    """
+    shard = root / "refs" / "shards" / "refs-000000.tar"
+    payload = _wav_bytes()
+    with tarfile.open(shard, "w") as archive:
+        for name in keep:
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            archive.addfile(info, fileobj=io.BytesIO(payload))
+
+
+def _substitution_trainset(tmp_path):
+    # One row whose speaker lost every ref, four rows that kept theirs. The texts
+    # differ in word count so _Tok's output length says which row was trained on.
+    rows = [_row("a-1")] + [
+        _row(f"b-{n}", speaker="spkB", text=" ".join(["b"] * n))
+        for n in range(6, 10)
+    ]
+    root, train = _build_trainset(tmp_path, rows)
+    _drop_speaker_from_shard(root, keep=["spkB/000.wav"])
+    store = _store(root)
+    index = manifest_index.load(train, params=_params(), ref_store=store, log=None)
+    assert [row["id"] for row in index] == ["a-1", "b-6", "b-7", "b-8", "b-9"]
+    return root, index, store
+
+
+def test_a_row_whose_refs_are_all_gone_trains_on_another_row(tmp_path):
+    _, index, store = _substitution_trainset(tmp_path)
+    dataset = Text2SemanticDataset(index, _Tok(), ref_store=store)
+
+    sample = dataset[0]
+    assert sample["speaker_audio"].size == 16000
+    assert dataset.substituted_rows == 1
+    # The sample is a whole other row, not row 0 wearing a borrowed voice. Row 0's
+    # text is two words and each intact row's is six to nine, so the tokenized
+    # length says which row was actually trained on.
+    own = dataset._tokenize_text(dataset.data[0]["text"])
+    intact = [len(dataset[i]["text_input_ids"]) for i in range(1, 5)]
+    assert len(sample["text_input_ids"]) != len(own)
+    assert len(sample["text_input_ids"]) in intact
+
+    # Reading the intact rows substituted nothing.
+    assert dataset.substituted_rows == 1
+
+
+def test_the_substituted_row_is_the_same_on_every_rank(tmp_path):
+    root, index, store = _substitution_trainset(tmp_path)
+    first = Text2SemanticDataset(index, _Tok(), ref_store=store)
+    second = Text2SemanticDataset(index, _Tok(), ref_store=_store(root))
+    # The draw is seeded from the row index, not from process state, so two ranks
+    # must land on the same substitute -- otherwise they would disagree about what
+    # the batch was while averaging gradients over it.
+    assert len(first[0]["text_input_ids"]) == len(second[0]["text_input_ids"])
+
+
+def test_nothing_readable_anywhere_still_fails(tmp_path):
+    root, train = _build_trainset(tmp_path, [_row("a-1"), _row("a-2")])
+    _drop_speaker_from_shard(root, keep=["spkB/000.wav"])
+    store = _store(root)
+    index = manifest_index.load(train, params=_params(), ref_store=store, log=None)
+    dataset = Text2SemanticDataset(index, _Tok(), ref_store=store)
+    # No amount of substitution helps when no row has a readable ref, and
+    # silently training on nothing would be worse than stopping.
+    with pytest.raises(ValueError, match="broken manifest"):
+        dataset[0]
 
 
 def test_a_mel_extractor_moves_the_log_mel_into_collate(tmp_path):
