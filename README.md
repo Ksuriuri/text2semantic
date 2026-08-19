@@ -148,6 +148,25 @@ Qwen backbone 默认学习率为 `4e-5`；随机初始化的 speech embedding/he
 encoder、speaker projection 和 speaker boundary embedding 默认使用 `2e-4`。同一个
 cosine warmup scheduler 会分别衰减各参数组的学习率，并保持二者比例。
 
+### 训练步耗时
+
+冻结的 speaker 特征提取器占了很大一块步耗时，而这块跟 GPU 算力无关，所以两个默认
+值是按吞吐设的：
+
+- `--speaker_encoder_dtype`（默认 `bfloat16`）：冻结 W2V-BERT 的前向精度。原来固定
+  fp32 且显式关掉 autocast，在 8×B200、`--batch_size 32`、`--max_ref_seconds 20`
+  下这一段是 3.95 s 每步里的 974 ms；bf16 是 301 ms，layer-17 输出经过 mean/std
+  归一化后再交给可训练的 encoder，相对差 0.031。要复现旧数值就传
+  `--speaker_encoder_dtype float32`。
+- `--speaker_mel_in_workers`（默认开）：把 80 维 log-mel 放到 DataLoader worker 里
+  算，而不是留在训练步里单线程跑。同一配置下这是另外 912 ms，期间 GPU 空转。
+  `--num_workers 0` 时自动跳过，也可以用 `--no-speaker_mel_in_workers` 关掉。
+
+同一份数据同一批 size 下的实测（8×B200，`--batch_size 32`）：3.95 → 3.22（bf16）→
+**2.72 s/step**，吞吐 +45%，step 40 的 loss 与 fp32 路径一致到小数点后四位。
+`--batch_size` 再往上没有收益：64 的 samples/s 只比 32 高 2%，128 因为显存接近打满
+反而降到 82%，256 直接 OOM。
+
 训练指标、验证 loss、token accuracy 和 EOS accuracy 写入
 `haoyuanhuang22-jcxy/text2semantic` W&B project。API key 不应写进脚本或提交到仓库。
 
