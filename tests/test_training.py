@@ -43,6 +43,7 @@ from finetuning.train import (
     speaker_statistics,
     sorted_checkpoints,
     steps_for_epochs,
+    wandb_init_kwargs,
 )
 from qwen_tts.core.models import (
     Text2SemanticConfig,
@@ -700,3 +701,17 @@ def test_build_dataset_augments_train_text_but_not_eval_text():
 
     assert train_dataset.punctuation_dropout_prob == 0.1
     assert eval_dataset.punctuation_dropout_prob == 0.0
+
+
+def test_wandb_init_kwargs_resumes_the_same_run_when_an_id_is_given():
+    resumed = wandb_init_kwargs("t2s-v1-aws", "t2s-v1-aws-8node")
+    assert resumed["id"] == "t2s-v1-aws-8node"
+    # Without resume, a relaunch onto an existing id is an error rather than a
+    # continuation, so the id alone would not survive a preemption.
+    assert resumed["resume"] == "allow"
+    assert resumed["name"] == "t2s-v1-aws"
+
+
+def test_wandb_init_kwargs_without_an_id_lets_wandb_mint_one():
+    fresh = wandb_init_kwargs("t2s-v1-aws", None)
+    assert "id" not in fresh and "resume" not in fresh

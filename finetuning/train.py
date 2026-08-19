@@ -249,7 +249,8 @@ def parse_args():
     parser.add_argument(
         "--checkpoint_remote_dir",
         help=(
-            "gs:// prefix to mirror checkpoints to. A Spot preemption takes "
+            "gs:// or s3:// prefix to mirror checkpoints to, whichever cloud "
+            "the run is on. A Spot preemption takes "
             "the machine and its disk, so on Spot this is what makes the run "
             "resumable at all; with it set, 'auto' resume reads from here."
         ),
@@ -267,6 +268,18 @@ def parse_args():
         ),
     )
     parser.add_argument("--wandb_run_name")
+    parser.add_argument(
+        "--wandb_run_id",
+        default=os.environ.get("WANDB_RUN_ID"),
+        help=(
+            "Stable W&B run id, so a job relaunched after a Spot preemption "
+            "continues the same curve instead of starting a second one. The "
+            "run resumes at the global step of the checkpoint it loaded, so "
+            "whatever was logged between that checkpoint and the preemption is "
+            "sent again; W&B keeps the first value for a step it already has. "
+            "Defaults to $WANDB_RUN_ID."
+        ),
+    )
     parser.add_argument(
         "--gradient_checkpointing",
         action=argparse.BooleanOptionalAction,
@@ -312,7 +325,7 @@ def parse_args():
     if args.checkpoint_remote_dir and not checkpoint_remote.is_remote(
         args.checkpoint_remote_dir
     ):
-        parser.error("--checkpoint_remote_dir must be a gs:// URI.")
+        parser.error("--checkpoint_remote_dir must be a gs:// or s3:// URI.")
     if args.logging_steps <= 0:
         parser.error("--logging_steps must be positive.")
     if args.eval_steps <= 0:
@@ -729,6 +742,22 @@ def should_decay_parameter(parameter_name, parameter):
     lowered = parameter_name.lower()
     no_decay_terms = ("bias", "norm", "embedding", "embeddings")
     return not any(term in lowered for term in no_decay_terms)
+
+
+def wandb_init_kwargs(run_name, run_id):
+    """`wandb.init` arguments, resuming the same run when an id is given.
+
+    A Spot run is relaunched with the same command line after every preemption.
+    W&B mints a fresh run id per process start, so without a stable id each
+    relaunch appears as its own curve and the run reads as N short trainings
+    instead of one.  `resume="allow"` creates the run the first time and attaches
+    to it afterwards, which is what makes the id enough on its own.
+    """
+    kwargs = {"entity": WANDB_ENTITY, "name": run_name}
+    if run_id:
+        kwargs["id"] = run_id
+        kwargs["resume"] = "allow"
+    return kwargs
 
 
 def steps_for_epochs(
@@ -1151,12 +1180,7 @@ def train():
     accelerator.init_trackers(
         WANDB_PROJECT,
         config=tracker_config,
-        init_kwargs={
-            "wandb": {
-                "entity": WANDB_ENTITY,
-                "name": args.wandb_run_name,
-            }
-        },
+        init_kwargs={"wandb": wandb_init_kwargs(args.wandb_run_name, args.wandb_run_id)},
     )
 
     start_epoch = 0
