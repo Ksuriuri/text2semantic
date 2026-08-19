@@ -123,3 +123,108 @@ def test_is_remote_and_join():
         checkpoint_remote.join("gs://b/run/", "/checkpoint-step-50/")
         == "gs://b/run/checkpoint-step-50"
     )
+
+
+class FakeS3Run:
+    """Records aws invocations and replays `aws s3 ls --recursive` output."""
+
+    def __init__(self, keys=()):
+        self.commands = []
+        self.keys = list(keys)
+
+    def __call__(self, command):
+        self.commands.append(command)
+        if command[:4] == ["aws", "s3", "ls", "--recursive"]:
+            lines = [f"2026-08-19 12:00:00          0 {key}" for key in self.keys]
+            return types.SimpleNamespace(stdout="\n".join(lines) + "\n")
+        return types.SimpleNamespace(stdout="")
+
+
+def s3_keys(*checkpoints):
+    return [
+        f"{path}/{checkpoint_remote.COMPLETE_MARKER}" for path in checkpoints
+    ]
+
+
+def test_scheme_of_accepts_both_and_rejects_a_local_path():
+    assert checkpoint_remote.scheme_of("gs://b/run") == checkpoint_remote.GCS
+    assert checkpoint_remote.scheme_of("s3://b/run") == checkpoint_remote.S3
+    assert checkpoint_remote.is_remote("s3://b/run")
+    try:
+        checkpoint_remote.scheme_of("/out/run")
+    except ValueError:
+        pass
+    else:  # pragma: no cover - the assert below is the failure message
+        raise AssertionError("a local path must not be taken for a remote URI")
+
+
+def test_s3_upload_and_marker_use_the_aws_cli():
+    run = FakeS3Run()
+    checkpoint_remote.upload("/out/checkpoint-step-50", "s3://b/run/checkpoint-step-50", run=run)
+    checkpoint_remote.mark_complete("s3://b/run/checkpoint-step-50", run=run)
+    assert run.commands[0] == [
+        "aws",
+        "s3",
+        "sync",
+        "/out/checkpoint-step-50",
+        "s3://b/run/checkpoint-step-50",
+    ]
+    assert run.commands[1] == [
+        "aws",
+        "s3",
+        "cp",
+        "-",
+        f"s3://b/run/checkpoint-step-50/{checkpoint_remote.COMPLETE_MARKER}",
+    ]
+
+
+def test_s3_download_reverses_the_sync_arguments():
+    run = FakeS3Run()
+    checkpoint_remote.download("s3://b/run/checkpoint-step-50", "/out/checkpoint-step-50", run=run)
+    assert run.commands[0] == [
+        "aws",
+        "s3",
+        "sync",
+        "s3://b/run/checkpoint-step-50",
+        "/out/checkpoint-step-50",
+    ]
+
+
+def test_s3_latest_complete_rebuilds_uris_from_bucket_relative_keys():
+    # `aws s3 ls` prints keys without the bucket, so a naive reader would return
+    # "run/checkpoint-step-1000" and resume from a path that does not exist.
+    run = FakeS3Run(s3_keys("run/checkpoint-step-950", "run/checkpoint-step-1000"))
+    assert (
+        checkpoint_remote.latest_complete("s3://b/run", run=run)
+        == "s3://b/run/checkpoint-step-1000"
+    )
+
+
+def test_s3_listing_ignores_objects_that_are_not_markers():
+    run = FakeS3Run(s3_keys("run/checkpoint-step-100"))
+    run.keys.append("run/checkpoint-step-200/model.safetensors")
+    assert (
+        checkpoint_remote.latest_complete("s3://b/run", run=run)
+        == "s3://b/run/checkpoint-step-100"
+    )
+
+
+def test_s3_rotate_deletes_with_a_trailing_slash():
+    # `aws s3 rm --recursive s3://b/run/checkpoint-step-100` is a raw prefix
+    # match, so without the slash it would also delete checkpoint-step-1000.
+    run = FakeS3Run(
+        s3_keys(
+            "run/checkpoint-step-100",
+            "run/checkpoint-step-1000",
+            "run/checkpoint-step-1050",
+        )
+    )
+    deleted = checkpoint_remote.rotate("s3://b/run", 2, run=run)
+    assert deleted == ["s3://b/run/checkpoint-step-100"]
+    assert run.commands[-1] == [
+        "aws",
+        "s3",
+        "rm",
+        "--recursive",
+        "s3://b/run/checkpoint-step-100/",
+    ]

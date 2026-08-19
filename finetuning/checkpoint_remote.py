@@ -24,9 +24,16 @@ Uploads are synchronous.  A ~14 GB checkpoint takes 10-20 s in-region, which
 against a 30-minute save interval is about 1% of the run, and doing it inline
 means rotation can never delete a directory that is still being copied.
 
-The transfer itself shells out to ``gcloud storage``, which parallelises across
-objects and is already on every GCP image; ``run`` is injectable so the logic can
-be tested without touching the network.
+The transfer shells out to the object store's own CLI -- ``gcloud storage`` for
+``gs://`` and ``aws s3`` for ``s3://`` -- because both parallelise across objects
+and are already on their platform's images.  ``run`` is injectable so the logic
+can be tested without touching the network.
+
+A run on one cloud wants its checkpoints in that cloud: mirroring a ~14 GB save
+across clouds every half hour costs egress on every save and adds the one delay
+that is inline with training.  The two backends differ only in the four commands
+below; everything above them -- the marker, the step ordering, the rotation rule
+-- is shared, so resume semantics cannot drift between platforms.
 """
 
 from __future__ import annotations
@@ -36,10 +43,22 @@ import subprocess
 
 COMPLETE_MARKER = "_UPLOAD_COMPLETE"
 _STEP_PATTERN = re.compile(r"checkpoint-(?:keep-)?step-(\d+)/?$")
+GCS = "gs://"
+S3 = "s3://"
+_SCHEMES = (GCS, S3)
 
 
 def is_remote(path):
-    return bool(path) and str(path).startswith("gs://")
+    return bool(path) and str(path).startswith(_SCHEMES)
+
+
+def scheme_of(uri):
+    """Which object store a URI names. Raises rather than guessing."""
+    text = str(uri)
+    for scheme in _SCHEMES:
+        if text.startswith(scheme):
+            return scheme
+    raise ValueError(f"{uri!r} is not a remote checkpoint URI (gs:// or s3://)")
 
 
 def join(prefix, *parts):
@@ -64,6 +83,13 @@ def _run(command):
     )
 
 
+def _sync_command(src, dst):
+    if scheme_of(dst if is_remote(dst) else src) == S3:
+        # `aws s3 sync` is already recursive and copies only what differs.
+        return ["aws", "s3", "sync", src, dst]
+    return ["gcloud", "storage", "rsync", "--recursive", src, dst]
+
+
 def upload(local_dir, remote_dir, *, run=_run):
     """Copy a finished local checkpoint directory to its remote prefix.
 
@@ -71,46 +97,45 @@ def upload(local_dir, remote_dir, *, run=_run):
     copy is a plain recursive rsync: object storage has no partial-write
     visibility problem per object, and the marker covers the set.
     """
-    run(
-        [
-            "gcloud",
-            "storage",
-            "rsync",
-            "--recursive",
-            str(local_dir).rstrip("/"),
-            str(remote_dir).rstrip("/"),
-        ]
-    )
+    run(_sync_command(str(local_dir).rstrip("/"), str(remote_dir).rstrip("/")))
     return remote_dir
 
 
 def mark_complete(remote_dir, *, run=_run):
     """Write the marker that makes a remote checkpoint eligible for resume."""
-    run(
-        [
-            "gcloud",
-            "storage",
-            "cp",
-            "-",
-            join(remote_dir, COMPLETE_MARKER),
-        ]
-    )
-    return join(remote_dir, COMPLETE_MARKER)
+    marker = join(remote_dir, COMPLETE_MARKER)
+    if scheme_of(remote_dir) == S3:
+        run(["aws", "s3", "cp", "-", marker])
+    else:
+        run(["gcloud", "storage", "cp", "-", marker])
+    return marker
+
+
+def _marker_uris(remote_prefix, *, run):
+    """Every COMPLETE_MARKER object under the prefix, as full URIs.
+
+    `gcloud storage ls` takes a `**` glob and prints URIs. `aws s3 ls` has
+    neither: it needs `--recursive` and prints `date time size key`, with the key
+    relative to the bucket, so the URI has to be put back together.
+    """
+    prefix = str(remote_prefix).rstrip("/")
+    if scheme_of(prefix) == S3:
+        bucket = prefix[len(S3) :].split("/", 1)[0]
+        result = run(["aws", "s3", "ls", "--recursive", f"{prefix}/"])
+        uris = []
+        for line in result.stdout.splitlines():
+            fields = line.split(maxsplit=3)
+            if len(fields) == 4:
+                uris.append(f"{S3}{bucket}/{fields[3]}")
+        return uris
+    result = run(["gcloud", "storage", "ls", join(prefix, f"**/{COMPLETE_MARKER}")])
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
 def list_complete(remote_prefix, *, run=_run):
     """[(step, uri)] for the remote checkpoints that finished uploading."""
-    result = run(
-        [
-            "gcloud",
-            "storage",
-            "ls",
-            join(remote_prefix, f"**/{COMPLETE_MARKER}"),
-        ]
-    )
     found = []
-    for line in result.stdout.splitlines():
-        line = line.strip()
+    for line in _marker_uris(remote_prefix, run=run):
         if not line.endswith(COMPLETE_MARKER):
             continue
         checkpoint = line[: -len(COMPLETE_MARKER)].rstrip("/")
@@ -133,16 +158,7 @@ def download(remote_dir, local_dir, *, run=_run):
     Called by one process per node after a restart: every rank reads the state,
     and each node has its own empty disk.
     """
-    run(
-        [
-            "gcloud",
-            "storage",
-            "rsync",
-            "--recursive",
-            str(remote_dir).rstrip("/"),
-            str(local_dir).rstrip("/"),
-        ]
-    )
+    run(_sync_command(str(remote_dir).rstrip("/"), str(local_dir).rstrip("/")))
     return local_dir
 
 
@@ -162,5 +178,12 @@ def rotate(remote_prefix, limit, *, run=_run):
     ]
     doomed = [uri for _step, uri in rolling[:-limit]]
     for uri in doomed:
-        run(["gcloud", "storage", "rm", "--recursive", uri.rstrip("/")])
+        target = uri.rstrip("/")
+        if scheme_of(target) == S3:
+            # A trailing slash matters here: without it `rm --recursive` also
+            # matches sibling prefixes that merely start with this name, e.g.
+            # checkpoint-step-100 would take checkpoint-step-1000 with it.
+            run(["aws", "s3", "rm", "--recursive", f"{target}/"])
+        else:
+            run(["gcloud", "storage", "rm", "--recursive", target])
     return doomed
