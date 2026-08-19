@@ -19,6 +19,7 @@ from qwen_tts.semantic_codec import (
     load_codec_checkpoint,
     load_codec_config,
     resolve_codec_assets,
+    resolve_float_dtype,
     semantic_codec_spec,
 )
 
@@ -188,3 +189,27 @@ def test_decode_codes_returns_features_at_the_feature_rate():
     tokenizer.codec = _codec(2)
     features = tokenizer.decode_codes([1, 2, 3, 4])
     assert features.shape == (8, TINY["hidden_size"])
+
+
+@pytest.mark.parametrize(
+    ("given", "expected"),
+    [
+        (None, torch.float32),
+        ("fp32", torch.float32),
+        ("float32", torch.float32),
+        ("bf16", torch.bfloat16),
+        ("BFloat16", torch.bfloat16),
+        (torch.bfloat16, torch.bfloat16),
+    ],
+)
+def test_resolve_float_dtype_accepts_spellings_and_dtypes(given, expected):
+    assert resolve_float_dtype(given) is expected
+
+
+@pytest.mark.parametrize("given", ["float8", "", torch.int64])
+def test_resolve_float_dtype_rejects_anything_else(given):
+    # A silently ignored dtype would run the frozen extractor in fp32 while the
+    # caller believed it had asked for bf16, which is exactly the kind of
+    # no-op flag that makes a measured speedup unreproducible.
+    with pytest.raises(ValueError):
+        resolve_float_dtype(given)

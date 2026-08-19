@@ -92,6 +92,7 @@ def test_parse_args_defaults_match_dataset_limits(monkeypatch):
     assert args.min_speaker_records == 2
     assert args.punctuation_dropout_prob == 0.1
     assert args.punctuation_dropout_keep_word_spaces is True
+    assert args.speaker_encoder_dtype == "bfloat16"
 
 
 def _run_length_argv(*extra):

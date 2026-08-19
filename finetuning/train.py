@@ -36,7 +36,10 @@ from transformers import (
 )
 
 from qwen_tts.core.models import Text2SemanticForCausalLM
-from qwen_tts.semantic_codec import MaskGCTFeatureExtractor
+from qwen_tts.semantic_codec import (
+    FLOAT_DTYPES,
+    MaskGCTFeatureExtractor,
+)
 
 
 WANDB_PROJECT = "text2semantic"
@@ -55,6 +58,18 @@ def parse_args():
     parser.add_argument("--w2v_bert_path", required=True)
     parser.add_argument("--stats_path", required=True)
     parser.add_argument("--max_ref_seconds", type=float, default=20.0)
+    parser.add_argument(
+        "--speaker_encoder_dtype",
+        default="bfloat16",
+        choices=sorted(FLOAT_DTYPES),
+        help=(
+            "Precision of the frozen W2V-BERT that produces speaker "
+            "conditioning features. Its fp32 forward was 974 ms of a 3.96 s "
+            "step on B200 at batch_size 32 and 20 s refs; bfloat16 is 301 ms "
+            "for a 0.031 relative difference on a feature that is mean/std "
+            "normalised and fed to a trainable encoder."
+        ),
+    )
     parser.add_argument("--max_target_seconds", type=float, default=30.0)
     parser.add_argument("--min_target_seconds", type=float, default=0.5)
     parser.add_argument("--min_speaker_records", type=int, default=2)
@@ -925,6 +940,7 @@ def train():
         w2v_bert_path=args.w2v_bert_path,
         stats_path=args.stats_path,
         device=accelerator.device,
+        dtype=args.speaker_encoder_dtype,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(args.base_model_path)
