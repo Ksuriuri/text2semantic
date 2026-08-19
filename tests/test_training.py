@@ -28,6 +28,7 @@ from finetuning.train import (
     add_speaker_features,
     build_dataset,
     build_optimizer,
+    check_fused_linear_attention,
     decide_checkpoint,
     evaluate,
     fetch_remote_checkpoint,
@@ -623,6 +624,51 @@ def test_preemption_flag_records_the_signal():
     flag._handle(signal.SIGTERM, None)
     assert flag.triggered is True
     assert flag.signal_number == signal.SIGTERM
+
+
+def fake_hybrid_model(linear_layers=18, full_layers=6):
+    layer_types = ["linear_attention"] * linear_layers + ["full_attention"] * full_layers
+    return SimpleNamespace(
+        backbone=SimpleNamespace(config=SimpleNamespace(layer_types=layer_types))
+    )
+
+
+def test_fused_linear_attention_check_reports_the_kernel_it_found(monkeypatch):
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as qwen
+
+    monkeypatch.setattr(qwen, "chunk_gated_delta_rule", lambda *a, **k: None)
+    monkeypatch.setattr(qwen, "fused_recurrent_gated_delta_rule", lambda *a, **k: None)
+    lines = []
+    check_fused_linear_attention(fake_hybrid_model(), require=True, log=lines.append)
+    assert lines == ["Linear attention: fused kernels on 18/24 layers"]
+
+
+def test_fused_linear_attention_check_refuses_the_float32_fallback(monkeypatch):
+    # The whole point: without the wheel transformers only warns, and 18 of 24
+    # layers quietly run a float32 chunk loop at 7.47 s/step instead of 5.03.
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as qwen
+
+    monkeypatch.setattr(qwen, "chunk_gated_delta_rule", None)
+    monkeypatch.setattr(qwen, "fused_recurrent_gated_delta_rule", None)
+    with pytest.raises(RuntimeError, match="flash-linear-attention is missing"):
+        check_fused_linear_attention(fake_hybrid_model(), require=True)
+    lines = []
+    check_fused_linear_attention(fake_hybrid_model(), require=False, log=lines.append)
+    assert lines and lines[0].startswith("WARNING: 18/24 layers")
+
+
+def test_fused_linear_attention_check_ignores_a_full_attention_model(monkeypatch):
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as qwen
+
+    monkeypatch.setattr(qwen, "chunk_gated_delta_rule", None)
+    monkeypatch.setattr(qwen, "fused_recurrent_gated_delta_rule", None)
+    lines = []
+    check_fused_linear_attention(
+        fake_hybrid_model(linear_layers=0, full_layers=24),
+        require=True,
+        log=lines.append,
+    )
+    assert lines == []
 
 
 def test_evaluation_reports_semantic_and_eos_metrics():

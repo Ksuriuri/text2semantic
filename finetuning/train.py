@@ -312,6 +312,19 @@ def parse_args():
             "launches and fewer activation tensors."
         ),
     )
+    parser.add_argument(
+        "--require_fused_linear_attention",
+        action="store_true",
+        help=(
+            "Fail instead of training slowly when the fused linear-attention "
+            "kernels are missing. 18 of Qwen3.5-2B's 24 layers are linear "
+            "attention, and transformers silently falls back to a float32 "
+            "per-chunk Python loop for them with nothing but a warning: 7.47 "
+            "s/step against 5.03 measured on 8xH100. Worth setting on a paid "
+            "multi-node run, where one node that came up without the wheel "
+            "should refuse to join rather than halve the whole job."
+        ),
+    )
     args = parser.parse_args()
     if not 0 <= args.warmup_ratio < 1:
         parser.error("--warmup_ratio must be in [0, 1).")
@@ -393,6 +406,46 @@ def apply_liger(model):
         swiglu=True,
         model=model.backbone,
     )
+
+
+def check_fused_linear_attention(model, require, log=print):
+    """Say out loud which kernel the linear-attention layers are about to use.
+
+    transformers computes one `is_fast_path_available` from four functions but
+    binds each layer's kernel independently, so a missing causal-conv1d does not
+    demote the delta-rule kernels -- and a missing flash-linear-attention demotes
+    them to `torch_chunk_gated_delta_rule`, a float32 loop over chunks, behind a
+    warning that is one line in a log nobody reads at minute three of an eight
+    node run. That was 7.47 s/step against 5.03: on one epoch of t2s-v1, a day
+    and a half and about $6k.
+
+    causal-conv1d is deliberately not checked. Its fallback is a single
+    `F.conv1d` rather than a Python loop, and it is the only half that needs
+    nvcc, which the training AMI does not have.
+    """
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as qwen
+
+    layer_types = getattr(model.backbone.config, "layer_types", None) or []
+    linear = sum(1 for kind in layer_types if kind == "linear_attention")
+    if not linear:
+        return
+    missing = [
+        name
+        for name in ("chunk_gated_delta_rule", "fused_recurrent_gated_delta_rule")
+        if getattr(qwen, name, None) is None
+    ]
+    if not missing:
+        log(f"Linear attention: fused kernels on {linear}/{len(layer_types)} layers")
+        return
+    message = (
+        f"{linear}/{len(layer_types)} layers are linear attention and "
+        f"flash-linear-attention is missing ({', '.join(missing)} unbound), so "
+        "they will run a float32 chunk loop at roughly two thirds the speed. "
+        "Install flash-linear-attention."
+    )
+    if require:
+        raise RuntimeError(message)
+    log(f"WARNING: {message}")
 
 
 def read_jsonl(path):
@@ -1062,6 +1115,9 @@ def train():
         attn_implementation=args.attn_implementation,
     )
     model.requires_grad_(True)
+    check_fused_linear_attention(
+        model, args.require_fused_linear_attention, log=accelerator.print
+    )
     if args.liger:
         apply_liger(model)
     if args.gradient_checkpointing:
