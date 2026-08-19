@@ -633,11 +633,22 @@ def fake_hybrid_model(linear_layers=18, full_layers=6):
     )
 
 
-def test_fused_linear_attention_check_reports_the_kernel_it_found(monkeypatch):
+def bind_delta_rule_kernels(monkeypatch, value):
+    """Point both kernel names at `value`, whether or not they are bound now.
+
+    `raising=False` is the point: some transformers builds do not define these
+    names at all when flash-linear-attention is absent, which is exactly the
+    machine this check exists for -- and a plain setattr would error there
+    instead of testing anything. The check itself reads them with getattr.
+    """
     from transformers.models.qwen3_5 import modeling_qwen3_5 as qwen
 
-    monkeypatch.setattr(qwen, "chunk_gated_delta_rule", lambda *a, **k: None)
-    monkeypatch.setattr(qwen, "fused_recurrent_gated_delta_rule", lambda *a, **k: None)
+    for name in ("chunk_gated_delta_rule", "fused_recurrent_gated_delta_rule"):
+        monkeypatch.setattr(qwen, name, value, raising=False)
+
+
+def test_fused_linear_attention_check_reports_the_kernel_it_found(monkeypatch):
+    bind_delta_rule_kernels(monkeypatch, lambda *a, **k: None)
     lines = []
     check_fused_linear_attention(fake_hybrid_model(), require=True, log=lines.append)
     assert lines == ["Linear attention: fused kernels on 18/24 layers"]
@@ -646,10 +657,7 @@ def test_fused_linear_attention_check_reports_the_kernel_it_found(monkeypatch):
 def test_fused_linear_attention_check_refuses_the_float32_fallback(monkeypatch):
     # The whole point: without the wheel transformers only warns, and 18 of 24
     # layers quietly run a float32 chunk loop at 7.47 s/step instead of 5.03.
-    from transformers.models.qwen3_5 import modeling_qwen3_5 as qwen
-
-    monkeypatch.setattr(qwen, "chunk_gated_delta_rule", None)
-    monkeypatch.setattr(qwen, "fused_recurrent_gated_delta_rule", None)
+    bind_delta_rule_kernels(monkeypatch, None)
     with pytest.raises(RuntimeError, match="flash-linear-attention is missing"):
         check_fused_linear_attention(fake_hybrid_model(), require=True)
     lines = []
@@ -658,10 +666,7 @@ def test_fused_linear_attention_check_refuses_the_float32_fallback(monkeypatch):
 
 
 def test_fused_linear_attention_check_ignores_a_full_attention_model(monkeypatch):
-    from transformers.models.qwen3_5 import modeling_qwen3_5 as qwen
-
-    monkeypatch.setattr(qwen, "chunk_gated_delta_rule", None)
-    monkeypatch.setattr(qwen, "fused_recurrent_gated_delta_rule", None)
+    bind_delta_rule_kernels(monkeypatch, None)
     lines = []
     check_fused_linear_attention(
         fake_hybrid_model(linear_layers=0, full_layers=24),
