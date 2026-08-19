@@ -6,6 +6,7 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from torch import nn
 from transformers import (
     PreTrainedModel,
@@ -70,6 +71,7 @@ class Text2SemanticForCausalLM(PreTrainedModel):
                 bias=False,
             )
         self.speaker_boundary_embedding = nn.Embedding(2, qwen_config.hidden_size)
+        self.speaker_gradient_checkpointing = False
         self.post_init()
         self._init_speech_parameters()
 
@@ -131,12 +133,29 @@ class Text2SemanticForCausalLM(PreTrainedModel):
         self.backbone.set_input_embeddings(value)
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """Checkpoint the backbone, and the speaker encoder along with it.
+
+        The speaker encoder is a plain nn.Module, so transformers' own
+        `gradient_checkpointing_enable` walks straight past it -- which is easy to
+        miss, because the backbone is where the parameters are. The activations
+        are somewhere else: at batch 48 the training step peaked at 75.8 GiB with
+        20 s references against 62.3 GiB with 10 s ones, and that 13.5 GiB is this
+        module holding twice as many frames, not the frozen W2V-BERT (measured:
+        11.15 GiB whole-batch, and chunking it did not move the step's peak).
+
+        Recomputing it is cheap in the only currency that matters here. Six
+        Conformer blocks at width 512 over subsampled frames plus a two-layer
+        Perceiver is on the order of 1% of the step's arithmetic next to a 2B
+        backbone, and buying ~13 GiB with that is what makes a larger batch fit.
+        """
         self.backbone.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
         )
+        self.speaker_gradient_checkpointing = True
 
     def gradient_checkpointing_disable(self):
         self.backbone.gradient_checkpointing_disable()
+        self.speaker_gradient_checkpointing = False
 
     def _validate_speech_ids(self, speech_ids):
         if speech_ids.numel() == 0:
@@ -183,10 +202,40 @@ class Text2SemanticForCausalLM(PreTrainedModel):
             raise ValueError(
                 "speaker_feature_lengths must be in [1, speaker feature time]."
             )
-        speaker_latents = self.speaker_encoder(
-            speaker_features,
-            speaker_feature_lengths,
-        )
+        if (
+            self.speaker_gradient_checkpointing
+            and self.training
+            and torch.is_grad_enabled()
+        ):
+            # Both arguments come out of the frozen W2V-BERT, whose encode_*
+            # methods are @torch.inference_mode(), and checkpointing has to save
+            # its inputs to replay the forward: "Inference tensors cannot be saved
+            # for backward". Autograd tolerates them on the ordinary path, so this
+            # is specific to checkpointing -- and cheap, about 100 MB at batch 48
+            # with 20 s references. Both, because the conversions above only clear
+            # the inference flag when they actually copy: features change dtype
+            # and so come back normal, while `lengths.to(dtype=torch.long)` on an
+            # already-long tensor returns the same inference tensor, and that is
+            # the argument that failed on 8 GPUs.
+            if torch.is_inference(speaker_features):
+                speaker_features = speaker_features.clone()
+            if torch.is_inference(speaker_feature_lengths):
+                speaker_feature_lengths = speaker_feature_lengths.clone()
+            # use_reentrant=False so the recomputation sees the same RNG state and
+            # so this composes with the backbone's own checkpointing. The encoder
+            # is built with dropout 0 anyway, which is why the recomputed forward
+            # is not merely statistically equivalent but identical.
+            speaker_latents = torch.utils.checkpoint.checkpoint(
+                self.speaker_encoder,
+                speaker_features,
+                speaker_feature_lengths,
+                use_reentrant=False,
+            )
+        else:
+            speaker_latents = self.speaker_encoder(
+                speaker_features,
+                speaker_feature_lengths,
+            )
         speaker_embeds = self.speaker_projection(speaker_latents)
         boundary_ids = torch.arange(
             2,

@@ -299,6 +299,17 @@ def parse_args():
         default=True,
     )
     parser.add_argument(
+        "--speaker_gradient_checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Whether the trainable speaker encoder is checkpointed along with "
+            "the backbone. Defaults to following --gradient_checkpointing, "
+            "which is what the model does on its own; the point of the flag is "
+            "to be able to measure the two halves separately."
+        ),
+    )
+    parser.add_argument(
         "--attn_implementation",
         default="flash_attention_2",
         choices=("flash_attention_2", "sdpa", "eager"),
@@ -1123,6 +1134,8 @@ def train():
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
         model.config.use_cache = False
+    if args.speaker_gradient_checkpointing is not None:
+        model.speaker_gradient_checkpointing = args.speaker_gradient_checkpointing
 
     # One process per *node* builds the shared indexes (the speaker key table
     # and the manifest row indexes), because the index directories sit on each
@@ -1388,6 +1401,19 @@ def train():
                         log_values["train/lr_new_modules"] = group_lrs[
                             "new_modules"
                         ]
+                    if torch.cuda.is_available():
+                        # High-water marks, not the current usage: on a run this
+                        # long the question is always how much headroom is left,
+                        # and nvidia-smi only shows what the caching allocator has
+                        # reserved, which never shrinks and hides the answer.
+                        # Reserved is logged too, because that is what an OOM
+                        # actually collides with.
+                        log_values["train/vram_peak_gib"] = (
+                            torch.cuda.max_memory_allocated() / 2**30
+                        )
+                        log_values["train/vram_reserved_gib"] = (
+                            torch.cuda.max_memory_reserved() / 2**30
+                        )
                     accelerator.log(log_values, step=global_step)
                 action, preempting = decide_checkpoint(
                     accelerator,

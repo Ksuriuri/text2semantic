@@ -326,6 +326,104 @@ def test_forward_backward_and_independent_speech_parameters():
     assert any(key.startswith("speaker_encoder.") for key in model.state_dict())
 
 
+def test_gradient_checkpointing_covers_the_speaker_encoder():
+    # transformers' own gradient_checkpointing_enable only reaches the backbone,
+    # and the speaker encoder is where 20 s references cost 13.5 GiB. Same
+    # gradients either way -- the encoder's dropout is 0, so the recomputed
+    # forward is identical rather than merely equivalent.
+    torch.manual_seed(0)
+    reference = tiny_model()
+    reference.train()
+    batch = dict(
+        text_input_ids=torch.tensor([[2, 3]]),
+        speech_input_ids=torch.tensor([[16, 4, 5]]),
+        labels=torch.tensor([[4, 5, 17]]),
+        **speaker_inputs(),
+    )
+    assert reference.speaker_gradient_checkpointing is False
+    reference(**batch).loss.backward()
+    plain = {
+        name: parameter.grad.clone()
+        for name, parameter in reference.speaker_encoder.named_parameters()
+        if parameter.grad is not None
+    }
+    assert plain
+
+    calls = []
+    checkpointed = tiny_model()
+    checkpointed.load_state_dict(reference.state_dict())
+    checkpointed.train()
+    checkpointed.gradient_checkpointing_enable()
+    assert checkpointed.speaker_gradient_checkpointing is True
+    original = torch.utils.checkpoint.checkpoint
+
+    def counting_checkpoint(function, *args, **kwargs):
+        calls.append(function)
+        return original(function, *args, **kwargs)
+
+    torch.utils.checkpoint.checkpoint = counting_checkpoint
+    try:
+        checkpointed(**batch).loss.backward()
+    finally:
+        torch.utils.checkpoint.checkpoint = original
+    assert checkpointed.speaker_encoder in calls
+
+    for name, parameter in checkpointed.speaker_encoder.named_parameters():
+        assert torch.equal(parameter.grad, plain[name]), name
+
+    checkpointed.gradient_checkpointing_disable()
+    assert checkpointed.speaker_gradient_checkpointing is False
+
+
+def test_checkpointing_accepts_features_from_the_frozen_extractor():
+    # MaskGCTFeatureExtractor.encode_* are @torch.inference_mode(), so every
+    # speaker feature tensor a training step sees is an inference tensor, and
+    # checkpoint() refuses to save one for backward. Caught on 8 GPUs at batch 48,
+    # which is a slow way to find it.
+    model = tiny_model()
+    model.gradient_checkpointing_enable()
+    model.train()
+    with torch.inference_mode():
+        features = torch.randn(1, 5, 8)
+        # An inference tensor too, and the one that actually broke the run: the
+        # conversions in _encode_speaker_prefix only clear the flag when they copy,
+        # and .to(dtype=torch.long) on a long tensor returns it unchanged.
+        lengths = torch.full((1,), 5, dtype=torch.long)
+    assert torch.is_inference(features) and torch.is_inference(lengths)
+    output = model(
+        text_input_ids=torch.tensor([[2, 3]]),
+        speech_input_ids=torch.tensor([[16, 4, 5]]),
+        labels=torch.tensor([[4, 5, 17]]),
+        speaker_features=features,
+        speaker_feature_lengths=lengths,
+    )
+    output.loss.backward()
+    assert next(model.speaker_encoder.parameters()).grad is not None
+
+
+def test_the_speaker_encoder_is_not_checkpointed_under_no_grad():
+    # checkpoint() with grad disabled is pure recompute for nothing, and
+    # generation calls this path on every sampled token.
+    model = tiny_model()
+    model.gradient_checkpointing_enable()
+    model.train()
+    calls = []
+    original = torch.utils.checkpoint.checkpoint
+    torch.utils.checkpoint.checkpoint = lambda function, *a, **k: calls.append(
+        function
+    ) or original(function, *a, **k)
+    try:
+        with torch.no_grad():
+            model(
+                text_input_ids=torch.tensor([[2, 3]]),
+                speech_input_ids=torch.tensor([[16, 4, 5]]),
+                **speaker_inputs(),
+            )
+    finally:
+        torch.utils.checkpoint.checkpoint = original
+    assert calls == []
+
+
 def test_generation_stops_at_eos():
     model = tiny_model()
 
