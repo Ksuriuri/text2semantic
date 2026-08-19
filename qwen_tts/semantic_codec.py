@@ -417,6 +417,16 @@ class MaskGCTFeatureExtractor:
     faster on B200 for a 0.031 relative difference.
     """
 
+    # Off by default, and deliberately so: MaskGCTSemanticTokenizer builds one of
+    # these, and its RepCodec ids have to stay bit-reproducible against the shards
+    # already in the bucket. Chunking is exact in exact arithmetic -- rows do not
+    # attend to each other -- but cuBLAS picks different kernels for a batch of 8
+    # than for 48, and in bf16 that measured a 4.3e-2 relative difference. Only
+    # the trainer, whose features are mean/std normalised and fed to a trainable
+    # encoder, opts in. Also a class attribute so an instance built with __new__ --
+    # which is how the tests avoid downloading W2V-BERT -- still has a chunk size.
+    chunk_size = 0
+
     def __init__(
         self,
         *,
@@ -424,9 +434,20 @@ class MaskGCTFeatureExtractor:
         stats_path,
         device="cuda:0",
         dtype=torch.float32,
+        chunk_size=None,
     ):
         self.device = torch.device(device)
         self.dtype = resolve_float_dtype(dtype)
+        # W2V-BERT uses relative_key attention, which materialises a
+        # batch x L x L x head_dim tensor. Measured on one H100 at batch 48 and
+        # 20 s refs, the frozen forward peaks at 11.15 GiB whole and 3.24 GiB in
+        # chunks of 8, at ~1.3% of a step either way. Worth knowing, but it did
+        # not move the training step's peak (75.8 GiB at batch 48 either way):
+        # that peak belongs to a different moment in the step, and what 20 s refs
+        # really cost is the *trainable* speaker encoder's retained activations
+        # over twice as many frames.
+        if chunk_size is not None:
+            self.chunk_size = chunk_size
         self.mel_extractor = SpeakerMelExtractor(w2v_bert_path)
         self.feature_extractor = self.mel_extractor.feature_extractor
         self.semantic_model = Wav2Vec2BertModel.from_pretrained(
@@ -473,26 +494,47 @@ class MaskGCTFeatureExtractor:
             *self.mel_extractor(audios, max_audio_seconds=max_audio_seconds)
         )
 
+    def _chunks(self, batch_size):
+        step = self.chunk_size if self.chunk_size and self.chunk_size > 0 else batch_size
+        return [
+            (start, min(start + step, batch_size))
+            for start in range(0, batch_size, step)
+        ]
+
     @torch.inference_mode()
     def encode_features(self, input_features, attention_mask=None):
         """The GPU half: layer-17 features from an already computed log-mel.
 
         Callable directly so the mel can be produced in a DataLoader worker
         rather than inline in the training step.
+
+        With ``chunk_size`` set, the rows go through the frozen model in groups.
+        Every row attends only to itself, so the result is the same in exact
+        arithmetic; what changes is that the transient relative_key attention
+        buffer is sized by the chunk instead of by the whole batch, and that the
+        matmuls are shaped differently enough for cuBLAS to round differently.
         """
         input_features = input_features.to(self.device, self.dtype)
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.device)
 
         with torch.amp.autocast(device_type=self.device.type, enabled=False):
-            outputs = self.semantic_model(
-                input_features=input_features,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
+            features = torch.cat(
+                [
+                    (
+                        self.semantic_model(
+                            input_features=input_features[start:stop],
+                            attention_mask=(
+                                None if attention_mask is None
+                                else attention_mask[start:stop]
+                            ),
+                            output_hidden_states=True,
+                        ).hidden_states[17].float()
+                        - self.mean
+                    ) / self.std
+                    for start, stop in self._chunks(input_features.size(0))
+                ]
             )
-            features = (
-                outputs.hidden_states[17].float() - self.mean
-            ) / self.std
 
         feature_length = features.size(1)
         if attention_mask is None:

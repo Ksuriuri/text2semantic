@@ -71,6 +71,19 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--speaker_encode_chunk",
+        type=int,
+        default=0,
+        help=(
+            "Rows per frozen W2V-BERT forward; 0 means one forward for the "
+            "whole batch. Its relative_key attention allocates "
+            "batch x L x L x head_dim, which at batch 48 and 20 s refs peaks at "
+            "11.15 GiB whole against 3.24 GiB in chunks of 8. That did not move "
+            "the training step's peak, so this is a knob for a batch size the "
+            "frozen forward really does gate, not a default."
+        ),
+    )
+    parser.add_argument(
         "--speaker_mel_in_workers",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1029,6 +1042,7 @@ def train():
         stats_path=args.stats_path,
         device=accelerator.device,
         dtype=args.speaker_encoder_dtype,
+        chunk_size=args.speaker_encode_chunk,
     )
     # Hand the CPU log-mel to the DataLoader workers unless asked not to. With
     # --num_workers 0 there are no workers, so it would run in this process

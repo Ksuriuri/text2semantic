@@ -935,6 +935,49 @@ def test_worker_computed_mel_reaches_the_same_features(monkeypatch):
     assert inline_lengths.tolist() == [4, 7]
 
 
+def test_chunking_the_frozen_forward_changes_nothing_but_the_batch_it_sees():
+    """W2V-BERT rows are independent, so chunking must be a pure memory trade.
+
+    The point of the chunk is the relative_key attention buffer, which is sized
+    by the batch handed to the frozen model: 8.4 GB at batch 32 and 20 s refs,
+    and the peak that stops the training batch from growing. If a chunk ever
+    changed a feature, speaker conditioning would depend on --batch_size.
+    """
+    batches = []
+
+    class SemanticModel:
+        def __call__(self, input_features, attention_mask, output_hidden_states):
+            batches.append(input_features.size(0))
+            hidden_states = [None] * 18
+            hidden_states[17] = input_features.float().sum(dim=-1, keepdim=True)
+            hidden_states[17] = hidden_states[17].expand(-1, -1, 4).contiguous()
+            return type("Output", (), {"hidden_states": hidden_states})()
+
+    def extractor(chunk_size):
+        made = MaskGCTFeatureExtractor.__new__(MaskGCTFeatureExtractor)
+        made.device = torch.device("cpu")
+        made.dtype = torch.float32
+        made.semantic_model = SemanticModel()
+        made.mean = torch.zeros(4)
+        made.std = torch.ones(4)
+        made.chunk_size = chunk_size
+        return made
+
+    torch.manual_seed(0)
+    mel = torch.randn(7, 5, 3)
+    mask = torch.ones(7, 5, dtype=torch.long)
+    mask[3, 2:] = 0
+
+    whole_features, whole_lengths = extractor(0).encode_features(mel, mask)
+    assert batches == [7]
+    batches.clear()
+    chunked_features, chunked_lengths = extractor(3).encode_features(mel, mask)
+
+    assert batches == [3, 3, 1]
+    assert torch.equal(whole_features, chunked_features)
+    assert torch.equal(whole_lengths, chunked_lengths)
+
+
 def test_the_mel_extractor_truncates_to_max_ref_seconds():
     # The truncation used to live in encode_audios; if it had not moved with the
     # mel, a 20 s cap would silently become "whatever the shard holds".
