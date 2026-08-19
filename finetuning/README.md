@@ -81,6 +81,16 @@ trainset grows, while `--max_train_steps` is for deliberately training a fixed
 fraction of an epoch. Setting one to a number the other contradicts is what used
 to decay the learning rate to zero partway through a run.
 
+Both numbers count **optimizer steps of the sharded run**, which is not what
+`accelerator.prepare` assumes: a prepared scheduler is advanced once per process
+per optimizer step, so the cosine is built for `steps x num_processes` scheduler
+steps (`schedule_steps_for_accelerate`). The startup banner prints both counts —
+check them, because getting this wrong scales with the cluster: on 32 processes
+the LR used to reach zero about 6,200 steps into a 199,723-step epoch and stay
+there. A checkpoint written before that fix carries scheduler state in the old,
+unmultiplied space, so resuming it on the fixed code makes the LR jump; start
+such a run fresh instead.
+
 The Qwen3.5 backbone is loaded from pretrained weights. The independent
 8195-entry speech embedding, 8195-class output head, and IndexTTS2-style
 Conformer + Perceiver speaker encoder are random and trainable. A frozen

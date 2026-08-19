@@ -10,7 +10,7 @@ from accelerate import Accelerator
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
-from transformers import Qwen3_5TextConfig
+from transformers import Qwen3_5TextConfig, get_cosine_schedule_with_warmup
 
 from finetuning import checkpoint_remote
 from finetuning.checkpoint_policy import (
@@ -34,6 +34,7 @@ from finetuning.train import (
     parse_args,
     rotate_checkpoints,
     save_checkpoint,
+    schedule_steps_for_accelerate,
     speaker_key,
     speaker_statistics,
     sorted_checkpoints,
@@ -43,6 +44,8 @@ from qwen_tts.core.models import (
     Text2SemanticConfig,
     Text2SemanticForCausalLM,
 )
+
+BASE_LR = 4e-5  # the --lr default, so the LR traces read like the real run
 
 
 class SavingTokenizer:
@@ -140,6 +143,152 @@ def test_steps_for_epochs_matches_the_t2s_v1_manifest():
     rows = 99_374_464
     batches = math.ceil(rows / 32)
     assert steps_for_epochs(batches, 16, 1, 1) == 194_091
+
+
+def test_schedule_steps_for_accelerate_scales_by_processes():
+    # The whole point: 194,091 optimizer steps on 16 processes must be built as
+    # 3,105,456 scheduler steps, because AcceleratedScheduler advances the
+    # wrapped scheduler once per process per optimizer step.
+    assert schedule_steps_for_accelerate(194_091, 16, False) == 194_091 * 16
+    assert schedule_steps_for_accelerate(100, 1, False) == 100
+    # split_batches keeps the dataloader batch size, so one step per step.
+    assert schedule_steps_for_accelerate(100, 32, True) == 100
+    # --warmup_ratio 0 is legal and must stay 0, not become one process-worth.
+    assert schedule_steps_for_accelerate(0, 32, False) == 0
+    with pytest.raises(ValueError):
+        schedule_steps_for_accelerate(-1, 8, False)
+    with pytest.raises(ValueError):
+        schedule_steps_for_accelerate(10, 0, False)
+
+
+def _lr_trace(monkeypatch, num_processes, warmup_scheduler_steps,
+              total_scheduler_steps, optimizer_steps, probe_steps):
+    """LR after each of `probe_steps` optimizer steps, through real accelerate.
+
+    Drives `accelerate.scheduler.AcceleratedScheduler` itself rather than a
+    hand-rolled imitation of it, so the test fails if accelerate ever changes
+    how a prepared scheduler is advanced.
+    """
+    from accelerate.scheduler import AcceleratedScheduler
+
+    monkeypatch.setattr(
+        "accelerate.scheduler.AcceleratorState",
+        lambda: SimpleNamespace(num_processes=num_processes),
+    )
+    parameter = torch.nn.Parameter(torch.zeros(1))
+    optimizer = torch.optim.SGD([parameter], lr=BASE_LR)
+    inner = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_scheduler_steps,
+        num_training_steps=total_scheduler_steps,
+    )
+    wrapped = AcceleratedScheduler(
+        inner,
+        [SimpleNamespace(step_was_skipped=False)],
+        step_with_optimizer=True,
+        split_batches=False,
+    )
+    seen = {}
+    for step in range(1, optimizer_steps + 1):
+        optimizer.step()  # order the wrapper expects; no grads, so it is a no-op
+        wrapped.step()
+        if step in probe_steps:
+            seen[step] = optimizer.param_groups[0]["lr"]
+    return seen
+
+
+def cosine_lr(step, warmup, total):
+    """The LR the run is supposed to be at, straight from the cosine formula."""
+    if step < warmup:
+        return BASE_LR * step / warmup
+    progress = (step - warmup) / (total - warmup)
+    return BASE_LR * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def test_prepared_cosine_spans_the_whole_run_on_many_processes(monkeypatch):
+    # 4 nodes x 8 H100 = 32 processes, a 1,000-step run, 3% warmup.  With the
+    # fix the LR peaks at the end of warmup and still has most of its range left
+    # at the halfway point; the bug drove it to zero in the first 2% of the run.
+    processes, steps = 32, 1_000
+    warmup = int(steps * 0.03)
+    trace = _lr_trace(
+        monkeypatch,
+        processes,
+        schedule_steps_for_accelerate(warmup, processes, False),
+        schedule_steps_for_accelerate(steps, processes, False),
+        steps,
+        probe_steps={warmup, steps // 2, steps},
+    )
+    assert trace[warmup] == pytest.approx(BASE_LR, rel=1e-6)
+    assert trace[steps // 2] == pytest.approx(
+        cosine_lr(steps // 2, warmup, steps), rel=1e-6
+    )
+    assert trace[steps // 2] > BASE_LR * 0.4  # still half the range to spend
+    assert trace[steps] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_unscaled_schedule_is_the_bug_this_guards_against(monkeypatch):
+    # Pin the defect itself: hand the wrapper the optimizer-step count and the
+    # cosine is spent 1/32 of the way into the run.  This is what the 4x5090 run
+    # did (LR at 12% of peak by step 5,880 of 30,000) and what 32 processes would
+    # have turned into 97% of an epoch on a schedule that no longer means
+    # anything -- past its end the clamped cosine oscillates between 0 and peak
+    # rather than holding 0, so the tell is non-monotonicity, not smallness.
+    processes, steps = 32, 1_000
+    warmup = int(steps * 0.03)
+    spent = steps // processes + 1
+    trace = _lr_trace(
+        monkeypatch, processes, warmup, steps, steps,
+        probe_steps={spent, steps // 2},
+    )
+    # The run is 3.2% in and the schedule is already finished, where the
+    # intended cosine is still within a whisker of peak.
+    assert trace[spent] < cosine_lr(spent, warmup, steps) * 0.01
+    # ...and then the LR climbs back up, which a cosine decay never does.
+    assert trace[steps // 2] > trace[spent] * 100
+
+
+def test_scaled_schedule_reproduces_the_4x5090_measurement(monkeypatch):
+    # The unscaled schedule on 4 processes is what actually ran: at optimizer
+    # step 5,880 of 30,000 W&B logged lr_backbone 4.6976e-6 against a 4e-5 peak,
+    # i.e. 11.74% of peak.  Reproducing that number is what proves the diagnosis
+    # rather than merely asserting the fix looks right.
+    trace = _lr_trace(monkeypatch, 4, 900, 30_000, 5_880, probe_steps={5_880})
+    assert trace[5_880] / BASE_LR == pytest.approx(4.6976e-6 / 4e-5, rel=5e-3)
+
+
+def test_resume_restores_the_scheduler_position(tmp_path):
+    # Trainers that fast-forward the scheduler by hand after a resume have to
+    # apply the same num_processes factor, or a preempted run comes back at the
+    # wrong LR without any error.  This trainer does not fast-forward: the
+    # scheduler goes through `prepare`, so `save_state` records its position and
+    # `load_state` restores it.  Pinned here because the day someone drops the
+    # scheduler from `prepare`, resume starts silently relearning from LR 0.
+    accelerator = Accelerator(project_dir=str(tmp_path))
+    model = torch.nn.Linear(4, 4)
+    optimizer = AdamW(model.parameters(), lr=BASE_LR)
+    model, optimizer, scheduler = accelerator.prepare(
+        model,
+        optimizer,
+        get_cosine_schedule_with_warmup(optimizer, 10, 100),
+    )
+    for _ in range(40):
+        optimizer.step()
+        scheduler.step()
+    before = optimizer.param_groups[0]["lr"]
+    assert before > 0
+    accelerator.save_state(str(tmp_path / "state"))
+
+    resumed = Accelerator(project_dir=str(tmp_path))
+    fresh_model = torch.nn.Linear(4, 4)
+    fresh_optimizer = AdamW(fresh_model.parameters(), lr=BASE_LR)
+    fresh_model, fresh_optimizer, fresh_scheduler = resumed.prepare(
+        fresh_model,
+        fresh_optimizer,
+        get_cosine_schedule_with_warmup(fresh_optimizer, 10, 100),
+    )
+    resumed.load_state(str(tmp_path / "state"))
+    assert fresh_optimizer.param_groups[0]["lr"] == pytest.approx(before, rel=1e-12)
 
 
 def test_speaker_statistics_are_split_local():

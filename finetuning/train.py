@@ -695,6 +695,32 @@ def steps_for_epochs(
     return steps_per_epoch * num_epochs
 
 
+def schedule_steps_for_accelerate(optimizer_steps, num_processes, split_batches):
+    """Translate optimizer steps into the count `accelerator.prepare` expects.
+
+    A scheduler passed through `accelerate.Accelerator.prepare` is wrapped in
+    `AcceleratedScheduler`, which -- unless the dataloader splits batches --
+    advances the wrapped scheduler `num_processes` times per optimizer step,
+    because it assumes `num_training_steps` was counted on an unsharded
+    dataloader.  `steps_for_epochs` (and `--max_train_steps`) count the real
+    optimizer steps of the *sharded* run, so handing that number straight to
+    `get_cosine_schedule_with_warmup` makes the schedule finish
+    `num_processes` times too early: warmup ends almost immediately and the
+    cosine sits at zero for the rest of the run.
+
+    Measured, not theorised: the 4x5090 run (30,000 steps, 4 processes) logged
+    lr_backbone 4.6976e-6 at step 5,880, which is the cosine value for step
+    5,880 x 4 to three significant figures.  At 32 processes the same bug would
+    zero the LR about 6,200 steps into a 199,723-step epoch.
+    """
+    if optimizer_steps < 0:
+        # Zero is legal: --warmup_ratio 0 means no warmup at all.
+        raise ValueError("optimizer_steps must not be negative")
+    if num_processes <= 0:
+        raise ValueError("num_processes must be positive")
+    return optimizer_steps if split_batches else optimizer_steps * num_processes
+
+
 def build_optimizer(model, args):
     groups = {
         ("backbone", True): [],
@@ -1013,10 +1039,22 @@ def train():
     else:
         total_steps = args.max_train_steps
         accelerator.print(f"Run length: {total_steps:,} steps (fixed)")
+    warmup_steps = int(total_steps * args.warmup_ratio)
+    schedule_total = schedule_steps_for_accelerate(
+        total_steps, accelerator.num_processes, accelerator.split_batches
+    )
+    schedule_warmup = schedule_steps_for_accelerate(
+        warmup_steps, accelerator.num_processes, accelerator.split_batches
+    )
+    accelerator.print(
+        f"LR schedule: warmup {warmup_steps:,} / total {total_steps:,} optimizer "
+        f"steps, built as {schedule_warmup:,} / {schedule_total:,} scheduler steps "
+        f"for {accelerator.num_processes} process(es)"
+    )
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=int(total_steps * args.warmup_ratio),
-        num_training_steps=total_steps,
+        num_warmup_steps=schedule_warmup,
+        num_training_steps=schedule_total,
     )
     (
         model,
