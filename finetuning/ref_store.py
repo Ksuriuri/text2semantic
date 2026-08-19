@@ -109,6 +109,10 @@ class SpeakerRefStore:
         self._member_indexes = OrderedDict()
         self._shard_handles = OrderedDict()
         self._owner_pid = os.getpid()
+        # Index/shard disagreements, counted so the scale is visible rather than
+        # inferred from one warning per shard.
+        self.missing_members = 0
+        self._warned_shards = set()
         # A big speaker index stays on disk: t2s-v1's is 5.2 GB of json, which
         # becomes ~12 GB of dict per process, once per rank and per worker.
         if index_backend == "auto":
@@ -155,7 +159,14 @@ class SpeakerRefStore:
         """The row ids these members are, for comparing against ``exclude``."""
         return tuple(ref_member_index.member_row_id(name) for name in self.members(key))
 
-    def pick_member(self, key, *, exclude=None, rng=None):
+    def pick_members(self, key, *, exclude=None, rng=None):
+        """Every usable member for a speaker, the picked one first.
+
+        The head of this list is exactly what ``pick_member`` returns, so which
+        ref a row trains on does not change; the tail is the fallback order for
+        ``read_ref``, rotated from that point so it stays deterministic for a
+        given seed.
+        """
         names = list(self.members(key))
         if exclude:
             # A shard member is named after the row it came from
@@ -171,10 +182,13 @@ class SpeakerRefStore:
                 and ref_member_index.member_row_id(name) != exclude
             ]
         if not names:
-            return None
-        if rng is None:
-            return names[0]
-        return names[rng.randrange(len(names))]
+            return []
+        start = 0 if rng is None else rng.randrange(len(names))
+        return names[start:] + names[:start]
+
+    def pick_member(self, key, *, exclude=None, rng=None):
+        names = self.pick_members(key, exclude=exclude, rng=rng)
+        return names[0] if names else None
 
     def pick_path(self, key, *, exclude=None, rng=None):
         entry = self._lookup(key)
@@ -192,12 +206,35 @@ class SpeakerRefStore:
         return entry["shard"], member
 
     def read_ref(self, key, *, exclude=None, rng=None):
-        """``(member name, bytes)`` for a usable ref, or None. Nothing is written."""
-        picked = self.pick_ref(key, exclude=exclude, rng=rng)
-        if picked is None:
+        """``(member name, bytes)`` for a usable ref, or None. Nothing is written.
+
+        The index and the shards can disagree: a shard rewritten after a packer
+        restart no longer holds every member the index names for it. One such row
+        used to kill a 64-rank job in the dataloader, so a member the shard does
+        not have is skipped in favour of the same speaker's other refs -- the
+        picked member is still tried first, so nothing changes for the rows whose
+        refs are all present. A short read stays fatal: that is a damaged shard or
+        a bad offset, not a stale index, and quietly training on a truncated ref
+        is worse than stopping.
+        """
+        entry = self._lookup(key)
+        if entry is None:
             return None
-        shard_name, member = picked
-        return member, self.read_member(shard_name, member)
+        shard_name = entry["shard"]
+        for member in self.pick_members(key, exclude=exclude, rng=rng):
+            try:
+                return member, self.read_member(shard_name, member)
+            except FileNotFoundError:
+                self.missing_members += 1
+                if shard_name not in self._warned_shards:
+                    self._warned_shards.add(shard_name)
+                    print(
+                        f"[ref_store] {shard_name} does not contain every member "
+                        f"the speaker index names for it (first: {member}); "
+                        "falling back to this speaker's other refs",
+                        flush=True,
+                    )
+        return None
 
     def read_member(self, shard_name, member):
         """A member's bytes, read in place from the shard."""
