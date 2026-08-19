@@ -47,6 +47,12 @@ AMBIGUOUS = "AMBIGUOUS"
 # `repair` waits it out.
 _EC2_STATES = {"running": "RUNNING", "stopped": "TERMINATED"}
 _EC2_LIVE = "pending,running,shutting-down,stopping,stopped"
+# A transient systemd-run unit does not inherit the operator's shell limits, it
+# gets the manager's defaults -- 8 MB of locked memory. EFA registers pinned
+# memory directly, so that default is the difference between a run and an
+# `ibv_reg_mr failed`, and it is also what `train_multinode.sh` refuses to start
+# without.
+UNIT_PROPERTIES = ("LimitMEMLOCK=infinity", "LimitNOFILE=1048576")
 
 
 def run(command, *, check=False, timeout=600):
@@ -325,13 +331,15 @@ def plan(states, job_running):
 
 class Supervisor:
     def __init__(
-        self, cloud, nodes, *, template, launch_command, unit, env=(), log=print
+        self, cloud, nodes, *, template, launch_command, unit, env=(),
+        properties=UNIT_PROPERTIES, log=print
     ):
         self.cloud = cloud
         self.nodes = list(nodes)
         self.template = template
         self.launch_command = launch_command
         self.unit = unit
+        self.properties = list(properties)
         # Extra KEY=VALUE for the unit, e.g. T2S_FABRIC=efa or WANDB_RUN_ID. These
         # have to be re-supplied on every relaunch, so they belong here and not in
         # whatever shell started the first one.
@@ -378,10 +386,12 @@ class Supervisor:
             self.log(f"no internal IP for {self.nodes[0]} yet")
             return False
         extra = "".join(f"--setenv={shlex.quote(item)} " for item in self.env)
+        limits = "".join(f"--property={shlex.quote(item)} " for item in self.properties)
         for rank, name in enumerate(self.nodes):
             remote = (
                 f"sudo systemctl reset-failed {shlex.quote(self.unit)} 2>/dev/null; "
                 f"sudo systemd-run --unit={shlex.quote(self.unit)} "
+                f"{limits}"
                 f"--setenv=T2S_MACHINE_RANK={rank} "
                 f"--setenv=T2S_MAIN_IP={main_ip} "
                 f"--setenv=T2S_NUM_MACHINES={len(self.nodes)} "
@@ -448,6 +458,17 @@ def main(argv=None):
             "relaunch, e.g. --setenv T2S_FABRIC=efa --setenv WANDB_RUN_ID=..."
         ),
     )
+    parser.add_argument(
+        "--property",
+        action="append",
+        default=None,
+        dest="properties",
+        metavar="NAME=VALUE",
+        help=(
+            "systemd unit property, repeatable. Default: "
+            f"{' '.join(UNIT_PROPERTIES)}"
+        ),
+    )
     parser.add_argument("--ssh-user", default="ubuntu", help="AWS only")
     parser.add_argument("--ssh-key", help="AWS only: private key for the ssh hop")
     parser.add_argument(
@@ -489,6 +510,7 @@ def main(argv=None):
         launch_command=args.launch_command,
         unit=args.unit,
         env=args.env,
+        properties=UNIT_PROPERTIES if args.properties is None else args.properties,
     )
     print(f"supervising {', '.join(args.nodes)} in {where}", flush=True)
     while True:

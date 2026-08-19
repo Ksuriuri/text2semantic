@@ -290,6 +290,20 @@ def test_extra_env_is_reapplied_on_every_relaunch():
         assert "--setenv=WANDB_RUN_ID=t2s-v1" in command
 
 
+def test_the_unit_carries_the_limits_efa_needs():
+    cloud = FakeCloud({"node-0": "RUNNING", "node-1": "RUNNING"}, ip="10.1.2.3")
+
+    assert supervisor(cloud).launch() is True
+
+    launches = [c for _, _, c in
+                [a for a in cloud.actions if a[0] == "ssh"] if "systemd-run" in c]
+    for command in launches:
+        # Without this the transient unit gets the manager's 8 MB and EFA fails
+        # its memlock gate -- on GCP the property is simply inert.
+        assert "--property=LimitMEMLOCK=infinity" in command
+        assert "--property=LimitNOFILE=1048576" in command
+
+
 def test_main_requires_the_locator_that_matches_the_cloud():
     common = [
         "--node", "node-0",
