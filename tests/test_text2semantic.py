@@ -1100,3 +1100,70 @@ def test_the_mel_extractor_truncates_to_max_ref_seconds():
         mel_extractor(audios, max_audio_seconds=0)
     with pytest.raises(ValueError):
         mel_extractor([], max_audio_seconds=1.0)
+
+
+def test_speech_id_range_is_validated_once_not_per_forward():
+    # The range check calls int() on the id tensor, which on CUDA blocks until
+    # the queue drains. It must therefore run on the first forward and then stop.
+    model = tiny_model()
+    assert model._speech_ids_validated is False
+    calls = []
+    original = torch.Tensor.min
+
+    def counting_min(self, *args, **kwargs):
+        calls.append(1)
+        return original(self, *args, **kwargs)
+
+    torch.Tensor.min = counting_min
+    try:
+        for _ in range(3):
+            model(
+                text_input_ids=torch.tensor([[2, 3]]),
+                speech_input_ids=torch.tensor([[16, 4, 5]]),
+                labels=torch.tensor([[4, 5, 17]]),
+                **speaker_inputs(),
+            )
+    finally:
+        torch.Tensor.min = original
+    assert model._speech_ids_validated is True
+    assert len(calls) == 1, f"validated {len(calls)} times, expected once"
+
+    # A bad id in the very first batch is still fatal.
+    fresh = tiny_model()
+    with pytest.raises(ValueError):
+        fresh(
+            text_input_ids=torch.tensor([[2, 3]]),
+            speech_input_ids=torch.tensor([[16, 4, 999]]),
+            labels=torch.tensor([[4, 5, 17]]),
+            **speaker_inputs(),
+        )
+
+
+def test_eval_mode_still_returns_logits_for_the_accuracy_metrics():
+    # evaluate() reads output.logits, so the fused loss must never be taken in
+    # eval mode. On CPU the fused path is off anyway, which is what keeps these
+    # tests meaningful without a GPU.
+    model = tiny_model()
+    model.eval()
+    output = model(
+        text_input_ids=torch.tensor([[2, 3]]),
+        speech_input_ids=torch.tensor([[16, 4, 5]]),
+        labels=torch.tensor([[4, 5, 17]]),
+        **speaker_inputs(),
+    )
+    assert output.logits is not None
+    assert output.logits.shape == (1, 3, 19)
+    assert output.loss is not None
+
+
+def test_mismatched_label_shape_is_rejected_on_both_loss_paths():
+    model = tiny_model()
+    for train_mode in (True, False):
+        model.train(train_mode)
+        with pytest.raises(ValueError):
+            model(
+                text_input_ids=torch.tensor([[2, 3]]),
+                speech_input_ids=torch.tensor([[16, 4, 5]]),
+                labels=torch.tensor([[4, 5]]),
+                **speaker_inputs(),
+            )

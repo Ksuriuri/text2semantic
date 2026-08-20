@@ -1,6 +1,7 @@
 # Copyright 2026
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -18,6 +19,17 @@ from transformers.utils import ModelOutput
 
 from .configuration_text2semantic import Text2SemanticConfig
 from .speaker import SpeakerConditioningEncoder
+
+try:
+    from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+except ImportError:  # optional: the Triton kernels are CUDA-only
+    LigerFusedLinearCrossEntropyLoss = None
+
+# Escape hatches for A/B-ing the two changes below against the old behaviour.
+_FUSED_CE_ENABLED = os.environ.get("T2S_FUSED_CE", "1") != "0"
+_ALWAYS_VALIDATE_SPEECH_IDS = (
+    os.environ.get("T2S_VALIDATE_SPEECH_IDS", "once") == "always"
+)
 
 
 @dataclass
@@ -50,6 +62,25 @@ class Text2SemanticForCausalLM(PreTrainedModel):
             config.speech_vocab_size,
             bias=False,
         )
+        # Fused linear + cross entropy over speech_head. The unfused path holds
+        # three (B, L, speech_vocab_size) tensors alive through backward -- the
+        # bf16 logits, the fp32 copy from .float(), and cross_entropy's saved
+        # fp32 log_softmax -- which is ~32 GiB at B=48, L=8000, V=8195. Liger
+        # chunks the head matmul and the log_softmax together so none of them is
+        # ever materialised. The training loop only reads output.loss; evaluate()
+        # needs output.logits and runs under model.eval(), so it keeps the
+        # unfused path and its metrics are unchanged.
+        self._fused_ce = None
+        if LigerFusedLinearCrossEntropyLoss is not None and _FUSED_CE_ENABLED:
+            self._fused_ce = LigerFusedLinearCrossEntropyLoss(
+                ignore_index=-100,
+                reduction="mean",
+                accum_dtype=torch.float32,
+            )
+        # The speech id range is a property of the manifest, not of a batch, so
+        # it is checked once rather than on every forward. See
+        # _validate_speech_ids.
+        self._speech_ids_validated = False
         self.speaker_encoder = SpeakerConditioningEncoder(
             input_dim=config.speaker_input_dim,
             conformer_output_dim=config.speaker_conformer_output_size,
@@ -160,6 +191,13 @@ class Text2SemanticForCausalLM(PreTrainedModel):
     def _validate_speech_ids(self, speech_ids):
         if speech_ids.numel() == 0:
             raise ValueError("speech_input_ids must not be empty.")
+        # int() on a CUDA tensor blocks until the device drains its queue and
+        # copies the scalar back. Sitting at the top of forward, two of them per
+        # micro-batch also destroy the overlap with the previous step. The bound
+        # being checked comes from the manifest and cannot change between
+        # batches, so the first one is enough to catch a bad manifest.
+        if self._speech_ids_validated and not _ALWAYS_VALIDATE_SPEECH_IDS:
+            return
         minimum = int(speech_ids.min())
         maximum = int(speech_ids.max())
         if minimum < 0 or maximum >= self.config.speech_vocab_size:
@@ -167,6 +205,7 @@ class Text2SemanticForCausalLM(PreTrainedModel):
                 f"Speech token IDs must be in [0, {self.config.speech_vocab_size - 1}], "
                 f"got [{minimum}, {maximum}]."
             )
+        self._speech_ids_validated = True
 
     def _encode_speaker_prefix(
         self,
@@ -461,18 +500,33 @@ class Text2SemanticForCausalLM(PreTrainedModel):
             speech_lengths,
             speech_input_ids.size(1),
         )
-        logits = self.speech_head(speech_hidden)
-        loss = None
-        if labels is not None:
-            if labels.shape != speech_input_ids.shape:
-                raise ValueError(
-                    "labels and speech_input_ids must have identical shapes."
-                )
-            loss = F.cross_entropy(
-                logits.float().reshape(-1, self.config.speech_vocab_size),
-                labels.reshape(-1),
-                ignore_index=-100,
+        if labels is not None and labels.shape != speech_input_ids.shape:
+            raise ValueError(
+                "labels and speech_input_ids must have identical shapes."
             )
+        logits = None
+        loss = None
+        fuse = (
+            labels is not None
+            and self.training
+            and self._fused_ce is not None
+            and speech_hidden.is_cuda
+        )
+        if fuse:
+            # No logits are produced on purpose -- that is the whole saving.
+            loss = self._fused_ce(
+                self.speech_head.weight,
+                speech_hidden.reshape(-1, speech_hidden.size(-1)),
+                labels.reshape(-1),
+            )
+        else:
+            logits = self.speech_head(speech_hidden)
+            if labels is not None:
+                loss = F.cross_entropy(
+                    logits.float().reshape(-1, self.config.speech_vocab_size),
+                    labels.reshape(-1),
+                    ignore_index=-100,
+                )
         return Text2SemanticOutput(
             loss=loss,
             logits=logits,
