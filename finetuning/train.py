@@ -45,6 +45,14 @@ from qwen_tts.semantic_codec import (
 WANDB_PROJECT = "text2semantic"
 WANDB_ENTITY = "haoyuanhuang22-jcxy"
 
+# cuDNN's fused attention kernel fails in the backward pass on some batch shapes
+# ("mha_graph.execute ... got false"), which killed rank 55 twenty steps into an
+# 8-node b48 resume and took the whole job with it. It is a kernel bug rather than
+# a shape we could avoid, and torch 2.13 exposes no env switch for it, so the only
+# way to keep --attn_implementation sdpa is to drop cuDNN from the backend list and
+# let SDPA choose flash/mem-efficient -- both exact, both well tested.
+torch.backends.cuda.enable_cudnn_sdp(False)
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
