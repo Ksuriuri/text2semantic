@@ -917,6 +917,52 @@ def schedule_steps_for_accelerate(optimizer_steps, num_processes, split_batches)
     return optimizer_steps if split_batches else optimizer_steps * num_processes
 
 
+def resume_batches_for_world(global_step, gradient_accumulation_steps):
+    """Micro-batches one rank has consumed by `global_step`, on *this* world.
+
+    A checkpoint records `step_in_epoch`, which is the saving rank's own
+    micro-batch count, so it only locates a position in the manifest at the
+    world size and accumulation that wrote it.  A Spot run that comes back on
+    fewer nodes keeps rows per optimizer step constant by raising
+    `--gradient_accumulation_steps`, and under that invariant the position is
+    just `global_step` optimizer steps in, whatever the world size.
+
+    Skipping the saved count instead is silent and expensive: resuming a
+    64-rank, accumulation-1 checkpoint on 16 ranks with accumulation 4 would
+    skip a quarter of the rows already trained, so about 20M rows would be
+    trained twice and the epoch's last 20M never seen at all.
+    """
+    if global_step < 0:
+        raise ValueError("global_step must not be negative")
+    if gradient_accumulation_steps <= 0:
+        raise ValueError("gradient_accumulation_steps must be positive")
+    return global_step * gradient_accumulation_steps
+
+
+def reposition_schedule(scheduler, position):
+    """Move a prepared scheduler to `position` scheduler steps, if it is not there.
+
+    The world-size assumption above is baked into the LR schedule too, and there
+    it is worse than losing rows.  `schedule_total` is a per-process basis (see
+    `schedule_steps_for_accelerate`), so a checkpoint saved at 64 ranks restores
+    a `last_epoch` measured on 64x -- which at 16 ranks is *past the end* of the
+    cosine.  Past its end the clamped cosine does not hold zero, it oscillates,
+    so the run would come back at roughly 1% of peak LR and never say so.
+
+    Returns True when it had to move, so the caller can log the new LR.  Setting
+    `last_epoch` and stepping is what makes the LambdaLR recompute every group
+    from its own lambda, rather than trusting a number saved on another basis.
+    """
+    if position < 0:
+        raise ValueError("position must not be negative")
+    inner = getattr(scheduler, "scheduler", scheduler)
+    if inner.last_epoch == position:
+        return False
+    inner.last_epoch = position - 1
+    inner.step()
+    return True
+
+
 def build_optimizer(model, args):
     groups = {
         ("backbone", True): [],
@@ -1332,6 +1378,30 @@ def train():
             f"Resumed from {resume_from} at "
             f"epoch={start_epoch}, step={resume_step}, global_step={global_step}"
         )
+        if start_epoch == 0:
+            portable_step = resume_batches_for_world(
+                global_step, args.gradient_accumulation_steps
+            )
+            if portable_step != resume_step:
+                accelerator.print(
+                    f"Rescaled resume position for this world size: skip "
+                    f"{resume_step:,} -> {portable_step:,} batches per rank "
+                    f"({accelerator.num_processes} ranks x "
+                    f"{args.gradient_accumulation_steps} accumulation)"
+                )
+                resume_step = portable_step
+        schedule_position = schedule_steps_for_accelerate(
+            global_step, accelerator.num_processes, accelerator.split_batches
+        )
+        if reposition_schedule(scheduler, schedule_position):
+            accelerator.print(
+                f"Rescaled LR schedule position -> {schedule_position:,} of "
+                f"{schedule_total:,} scheduler steps; "
+                + ", ".join(
+                    f"{name}={value:.3e}"
+                    for name, value in learning_rates_by_group(optimizer).items()
+                )
+            )
 
     preemption = PreemptionFlag().install()
     policy = CheckpointPolicy(

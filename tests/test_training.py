@@ -37,6 +37,8 @@ from finetuning.train import (
     load_resume_state,
     learning_rates_by_group,
     parse_args,
+    reposition_schedule,
+    resume_batches_for_world,
     rotate_checkpoints,
     save_checkpoint,
     schedule_steps_for_accelerate,
@@ -325,6 +327,71 @@ def test_resume_restores_the_scheduler_position(tmp_path):
     )
     resumed.load_state(str(tmp_path / "state"))
     assert fresh_optimizer.param_groups[0]["lr"] == pytest.approx(before, rel=1e-12)
+
+
+def test_resume_position_is_the_same_rows_at_any_world_size():
+    # The real case: AWS reclaimed 7 of 8 p5 nodes at step 8,825, and the run
+    # came back on 2 nodes with accumulation 4 to hold 3,072 rows/step.  What
+    # must be preserved across that change is rows consumed, not the saved
+    # per-rank batch count.
+    batch, rows_per_step = 48, 3072
+    before = resume_batches_for_world(8825, 1)
+    after = resume_batches_for_world(8825, 4)
+    assert before * 64 * batch == 8825 * rows_per_step
+    assert after * 16 * batch == 8825 * rows_per_step
+    # ...and the saved number taken literally on 16 ranks is a quarter of it,
+    # which is the silent corruption this guards against.
+    assert before * 16 * batch == 8825 * rows_per_step // 4
+    assert resume_batches_for_world(0, 4) == 0
+    with pytest.raises(ValueError):
+        resume_batches_for_world(10, 0)
+
+
+def test_resume_at_a_smaller_world_rescales_the_lr_schedule():
+    # t2s-v1's own numbers: 33,287 optimizer steps, 1,000 warmup, preempted at
+    # step 8,825.  It was saved at 64 processes, so last_epoch was 564,800 on a
+    # 2,130,368-step basis; it came back on 16, where the basis is 532,592 and
+    # 564,800 is *past the end*.
+    steps, warmup, saved_at = 33_287, 1_000, 8_825
+    total = schedule_steps_for_accelerate(steps, 16, False)
+    warm = schedule_steps_for_accelerate(warmup, 16, False)
+    parameter = torch.nn.Parameter(torch.zeros(1))
+    optimizer = torch.optim.SGD([parameter], lr=BASE_LR)
+    resumed_scheduler = get_cosine_schedule_with_warmup(optimizer, warm, total)
+    resumed_scheduler.last_epoch = saved_at * 64  # what load_state restores
+    resumed_scheduler.step()
+    # Pin the defect: 26.5% into the run the LR would be under 1% of peak, and
+    # past the end the clamped cosine climbs back off zero rather than holding
+    # it, so the tell is a wrong value rather than an obviously dead one.
+    intended = cosine_lr(saved_at * 16, warm, total)
+    assert optimizer.param_groups[0]["lr"] < BASE_LR * 0.01
+    assert intended > BASE_LR * 0.8
+
+    position = schedule_steps_for_accelerate(saved_at, 16, False)
+    assert reposition_schedule(resumed_scheduler, position) is True
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(intended, rel=1e-9)
+    # Idempotent, so an ordinary same-world resume is untouched.
+    assert reposition_schedule(resumed_scheduler, position) is False
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(intended, rel=1e-9)
+
+
+def test_reposition_schedule_reaches_through_the_accelerate_wrapper(tmp_path):
+    # The trainer holds the prepared scheduler, not the LambdaLR, and only the
+    # inner one owns last_epoch.
+    accelerator = Accelerator(project_dir=str(tmp_path))
+    model = torch.nn.Linear(4, 4)
+    optimizer = AdamW(model.parameters(), lr=BASE_LR)
+    model, optimizer, scheduler = accelerator.prepare(
+        model,
+        optimizer,
+        get_cosine_schedule_with_warmup(optimizer, 10, 100),
+    )
+    assert not isinstance(scheduler, LambdaLR)
+    assert reposition_schedule(scheduler, 40) is True
+    assert scheduler.scheduler.last_epoch == 40
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(
+        cosine_lr(40, 10, 100), rel=1e-9
+    )
 
 
 def test_speaker_statistics_are_split_local():
