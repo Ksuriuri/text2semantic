@@ -14,6 +14,8 @@
 #   WEBUI_HOST             default 0.0.0.0
 #   WEBUI_PORT             default 7860
 #   WEBUI_OUT_DIR          default ./webui_outputs
+#   T2S_REPLICAS           AR copies (default 2). Vocoder stays shared.
+#   WEBUI_EXAMPLES_DIR     optional dir of reference wavs for the Gradio UI
 #   BIGVGAN_DIR W2V_BERT_PATH STATS_PATH
 #     override if those files are not inside CODEC_DIR
 set -euo pipefail
@@ -29,6 +31,11 @@ BIGVGAN_DIR="${BIGVGAN_DIR:-$CODEC_DIR/bigvgan}"
 W2V_BERT_PATH="${W2V_BERT_PATH:-$CODEC_DIR/w2v-bert-2.0}"
 STATS_PATH="${STATS_PATH:-$CODEC_DIR/wav2vec2bert_stats.pt}"
 DEVICE="${T2S_DEVICE:-cuda:0}"
+REPLICAS="${T2S_REPLICAS:-2}"
+EXTRA=()
+if [[ -n "${WEBUI_EXAMPLES_DIR:-}" ]]; then
+  EXTRA+=(--examples-dir "$WEBUI_EXAMPLES_DIR")
+fi
 
 exec "$PY" "$ROOT/scripts/webui.py" \
   --checkpoint "$T2S_CHECKPOINT" \
@@ -38,4 +45,6 @@ exec "$PY" "$ROOT/scripts/webui.py" \
   --w2v-bert-path "$W2V_BERT_PATH" \
   --stats-path "$STATS_PATH" \
   --device "$DEVICE" \
+  --t2s-replicas "$REPLICAS" \
+  "${EXTRA[@]}" \
   "$@"

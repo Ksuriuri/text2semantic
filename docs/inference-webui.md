@@ -1,6 +1,7 @@
 # 完整推理与 WebUI 部署
 
 本文说明如何在**另一台机器**上跑当前 text2semantic 的完整波形推理：命令行和 WebUI 走同一条链路。
+GCP L4 dest 听音盒的实测路径在文末。
 
 ## 链路
 
@@ -26,6 +27,8 @@ checkpoint-step-21000/
   chat_template.jinja
 ```
 
+trainer 前缀在 S3 上是 18.53 GB / 75 个对象。听音盒磁盘紧的话只拉上面这些。
+
 另外两份外部依赖（本仓库不包含）：
 
 | 路径 | 内容 |
@@ -45,7 +48,7 @@ checkpoint-step-21000/
   checkpoint-step-21000/      # T2S_CHECKPOINT
 ```
 
-显存：2B AR + w2v-bert + codec + s2mel + BigVGAN，建议 **≥ 24 GB**。没有 GPU 可设 `T2S_DEVICE=cpu`，会很慢。
+显存：2B AR + w2v-bert + codec + s2mel + BigVGAN，建议 **≥ 24 GB**。两份 AR replica（默认）在 L4 24G 上大约 16 / 23 GiB。没有 GPU 可设 `T2S_DEVICE=cpu`，会很慢。
 
 ## Python 环境
 
@@ -54,12 +57,13 @@ checkpoint-step-21000/
 ```bash
 # 本仓库
 pip install -e ".[infer]"
+# 或 uv pip install -e ".[infer]"
 
 # IndexTTS-2.5 代码里的额外依赖（按那边 README 装）
 # 常见缺包：omegaconf einops munch librosa
 ```
 
-`[infer]` 会装 `gradio`、`omegaconf`、`torchaudio`、`munch`。  
+`[infer]` 会装 `gradio`、`fastapi`、`uvicorn`、`python-multipart`、`omegaconf`、`torchaudio`、`munch`。
 BigVGAN 从本地 `bigvgan_generator.pt` 加载，wav 用标准库 `wave` 写 PCM16，不依赖 `torchcodec`，也不走 Hugging Face Hub。
 
 ## 命令行
@@ -77,7 +81,7 @@ python scripts/infer.py \
 
 九章上的包装脚本是 `scripts/infer_jiuzhang.sh`（路径写死在那台机器）。换机器请用上面的参数或下面的 WebUI 脚本。
 
-## WebUI
+## WebUI 与 REST
 
 ```bash
 export T2S_CHECKPOINT=/opt/t2s/checkpoint-step-21000
@@ -90,11 +94,14 @@ export WEBUI_PORT=7860
 # 可选
 export TEXT2SEMANTIC_PYTHON=/path/to/venv/bin/python
 export WEBUI_OUT_DIR=/opt/t2s/webui_outputs
+export T2S_REPLICAS=2
+export WEBUI_EXAMPLES_DIR=/opt/t2s/webui_examples
 
 bash scripts/launch_webui.sh
+# 或带 pidfile 重启：bash scripts/deploy/start_webui.sh
 ```
 
-浏览器打开 `http://<机器IP>:7860`。上传参考音频、输入文本、点生成。模型在启动时加载一次，之后请求复用。
+浏览器打开 `http://<机器IP>:<port>/`。上传参考音频、输入文本、点生成。模型在启动时加载一次，之后请求复用。
 
 等价的直接调用：
 
@@ -103,8 +110,42 @@ python scripts/webui.py \
   --checkpoint "$T2S_CHECKPOINT" \
   --indextts-root "$INDEXTTS_ROOT" \
   --codec-dir "$CODEC_DIR" \
-  --host 0.0.0.0 --port 7860
+  --host 0.0.0.0 --port 7860 \
+  --t2s-replicas 2
 ```
+
+### 并行
+
+默认 `--t2s-replicas 2`：两份 AR 各走自己的 CUDA stream，vocoder 共享一把锁。
+s2mel 的 `setup_caches(max_batch_size=1)`，vocoder **必须**串行。
+`POST /api/tts` 用 `asyncio.to_thread`，输出文件名带 thread id，避免并发互相覆盖。
+
+L4 24G 上实测：串行 39.7 s / 并发 2 路 29.4 s，大约 **1.35×**，不是 2×（kernel 争用）。
+VRAM 大约 16 / 23 GiB。再加 replica 会 OOM。
+
+### REST
+
+这是 **speaker clone**：只要目标文本 + 参考音频，没有 prompt 文本（不是 paper 那种 continuation）。
+
+```
+GET  /api/health
+POST /api/tts
+POST /api/generate    # 别名
+```
+
+`POST` 用 `multipart/form-data`：
+
+| 字段 | 必填 | 默认 |
+|---|---|---|
+| `text` | 是 | |
+| `ref_audio` | 是 | 音频文件 |
+| `temperature` | | 0.5 |
+| `top_k` | | 8 |
+| `max_new_tokens` | | 1500 |
+| `repetition_penalty` | | 10.0 |
+| `seed` | | -1（随机） |
+
+成功返回 `audio/wav`，状态在 `X-TTS-Status`。
 
 ## 环境变量
 
@@ -117,6 +158,8 @@ python scripts/webui.py \
 | `T2S_DEVICE` | 否 | 默认 `cuda:0` |
 | `WEBUI_HOST` / `WEBUI_PORT` | 否 | 默认 `0.0.0.0:7860` |
 | `WEBUI_OUT_DIR` | 否 | 生成 wav 落盘目录 |
+| `T2S_REPLICAS` | 否 | AR 副本数，默认 2 |
+| `WEBUI_EXAMPLES_DIR` | 否 | Gradio 参考音频示例目录 |
 | `BIGVGAN_DIR` | 否 | 默认 `$CODEC_DIR/bigvgan` |
 | `W2V_BERT_PATH` | 否 | 默认 `$CODEC_DIR/w2v-bert-2.0` |
 | `STATS_PATH` | 否 | 默认 `$CODEC_DIR/wav2vec2bert_stats.pt` |
@@ -129,3 +172,23 @@ python scripts/webui.py \
 - `BigVGAN local files missing`：`bigvgan/config.json` 或 `bigvgan_generator.pt` 不在
 - `No module named indextts`：`INDEXTTS_ROOT` 不对，或没装那边的依赖
 - `gradio is not installed`：`pip install 'gradio>=4.0'` 或 `pip install -e ".[infer]"`
+
+## GCP L4 dest（asia-northeast3-a）
+
+听音盒，不是 prod SpeechService。
+
+| | |
+|---|---|
+| 实例 | `dev-noiz-speech-01`，`34.22.68.219:8080`，zone `asia-northeast3-a` |
+| SSH | `gcloud compute ssh dev-noiz-speech-01 --zone=asia-northeast3-a`（用户 `babysor00`） |
+| 仓库 | `/home/babysor00/t2s/text2semantic` |
+| 当前权重 | `/home/babysor00/t2s/checkpoint-step-32765`（另留 17450 / 21000 回滚） |
+| IndexTTS | `/home/babysor00/indextts-2.5/indextts-2.5` |
+| 环境 | `scripts/deploy/gcp-l4.webui.env.example` |
+| 启动 | `scripts/deploy/start_webui.sh`（pidfile；不要 `pkill -f webui.py`） |
+
+换权重：只拉推理文件到新目录，改 `T2S_CHECKPOINT`，再跑 `start_webui.sh`。
+这台机器没有 AWS CLI。从有凭证的盒子 presign 再 curl，或本机拉下来之后 `gcloud compute scp`。
+
+机器上现在的 `start_webui.sh` 仍用 `pkill -f`。仓库里的脚本改成了 pidfile，
+因为 `pkill -f` 的 pattern 如果也出现在 ssh `--command` 里会杀掉自己的远程壳。

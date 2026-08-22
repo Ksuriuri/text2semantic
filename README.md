@@ -30,7 +30,7 @@ uv pip install flash-attn --no-build-isolation
 
 参考音频 + 文本 → text2semantic AR → `EnhancedCodec.decode`（50 Hz）→ s2mel → BigVGAN。
 
-新机器部署、目录布局、环境变量见 [docs/inference-webui.md](docs/inference-webui.md)。
+新机器部署、目录布局、环境变量、REST API 见 [docs/inference-webui.md](docs/inference-webui.md)。
 
 ```bash
 # 命令行
@@ -111,6 +111,10 @@ GCS service account key 不要提交进仓库（`.gitignore` 已忽略
 `gcs-key.json` / `key.json`）。
 
 ## 全参数训练
+
+AWS 8 机 p5 Spot（FSx、一次拉满 8 台、supervisor）见
+[docs/aws-p5-spot-training.md](docs/aws-p5-spot-training.md)。
+多机 Spot 的网络和抢占看护见 [docs/multinode-spot-training.md](docs/multinode-spot-training.md)。
 
 先把预处理结果划分为互不重叠的训练集与验证集。训练脚本会自动加载项目根目录下
 被 Git 忽略的 `.env`，也可以通过环境变量覆盖其中的 W&B key：

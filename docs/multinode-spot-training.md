@@ -140,14 +140,17 @@ python3 scripts/spot_supervisor.py \
 按 scheme 选 `aws s3` 还是 `gcloud storage`），跨云镜像每半小时十几 GB 的出网费和
 延迟都在保存的关键路径上，不值得。
 
-## 还没验证的部分
+## GCP 还没验证的部分
 
 TCPX 的环境变量、5 网卡的 NCCL 路径和双机 all-reduce 带宽，都要等真机起来才能
 测。第一件事应该是 NCCL 的 all-reduce benchmark（不是直接开训）：如果跨机带宽
 掉到 gVNIC 的水平，s/step 会比单机 8 卡差，那么先修网络再谈训练吞吐。
 
-AWS 一侧同理，而且多一件事要量：`p5.48xlarge` 上 per-GPU batch 32 能不能装进 80 GB
-（B200 上实测 64.8 GiB），以及真实的 s/step。这两个数字现在都是推算，不是测量。
-跨机 all-reduce 之后应该 grep 一次 NCCL 的 `NET/OFI`（`NCCL_DEBUG=INFO`
+## AWS 已经跑过
+
+t2s-v1 在 8 × `p5.48xlarge` + FSx 上跑完一轮：batch 48，稳态约 3.3 s/step。
+FSx、一次拉满 8 台、launch template v8、结束时怎么放，见
+[aws-p5-spot-training.md](aws-p5-spot-training.md)。
+跨机 all-reduce 仍建议 grep 一次 NCCL 的 `NET/OFI`（`NCCL_DEBUG=INFO`
 `NCCL_DEBUG_SUBSYS=INIT,NET`）确认插件真的被加载了 —— 上面三道检查能证明插件文件
 和 EFA 设备都在，但不能证明 NCCL 选了它。
