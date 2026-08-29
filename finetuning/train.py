@@ -1532,6 +1532,9 @@ def train():
                 )
             )
 
+    # A short finetune can finish before the first time-gated checkpoint. Keep
+    # track of what is already durable so the exact terminal step can be saved.
+    last_saved_step = global_step
     preemption = PreemptionFlag().install()
     policy = CheckpointPolicy(
         rolling_steps=args.checkpointing_steps,
@@ -1643,6 +1646,7 @@ def train():
                     # After the upload, so a save that only made it to local
                     # disk is not counted as one that survives the machine.
                     policy.record_save()
+                    last_saved_step = global_step
                     if action == ACTION_ROLLING and accelerator.is_main_process:
                         # Persistent checkpoints use their own prefix and are
                         # never rotated.
@@ -1691,6 +1695,35 @@ def train():
             args.max_ref_seconds,
             global_step,
         )
+    if not stopping and global_step > last_saved_step:
+        checkpoint_dir = os.path.join(
+            args.output_model_path,
+            checkpoint_dir_name(ACTION_ROLLING, global_step),
+        )
+        save_checkpoint(
+            accelerator,
+            model,
+            tokenizer,
+            checkpoint_dir,
+            epoch=epoch,
+            step_in_epoch=0,
+            global_step=global_step,
+        )
+        mirror_checkpoint(
+            accelerator,
+            checkpoint_dir,
+            args.checkpoint_remote_dir,
+            log=accelerator.print,
+        )
+        if accelerator.is_main_process:
+            rotate_checkpoints(args.output_model_path, args.checkpoint_total_limit)
+            if args.checkpoint_remote_dir:
+                checkpoint_remote.rotate(
+                    args.checkpoint_remote_dir,
+                    args.checkpoint_total_limit,
+                )
+        accelerator.wait_for_everyone()
+        accelerator.print(f"Final checkpoint saved at step {global_step}")
     accelerator.end_training()
 
 

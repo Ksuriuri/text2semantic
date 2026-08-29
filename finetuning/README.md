@@ -195,7 +195,9 @@ save. The step multiple sets the granularity, the interval sets the rate; only
 the latest `--checkpoint_total_limit` (default 2) are kept. Every
 `--keep_checkpointing_steps` (default 5000) steps a `checkpoint-keep-step-*` is
 saved instead, and those are never rotated. A `SIGTERM` or `SIGUSR1` forces one
-last checkpoint off schedule and then stops the run cleanly.
+last checkpoint off schedule and then stops the run cleanly. A normally
+completed run also saves its exact terminal step even when it falls between
+rolling intervals; this matters for short finetunes shorter than the time gate.
 
 On preemptible hardware add `--checkpoint_remote_dir gs://bucket/prefix`. Each
 save is then mirrored to object storage, every node uploading the files it
