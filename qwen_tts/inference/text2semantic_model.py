@@ -8,6 +8,10 @@ from transformers import AutoTokenizer
 
 from ..core.models.modeling_text2semantic import Text2SemanticForCausalLM
 from ..semantic_codec import MaskGCTFeatureExtractor
+from ..text_conditioning import (
+    condition_inference_text,
+    validate_conditioning_tokens,
+)
 from ..text_template import tokenize_tts_prompt
 
 
@@ -59,8 +63,32 @@ class Text2SemanticModel:
         )
 
     @torch.inference_mode()
-    def generate(self, text, ref_audio, **generation_kwargs):
+    def generate(
+        self,
+        text,
+        ref_audio,
+        *,
+        language=None,
+        emotion=None,
+        **generation_kwargs,
+    ):
         texts = [text] if isinstance(text, str) else list(text)
+        def controls(value, name):
+            if value is None or isinstance(value, str):
+                return [value] * len(texts)
+            values = list(value)
+            if len(values) != len(texts):
+                raise ValueError(f"{name} must be scalar or align with text batch")
+            return values
+
+        languages = controls(language, "language")
+        emotions = controls(emotion, "emotion")
+        if any(value is not None for value in languages + emotions):
+            validate_conditioning_tokens(self.tokenizer)
+        texts = [
+            condition_inference_text(value, language=lang, emotion=emo)
+            for value, lang, emo in zip(texts, languages, emotions)
+        ]
         if isinstance(ref_audio, (str, Path)):
             ref_audios = [str(ref_audio)] * len(texts)
         else:
@@ -105,4 +133,3 @@ class Text2SemanticModel:
             speaker_feature_lengths=speaker_feature_lengths,
             **generation_kwargs,
         )
-

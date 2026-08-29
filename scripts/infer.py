@@ -375,6 +375,15 @@ def parse_args(argv=None):
     p.add_argument("--checkpoint", help="text2semantic HF checkpoint dir (not needed with --codes-npy)")
     p.add_argument("--ref-audio", required=True, help="reference wav used as speaker prompt")
     p.add_argument("--text", help="target text (required unless --codes-npy)")
+    p.add_argument(
+        "--language",
+        choices=("ar", "de", "en", "es", "fr", "ja", "ko", "pt", "ru", "zh"),
+        help="Optional atomic language control placed before the text.",
+    )
+    p.add_argument(
+        "--emotion",
+        help="Optional freeform affect/event control wrapped in emo boundary tokens.",
+    )
     p.add_argument("--out", required=True, help="output wav path")
     p.add_argument("--codes-npy", help="skip AR generation and vocode these 25 Hz ids")
     p.add_argument("--save-codes", help="optional .npy path for the generated 25 Hz ids")
@@ -425,6 +434,8 @@ def main(argv=None) -> int:
             t2s,
             args.text,
             args.ref_audio,
+            language=args.language,
+            emotion=args.emotion,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_k=args.top_k,

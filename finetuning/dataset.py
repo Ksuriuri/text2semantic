@@ -38,6 +38,7 @@ class Text2SemanticDataset(Dataset):
         speaker_mel_extractor=None,
         punctuation_dropout_prob=0.0,
         punctuation_dropout_keep_word_spaces=True,
+        text_conditioner=None,
         seed=42,
     ):
         # A prefiltered source (finetuning.manifest_index.ManifestIndex) has
@@ -94,6 +95,7 @@ class Text2SemanticDataset(Dataset):
         self.punctuation_dropout_keep_word_spaces = (
             punctuation_dropout_keep_word_spaces
         )
+        self.text_conditioner = text_conditioner
         self.seed = seed
         # A row whose ref cannot be read is replaced by another row, this many
         # tries before giving up. Eight is generous for a lost shard and still
@@ -186,7 +188,7 @@ class Text2SemanticDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
-    def _augmented_text(self, item):
+    def _augmented_text(self, item, index=None):
         """The sample's text, sometimes with every written pause cue removed.
 
         The draw happens per read rather than per row, so over epochs the model
@@ -195,17 +197,23 @@ class Text2SemanticDataset(Dataset):
         from the base seed, so a run stays reproducible.
         """
         text = item["text"]
-        if self.punctuation_dropout_prob <= 0.0:
+        if (
+            self.punctuation_dropout_prob > 0.0
+            and random.random() < self.punctuation_dropout_prob
+        ):
+            stripped = strip_pause_marks(
+                text,
+                keep_word_spaces=self.punctuation_dropout_keep_word_spaces,
+            )
+            # A transcript that is nothing but punctuation strips down to
+            # nothing and would raise inside _tokenize_text; keep the original.
+            if stripped.strip():
+                text = stripped
+        if self.text_conditioner is None:
             return text
-        if random.random() >= self.punctuation_dropout_prob:
-            return text
-        stripped = strip_pause_marks(
-            text,
-            keep_word_spaces=self.punctuation_dropout_keep_word_spaces,
-        )
-        # A transcript that is nothing but punctuation strips down to nothing and
-        # would raise inside _tokenize_text; keep the original text instead.
-        return stripped if stripped.strip() else text
+        conditioned = dict(item)
+        conditioned["text"] = text
+        return self.text_conditioner(conditioned, index=index)
 
     def _tokenize_text(self, text):
         ids = tokenize_tts_prompt(self.tokenizer, text)
@@ -281,7 +289,9 @@ class Text2SemanticDataset(Dataset):
                 f"semantic_codes must be in [0, {self.semantic_vocab_size - 1}]."
             )
         return {
-            "text_input_ids": self._tokenize_text(self._augmented_text(item)),
+            "text_input_ids": self._tokenize_text(
+                self._augmented_text(item, index=index)
+            ),
             "speech_input_ids": torch.cat(
                 (torch.tensor([self.speech_bos_token_id]), codes)
             ),

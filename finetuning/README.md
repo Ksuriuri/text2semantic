@@ -74,6 +74,38 @@ uv run accelerate launch finetuning/train.py \
   --gradient_accumulation_steps 4
 ```
 
+To start a fresh finetune from a complete Text2Semantic checkpoint, pass
+`--init_model_path /path/to/checkpoint`. This restores the trained model and its
+tokenizer but intentionally starts a new optimizer, learning-rate schedule,
+dataloader position, and W&B run. Use `--resume_from_checkpoint` only to resume
+an interrupted run with its accelerator state.
+
+Language and affect controls are enabled at loader time, so the original
+manifest text stays unchanged:
+
+```bash
+uv run accelerate launch finetuning/train.py \
+  --init_model_path /path/to/text2semantic-checkpoint \
+  --base_model_path Qwen/Qwen3.5-2B-Base \
+  --w2v_bert_path /path/to/w2v-bert-2.0 \
+  --stats_path /path/to/wav2vec2bert_stats.pt \
+  --train_jsonl /path/to/manifests/train.jsonl \
+  --eval_jsonl /path/to/manifests/eval.jsonl \
+  --output_model_path output-affect \
+  --language_tag_prob 0.6 \
+  --emotion_conditioning \
+  --emotion_synonyms /path/to/emotion_synonyms.v3.json \
+  --emotion_synonym_prob 0.7 \
+  --num_epochs 1
+```
+
+This adds one atomic token per supported language plus the two emotion boundary
+tokens. Training redraws the optional language tag and emotion synonyms on each
+read. Evaluation keeps a stable language-tag draw and disables synonym
+augmentation. Checkpoints save the expanded tokenizer alongside the resized
+text embedding, and inference accepts explicit `language` and `emotion`
+controls.
+
 Run length comes from exactly one of `--num_epochs` or `--max_train_steps`;
 passing neither is an error. Warmup and the cosine decay are sized off whichever
 is given, so `--num_epochs 1` keeps the schedule matched to the manifest as the

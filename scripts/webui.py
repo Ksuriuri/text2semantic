@@ -91,6 +91,8 @@ class InferenceApp:
         max_new_tokens: int = 1500,
         repetition_penalty: float = 10.0,
         seed: int = -1,
+        language: str | None = None,
+        emotion: str | None = None,
     ):
         text = (text or "").strip()
         if not text:
@@ -118,6 +120,8 @@ class InferenceApp:
                         t2s,
                         text,
                         ref_path,
+                        language=language or None,
+                        emotion=(emotion or "").strip() or None,
                         max_new_tokens=int(max_new_tokens),
                         temperature=float(temperature),
                         top_k=int(top_k),
@@ -129,6 +133,8 @@ class InferenceApp:
                     t2s,
                     text,
                     ref_path,
+                    language=language or None,
+                    emotion=(emotion or "").strip() or None,
                     max_new_tokens=int(max_new_tokens),
                     temperature=float(temperature),
                     top_k=int(top_k),
@@ -246,6 +252,15 @@ def build_ui(app: InferenceApp):
             with gr.Column():
                 text = gr.Textbox(label="文本", lines=4, placeholder="输入要合成的句子")
                 ref = gr.Audio(label="参考音频", type="filepath")
+                language = gr.Dropdown(
+                    choices=["", "ar", "de", "en", "es", "fr", "ja", "ko", "pt", "ru", "zh"],
+                    value="",
+                    label="语言控制（空 = 不加标签）",
+                )
+                emotion = gr.Textbox(
+                    label="情绪 / 气声控制（空 = 不加标签）",
+                    placeholder="例如：平静而略带好奇；轻轻叹气",
+                )
                 with gr.Accordion("生成参数", open=False):
                     temperature = gr.Slider(0.1, 1.5, value=0.5, step=0.05, label="temperature")
                     top_k = gr.Slider(1, 200, value=8, step=1, label="top_k")
@@ -258,7 +273,10 @@ def build_ui(app: InferenceApp):
                 status = gr.Textbox(label="状态", lines=3)
         btn.click(
             fn=app.generate,
-            inputs=[text, ref, temperature, top_k, max_new_tokens, repetition_penalty, seed],
+            inputs=[
+                text, ref, temperature, top_k, max_new_tokens,
+                repetition_penalty, seed, language, emotion,
+            ],
             outputs=[audio_out, status],
         )
         with gr.Row():
@@ -320,6 +338,8 @@ def create_app(app: InferenceApp) -> FastAPI:
         max_new_tokens: int = Form(1500, description="最大 token 数，默认 1500"),
         repetition_penalty: float = Form(10.0, description="重复惩罚，默认 10.0"),
         seed: int = Form(-1, description="随机种子，默认 -1 随机"),
+        language: str | None = Form(None, description="可选语言控制码"),
+        emotion: str | None = Form(None, description="可选情绪/气声描述"),
     ):
         text = (text or "").strip()
         if not text:
@@ -341,6 +361,8 @@ def create_app(app: InferenceApp) -> FastAPI:
                 max_new_tokens,
                 repetition_penalty,
                 seed,
+                language,
+                emotion,
             )
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))

@@ -97,6 +97,33 @@ def test_parse_args_defaults_match_dataset_limits(monkeypatch):
     assert args.punctuation_dropout_prob == 0.1
     assert args.punctuation_dropout_keep_word_spaces is True
     assert args.speaker_encoder_dtype == "bfloat16"
+    assert args.init_model_path is None
+    assert args.language_tag_prob == 0.0
+    assert args.emotion_conditioning is False
+
+
+def test_parse_args_accepts_fresh_finetune_checkpoint_and_controls(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        _run_length_argv(
+            "--num_epochs",
+            "1",
+            "--init_model_path",
+            "checkpoint-step-32765",
+            "--language_tag_prob",
+            "0.6",
+            "--emotion_conditioning",
+            "--emotion_synonyms",
+            "emotion.v3.json",
+            "--emotion_synonym_prob",
+            "0.7",
+        ),
+    )
+    args = parse_args()
+    assert args.init_model_path == "checkpoint-step-32765"
+    assert args.language_tag_prob == pytest.approx(0.6)
+    assert args.emotion_conditioning is True
+    assert args.emotion_synonyms == "emotion.v3.json"
 
 
 def _run_length_argv(*extra):

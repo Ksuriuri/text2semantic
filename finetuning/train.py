@@ -40,6 +40,12 @@ from qwen_tts.semantic_codec import (
     FLOAT_DTYPES,
     MaskGCTFeatureExtractor,
 )
+from qwen_tts.text_conditioning import (
+    TextConditioner,
+    add_conditioning_tokens,
+    load_synonym_table,
+    resize_text_embeddings,
+)
 
 
 WANDB_PROJECT = "text2semantic"
@@ -59,6 +65,16 @@ def parse_args():
     parser.add_argument(
         "--base_model_path",
         default="Qwen/Qwen3.5-2B-Base",
+    )
+    parser.add_argument(
+        "--init_model_path",
+        default=None,
+        help=(
+            "Optional Text2Semantic checkpoint used as the initial model for "
+            "a new finetune. Unlike --resume_from_checkpoint, this loads only "
+            "model/tokenizer weights and starts a fresh optimizer, schedule, "
+            "dataloader position, and W&B run."
+        ),
     )
     parser.add_argument("--output_model_path", default="output")
     parser.add_argument("--train_jsonl", required=True)
@@ -243,6 +259,42 @@ def parse_args():
             "spaces as well."
         ),
     )
+    parser.add_argument(
+        "--language_tag_prob",
+        type=float,
+        default=0.0,
+        help=(
+            "Probability that a training/eval row gets its atomic language "
+            "token (for example <|lang_ja|>) at the start of the user text. "
+            "Training redraws per read; eval uses a stable row-id draw."
+        ),
+    )
+    parser.add_argument(
+        "--emotion_conditioning",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Wrap emotion/event descriptions in <|emo_start|> and "
+            "<|emo_end|> for rows whose manifest has an emotion field."
+        ),
+    )
+    parser.add_argument(
+        "--emotion_synonyms",
+        default=None,
+        help="Path to the version-3 emotion synonym JSON table.",
+    )
+    parser.add_argument(
+        "--emotion_synonym_prob",
+        type=float,
+        default=0.7,
+        help="Per-description-span/event synonym probability; train only.",
+    )
+    parser.add_argument(
+        "--emotion_max_replacements",
+        type=int,
+        default=2,
+        help="Maximum span replacements inside one freeform description.",
+    )
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--eval_steps", type=int, default=1000)
@@ -396,6 +448,21 @@ def parse_args():
         parser.error("--refs_per_speaker must be >= 0 (0 = all packed refs).")
     if not 0 <= args.punctuation_dropout_prob <= 1:
         parser.error("--punctuation_dropout_prob must be in [0, 1].")
+    if not 0 <= args.language_tag_prob <= 1:
+        parser.error("--language_tag_prob must be in [0, 1].")
+    if not 0 <= args.emotion_synonym_prob <= 1:
+        parser.error("--emotion_synonym_prob must be in [0, 1].")
+    if args.emotion_max_replacements < 0:
+        parser.error("--emotion_max_replacements must be non-negative.")
+    if (
+        args.emotion_conditioning
+        and args.emotion_synonym_prob > 0
+        and not args.emotion_synonyms
+    ):
+        parser.error(
+            "--emotion_synonyms is required when emotion conditioning uses "
+            "a non-zero synonym probability."
+        )
     return args
 
 
@@ -623,6 +690,7 @@ def build_dataset(
     speaker_audio_paths,
     *,
     punctuation_dropout_prob=0.0,
+    text_conditioner=None,
     ref_store=None,
     speaker_mel_extractor=None,
 ):
@@ -647,6 +715,7 @@ def build_dataset(
         punctuation_dropout_keep_word_spaces=(
             args.punctuation_dropout_keep_word_spaces
         ),
+        text_conditioner=text_conditioner,
         seed=args.seed,
     )
 
@@ -1171,14 +1240,34 @@ def train():
         else None
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model_path)
+    tokenizer_path = args.init_model_path or args.base_model_path
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = Text2SemanticForCausalLM.from_qwen_pretrained(
-        args.base_model_path,
-        dtype=torch.bfloat16,
-        attn_implementation=args.attn_implementation,
-    )
+    conditioning_enabled = args.language_tag_prob > 0 or args.emotion_conditioning
+    if conditioning_enabled:
+        added_tokens = add_conditioning_tokens(tokenizer)
+    else:
+        added_tokens = 0
+    if args.init_model_path:
+        model = Text2SemanticForCausalLM.from_pretrained(
+            args.init_model_path,
+            dtype=torch.bfloat16,
+            attn_implementation=args.attn_implementation,
+        )
+    else:
+        model = Text2SemanticForCausalLM.from_qwen_pretrained(
+            args.base_model_path,
+            dtype=torch.bfloat16,
+            attn_implementation=args.attn_implementation,
+        )
+    resized_tokens = resize_text_embeddings(model, tokenizer)
+    if added_tokens != max(0, resized_tokens):
+        accelerator.print(
+            "Conditioning tokenizer/model size delta differs because the base "
+            f"tokenizer already carried added tokens: tokenizer={added_tokens}, "
+            f"embedding={resized_tokens}."
+        )
     model.requires_grad_(True)
     check_fused_linear_attention(
         model, args.require_fused_linear_attention, log=accelerator.print
@@ -1230,6 +1319,30 @@ def train():
         f"Manifest index: train {len(train_data):,} rows "
         f"({train_data.index_dir}), eval {len(eval_data):,} rows"
     )
+    synonym_table = load_synonym_table(args.emotion_synonyms)
+    train_conditioner = None
+    eval_conditioner = None
+    if conditioning_enabled:
+        train_conditioner = TextConditioner(
+            language_tag_prob=args.language_tag_prob,
+            emotion_conditioning=args.emotion_conditioning,
+            emotion_synonym_prob=args.emotion_synonym_prob,
+            emotion_max_replacements=args.emotion_max_replacements,
+            synonym_table=synonym_table,
+            deterministic=False,
+            seed=args.seed,
+        )
+        # Eval follows the same 60/40 language-tag distribution, but the draw is
+        # stable by row id and synonym augmentation is off.
+        eval_conditioner = TextConditioner(
+            language_tag_prob=args.language_tag_prob,
+            emotion_conditioning=args.emotion_conditioning,
+            emotion_synonym_prob=0.0,
+            emotion_max_replacements=0,
+            synonym_table=synonym_table,
+            deterministic=True,
+            seed=args.seed,
+        )
     train_dataset = build_dataset(
         train_data,
         tokenizer,
@@ -1238,6 +1351,7 @@ def train():
         None,
         None,
         punctuation_dropout_prob=args.punctuation_dropout_prob,
+        text_conditioner=train_conditioner,
         ref_store=ref_store,
         speaker_mel_extractor=speaker_mel_extractor,
     )
@@ -1250,6 +1364,7 @@ def train():
         args,
         None,
         None,
+        text_conditioner=eval_conditioner,
         ref_store=ref_store,
         speaker_mel_extractor=speaker_mel_extractor,
     )
@@ -1262,6 +1377,12 @@ def train():
         "Punctuation dropout (train split only): p="
         f"{args.punctuation_dropout_prob}, keep_word_spaces="
         f"{args.punctuation_dropout_keep_word_spaces}"
+    )
+    accelerator.print(
+        "Text conditioning: language_tag_prob="
+        f"{args.language_tag_prob}, emotion={args.emotion_conditioning}, "
+        f"train_synonym_prob={args.emotion_synonym_prob if args.emotion_conditioning else 0}, "
+        "eval_synonym_prob=0"
     )
     train_generator = torch.Generator()
     train_generator.manual_seed(args.seed)
