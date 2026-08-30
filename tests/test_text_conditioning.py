@@ -129,14 +129,22 @@ def test_inference_converts_inline_brackets_and_auto_language_is_noop():
         "你好，[轻轻叹气]再试一次。[breathing]",
         language="auto",
     ) == (
-        "你好，<|emo_start|>轻轻叹气<|emo_end|>再试一次。"
-        "<|emo_start|>breathing<|emo_end|>"
+        "<|emo_start|>轻轻叹气; breathing<|emo_end|>你好，再试一次。"
     )
     assert condition_inference_text("[ 平静 ]hello", language="zh") == (
         "<|lang_zh|><|emo_start|>平静<|emo_end|>hello"
     )
     assert condition_inference_text("literal [] and [ ] stay") == (
         "literal [] and [ ] stay"
+    )
+
+
+def test_inline_emotion_is_hoisted_without_dropping_preceding_text():
+    assert condition_inference_text(
+        "The weather is lovely today. [sighing]Shall we take a walk?"
+    ) == (
+        "<|emo_start|>sighing<|emo_end|>"
+        "The weather is lovely today. Shall we take a walk?"
     )
 
 

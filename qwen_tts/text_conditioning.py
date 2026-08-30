@@ -283,22 +283,27 @@ class TextConditioner:
         return prefix + text
 
 
-def _replace_inline_emotions(text):
-    """Turn ``[affect]`` cues into model control spans in place."""
+def _extract_inline_emotions(text):
+    """Remove ``[affect]`` cues from speech and return their control values."""
+
+    values = []
 
     def replace(match):
         value = match.group(1).strip()
         if not value:
             return match.group(0)
-        return f"{EMOTION_START_TOKEN}{value}{EMOTION_END_TOKEN}"
+        values.append(value)
+        return ""
 
-    return INLINE_EMOTION_RE.sub(replace, text)
+    cleaned = INLINE_EMOTION_RE.sub(replace, text)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+    return cleaned, values
 
 
 def condition_inference_text(text, *, language=None, emotion=None):
     if not isinstance(text, str) or not text:
         raise ValueError("text must be a non-empty string")
-    text = _replace_inline_emotions(text)
+    text, inline_emotions = _extract_inline_emotions(text)
     prefix = ""
     if language is not None:
         language = str(language).strip().lower()
@@ -308,9 +313,14 @@ def condition_inference_text(text, *, language=None, emotion=None):
             )
         if language and language != "auto":
             prefix += LANGUAGE_TOKENS[language]
+    emotions = list(inline_emotions)
     if emotion is not None:
         emotion = str(emotion).strip()
         if not emotion:
             raise ValueError("emotion must be non-empty when provided")
-        prefix += f"{EMOTION_START_TOKEN}{emotion}{EMOTION_END_TOKEN}"
+        emotions.append(emotion)
+    if emotions:
+        prefix += (
+            f"{EMOTION_START_TOKEN}{'; '.join(emotions)}{EMOTION_END_TOKEN}"
+        )
     return prefix + text

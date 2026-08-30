@@ -250,16 +250,16 @@ def build_ui(app: InferenceApp):
         )
         with gr.Row():
             with gr.Column():
-                text = gr.Textbox(label="文本", lines=4, placeholder="输入要合成的句子")
+                text = gr.Textbox(
+                    label="文本",
+                    lines=4,
+                    placeholder="输入句子；用 [sighing] 这类方括号插入情绪/气声控制",
+                )
                 ref = gr.Audio(label="参考音频", type="filepath")
                 language = gr.Dropdown(
                     choices=["auto", "ar", "de", "en", "es", "fr", "ja", "ko", "pt", "ru", "zh"],
                     value="auto",
                     label="语言控制（auto = 不加标签）",
-                )
-                emotion = gr.Textbox(
-                    label="情绪 / 气声控制（空 = 不加标签）",
-                    placeholder="例如：平静而略带好奇；轻轻叹气",
                 )
                 with gr.Accordion("生成参数", open=False):
                     temperature = gr.Slider(0.1, 1.5, value=0.5, step=0.05, label="temperature")
@@ -275,7 +275,7 @@ def build_ui(app: InferenceApp):
             fn=app.generate,
             inputs=[
                 text, ref, temperature, top_k, max_new_tokens,
-                repetition_penalty, seed, language, emotion,
+                repetition_penalty, seed, language,
             ],
             outputs=[audio_out, status],
         )
