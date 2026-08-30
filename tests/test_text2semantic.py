@@ -464,6 +464,26 @@ def test_generation_never_emits_pad_token():
     assert generated[0].numel() == 0
 
 
+def test_generation_accepts_repetition_penalty():
+    model = tiny_model()
+
+    class EosHead(nn.Module):
+        def forward(self, hidden):
+            logits = torch.full((*hidden.shape[:-1], 19), -100.0)
+            logits[..., 17] = 100.0
+            return logits
+
+    model.speech_head = EosHead()
+    generated = model.generate_semantic(
+        torch.tensor([[2, 3]]),
+        max_new_tokens=5,
+        repetition_penalty=10.0,
+        do_sample=False,
+        **speaker_inputs(),
+    )
+    assert generated[0].numel() == 0
+
+
 def test_checkpoint_round_trip(tmp_path):
     model = tiny_model()
     model.save_pretrained(tmp_path, safe_serialization=True)

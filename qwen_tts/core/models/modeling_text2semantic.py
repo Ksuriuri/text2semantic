@@ -543,6 +543,7 @@ class Text2SemanticForCausalLM(PreTrainedModel):
         max_new_tokens=1500,
         temperature=1.0,
         top_k=0,
+        repetition_penalty=1.0,
         do_sample=True,
     ):
         """Generate semantic codec indices, excluding BOS and EOS."""
@@ -550,6 +551,8 @@ class Text2SemanticForCausalLM(PreTrainedModel):
             raise ValueError("max_new_tokens must be positive.")
         if temperature <= 0:
             raise ValueError("temperature must be positive.")
+        if repetition_penalty < 1.0:
+            raise ValueError("repetition_penalty must be at least 1.0.")
         if text_attention_mask is None:
             text_attention_mask = torch.ones_like(text_input_ids)
 
@@ -585,6 +588,14 @@ class Text2SemanticForCausalLM(PreTrainedModel):
             # BOS/PAD are input-only control tokens and must never be emitted.
             next_logits[:, self.config.speech_bos_token_id] = -torch.inf
             next_logits[:, self.config.speech_pad_token_id] = -torch.inf
+            if repetition_penalty != 1.0:
+                repeated_logits = torch.gather(next_logits, 1, generated)
+                repeated_logits = torch.where(
+                    repeated_logits < 0,
+                    repeated_logits * repetition_penalty,
+                    repeated_logits / repetition_penalty,
+                )
+                next_logits.scatter_(1, generated, repeated_logits)
             if top_k > 0:
                 k = min(top_k, next_logits.size(-1))
                 threshold = torch.topk(next_logits, k, dim=-1).values[:, -1:]
@@ -632,4 +643,3 @@ class Text2SemanticForCausalLM(PreTrainedModel):
             end = int(eos[0]) if eos.numel() else sequence.numel()
             results.append(sequence[:end])
         return results
-
