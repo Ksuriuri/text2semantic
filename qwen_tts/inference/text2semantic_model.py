@@ -9,6 +9,7 @@ from transformers import AutoTokenizer
 from ..core.models.modeling_text2semantic import Text2SemanticForCausalLM
 from ..semantic_codec import MaskGCTFeatureExtractor
 from ..text_conditioning import (
+    CONDITIONING_SPECIAL_TOKENS,
     condition_inference_text,
     validate_conditioning_tokens,
 )
@@ -83,12 +84,16 @@ class Text2SemanticModel:
 
         languages = controls(language, "language")
         emotions = controls(emotion, "emotion")
-        if any(value is not None for value in languages + emotions):
-            validate_conditioning_tokens(self.tokenizer)
         texts = [
             condition_inference_text(value, language=lang, emotion=emo)
             for value, lang, emo in zip(texts, languages, emotions)
         ]
+        if any(
+            token in value
+            for value in texts
+            for token in CONDITIONING_SPECIAL_TOKENS
+        ):
+            validate_conditioning_tokens(self.tokenizer)
         if isinstance(ref_audio, (str, Path)):
             ref_audios = [str(ref_audio)] * len(texts)
         else:

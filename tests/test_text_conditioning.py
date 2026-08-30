@@ -124,6 +124,22 @@ def test_inference_controls_are_explicit_and_validated():
         condition_inference_text("hello", emotion="  ")
 
 
+def test_inference_converts_inline_brackets_and_auto_language_is_noop():
+    assert condition_inference_text(
+        "你好，[轻轻叹气]再试一次。[breathing]",
+        language="auto",
+    ) == (
+        "你好，<|emo_start|>轻轻叹气<|emo_end|>再试一次。"
+        "<|emo_start|>breathing<|emo_end|>"
+    )
+    assert condition_inference_text("[ 平静 ]hello", language="zh") == (
+        "<|lang_zh|><|emo_start|>平静<|emo_end|>hello"
+    )
+    assert condition_inference_text("literal [] and [ ] stay") == (
+        "literal [] and [ ] stay"
+    )
+
+
 class TinyTokenizer:
     def __init__(self, size=32):
         self.tokens = {f"tok-{i}": i for i in range(size)}

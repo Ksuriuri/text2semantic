@@ -253,9 +253,9 @@ def build_ui(app: InferenceApp):
                 text = gr.Textbox(label="文本", lines=4, placeholder="输入要合成的句子")
                 ref = gr.Audio(label="参考音频", type="filepath")
                 language = gr.Dropdown(
-                    choices=["", "ar", "de", "en", "es", "fr", "ja", "ko", "pt", "ru", "zh"],
-                    value="",
-                    label="语言控制（空 = 不加标签）",
+                    choices=["auto", "ar", "de", "en", "es", "fr", "ja", "ko", "pt", "ru", "zh"],
+                    value="auto",
+                    label="语言控制（auto = 不加标签）",
                 )
                 emotion = gr.Textbox(
                     label="情绪 / 气声控制（空 = 不加标签）",

@@ -21,6 +21,7 @@ LANGUAGES = ("ar", "de", "en", "es", "fr", "ja", "ko", "pt", "ru", "zh")
 LANGUAGE_TOKENS = {language: f"<|lang_{language}|>" for language in LANGUAGES}
 EMOTION_START_TOKEN = "<|emo_start|>"
 EMOTION_END_TOKEN = "<|emo_end|>"
+INLINE_EMOTION_RE = re.compile(r"\[([^\[\]\r\n]+)\]")
 CONDITIONING_SPECIAL_TOKENS = (
     *LANGUAGE_TOKENS.values(),
     EMOTION_START_TOKEN,
@@ -282,17 +283,31 @@ class TextConditioner:
         return prefix + text
 
 
+def _replace_inline_emotions(text):
+    """Turn ``[affect]`` cues into model control spans in place."""
+
+    def replace(match):
+        value = match.group(1).strip()
+        if not value:
+            return match.group(0)
+        return f"{EMOTION_START_TOKEN}{value}{EMOTION_END_TOKEN}"
+
+    return INLINE_EMOTION_RE.sub(replace, text)
+
+
 def condition_inference_text(text, *, language=None, emotion=None):
     if not isinstance(text, str) or not text:
         raise ValueError("text must be a non-empty string")
+    text = _replace_inline_emotions(text)
     prefix = ""
     if language is not None:
-        language = str(language).lower()
-        if language not in LANGUAGE_TOKENS:
+        language = str(language).strip().lower()
+        if language and language != "auto" and language not in LANGUAGE_TOKENS:
             raise ValueError(
                 f"language must be one of {', '.join(LANGUAGES)}, got {language!r}"
             )
-        prefix += LANGUAGE_TOKENS[language]
+        if language and language != "auto":
+            prefix += LANGUAGE_TOKENS[language]
     if emotion is not None:
         emotion = str(emotion).strip()
         if not emotion:

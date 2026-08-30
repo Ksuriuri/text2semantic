@@ -377,8 +377,9 @@ def parse_args(argv=None):
     p.add_argument("--text", help="target text (required unless --codes-npy)")
     p.add_argument(
         "--language",
-        choices=("ar", "de", "en", "es", "fr", "ja", "ko", "pt", "ru", "zh"),
-        help="Optional atomic language control placed before the text.",
+        choices=("auto", "ar", "de", "en", "es", "fr", "ja", "ko", "pt", "ru", "zh"),
+        default="auto",
+        help="Language control placed before the text; auto adds no language tag.",
     )
     p.add_argument(
         "--emotion",
