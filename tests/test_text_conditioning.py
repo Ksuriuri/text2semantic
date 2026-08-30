@@ -62,7 +62,8 @@ def test_conditioner_adds_atomic_language_and_fish_event_without_speaking_bracke
         deterministic=True,
     )
     assert conditioner(item) == (
-        "<|lang_en|><|emo_start|>laughter<|emo_end|>Hello world."
+        "<|lang_en|><|emo_start|>laughter<|emo_end|> Hello  "
+        "<|emo_start|>laughter<|emo_end|> world."
     )
 
 
@@ -80,8 +81,28 @@ def test_fish_surface_tag_uses_canonical_event_synonyms():
         deterministic=True,
     )
     value = conditioner(item)
-    assert value.startswith("<|emo_start|>a light laugh<|emo_end|>")
+    assert value == (
+        "I tried. <|emo_start|>a light laugh<|emo_end|> It did not work."
+    )
     assert "[stifled laugh]" not in value
+
+
+def test_multiple_fish_tags_keep_their_original_order_and_positions():
+    item = {
+        "id": "fish-3",
+        "text": "A. [giggle] B. [sighing] C.",
+        "language": "en",
+        "emotion": {"tags": ["giggle", "sighing"], "events": []},
+    }
+    conditioner = TextConditioner(
+        emotion_conditioning=True,
+        emotion_synonym_prob=0.0,
+        synonym_table=TABLE,
+    )
+    assert conditioner(item) == (
+        "A. <|emo_start|>laughter<|emo_end|> B. "
+        "<|emo_start|>sighing<|emo_end|> C."
+    )
 
 
 def test_description_longest_match_respects_replacement_cap_and_target_language():
@@ -129,7 +150,8 @@ def test_inference_converts_inline_brackets_and_auto_language_is_noop():
         "你好，[轻轻叹气]再试一次。[breathing]",
         language="auto",
     ) == (
-        "<|emo_start|>轻轻叹气; breathing<|emo_end|>你好，再试一次。"
+        "你好，<|emo_start|>轻轻叹气<|emo_end|>再试一次。"
+        "<|emo_start|>breathing<|emo_end|>"
     )
     assert condition_inference_text("[ 平静 ]hello", language="zh") == (
         "<|lang_zh|><|emo_start|>平静<|emo_end|>hello"
@@ -139,12 +161,12 @@ def test_inference_converts_inline_brackets_and_auto_language_is_noop():
     )
 
 
-def test_inline_emotion_is_hoisted_without_dropping_preceding_text():
+def test_inline_emotion_stays_at_its_original_position():
     assert condition_inference_text(
         "The weather is lovely today. [sighing]Shall we take a walk?"
     ) == (
-        "<|emo_start|>sighing<|emo_end|>"
-        "The weather is lovely today. Shall we take a walk?"
+        "The weather is lovely today. "
+        "<|emo_start|>sighing<|emo_end|>Shall we take a walk?"
     )
 
 

@@ -186,6 +186,26 @@ def _strip_fish_tags(text, tags):
     return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
 
 
+def _condition_fish_tags(text, tags, language, table, rng, replace_prob):
+    """Replace Fish surface cues with control spans at their true positions."""
+    conditioned = text
+    for tag in tags:
+        pattern = re.compile(r"\[\s*" + re.escape(str(tag)) + r"\s*\]", re.I)
+
+        def replace(_match, value=tag):
+            surface = _event_surface(
+                value,
+                language,
+                table,
+                rng,
+                replace_prob,
+            )
+            return f"{EMOTION_START_TOKEN}{surface}{EMOTION_END_TOKEN}"
+
+        conditioned = pattern.sub(replace, conditioned)
+    return conditioned
+
+
 def emotion_text(item, table, rng, *, synonym_prob=0.7, max_replacements=2):
     emotion = item.get("emotion") or {}
     if not isinstance(emotion, dict):
@@ -262,7 +282,17 @@ class TextConditioner:
         emotion = item.get("emotion") or {}
         tags = emotion.get("tags") if isinstance(emotion, dict) else None
         if tags:
-            text = _strip_fish_tags(text, tags)
+            if self.emotion_conditioning:
+                text = _condition_fish_tags(
+                    text,
+                    tags,
+                    language,
+                    self.synonym_table,
+                    rng,
+                    self.emotion_synonym_prob,
+                )
+            else:
+                text = _strip_fish_tags(text, tags)
 
         prefix = ""
         if self.language_tag_prob > 0.0 and rng.random() < self.language_tag_prob:
@@ -271,8 +301,14 @@ class TextConditioner:
                 raise ValueError(f"unsupported language for conditioning: {language!r}")
             prefix += token
         if self.emotion_conditioning:
+            prefix_item = item
+            if tags:
+                prefix_emotion = dict(emotion)
+                prefix_emotion["tags"] = []
+                prefix_item = dict(item)
+                prefix_item["emotion"] = prefix_emotion
             value = emotion_text(
-                item,
+                prefix_item,
                 self.synonym_table,
                 rng,
                 synonym_prob=self.emotion_synonym_prob,
@@ -283,27 +319,22 @@ class TextConditioner:
         return prefix + text
 
 
-def _extract_inline_emotions(text):
-    """Remove ``[affect]`` cues from speech and return their control values."""
-
-    values = []
+def _replace_inline_emotions(text):
+    """Turn ``[affect]`` cues into model control spans in place."""
 
     def replace(match):
         value = match.group(1).strip()
         if not value:
             return match.group(0)
-        values.append(value)
-        return ""
+        return f"{EMOTION_START_TOKEN}{value}{EMOTION_END_TOKEN}"
 
-    cleaned = INLINE_EMOTION_RE.sub(replace, text)
-    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
-    return cleaned, values
+    return INLINE_EMOTION_RE.sub(replace, text)
 
 
 def condition_inference_text(text, *, language=None, emotion=None):
     if not isinstance(text, str) or not text:
         raise ValueError("text must be a non-empty string")
-    text, inline_emotions = _extract_inline_emotions(text)
+    text = _replace_inline_emotions(text)
     prefix = ""
     if language is not None:
         language = str(language).strip().lower()
@@ -313,14 +344,9 @@ def condition_inference_text(text, *, language=None, emotion=None):
             )
         if language and language != "auto":
             prefix += LANGUAGE_TOKENS[language]
-    emotions = list(inline_emotions)
     if emotion is not None:
         emotion = str(emotion).strip()
         if not emotion:
             raise ValueError("emotion must be non-empty when provided")
-        emotions.append(emotion)
-    if emotions:
-        prefix += (
-            f"{EMOTION_START_TOKEN}{'; '.join(emotions)}{EMOTION_END_TOKEN}"
-        )
+        prefix += f"{EMOTION_START_TOKEN}{emotion}{EMOTION_END_TOKEN}"
     return prefix + text
