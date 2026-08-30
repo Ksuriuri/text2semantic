@@ -28,6 +28,7 @@ from finetuning.dataset import Text2SemanticDataset
 from finetuning.ref_store import SpeakerRefStore, default_ref_index_path
 from finetuning import source_ref_store, speaker_index
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from transformers import (
     AutoTokenizer,
@@ -202,6 +203,15 @@ def parse_args():
     parser.add_argument("--adam_beta2", type=float, default=0.95)
     parser.add_argument("--adam_epsilon", type=float, default=1e-8)
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
+    parser.add_argument(
+        "--min_lr_ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "Cosine floor as a fraction of each optimizer group's initial LR. "
+            "For example 0.25 makes 4e-5 decay to 1e-5."
+        ),
+    )
     parser.add_argument(
         "--lr_schedule",
         choices=("cosine", "constant"),
@@ -452,6 +462,8 @@ def parse_args():
         parser.error("--language_tag_prob must be in [0, 1].")
     if not 0 <= args.emotion_synonym_prob <= 1:
         parser.error("--emotion_synonym_prob must be in [0, 1].")
+    if not 0 <= args.min_lr_ratio <= 1:
+        parser.error("--min_lr_ratio must be in [0, 1].")
     if args.emotion_max_replacements < 0:
         parser.error("--emotion_max_replacements must be non-negative.")
     if (
@@ -994,6 +1006,16 @@ def schedule_steps_for_accelerate(optimizer_steps, num_processes, split_batches)
     return optimizer_steps if split_batches else optimizer_steps * num_processes
 
 
+def cosine_with_floor_lambda(current_step, *, warmup_steps, total_steps, floor):
+    """Warm up, then cosine-decay to ``floor`` instead of zero."""
+    if warmup_steps > 0 and current_step < warmup_steps:
+        return float(current_step) / float(max(1, warmup_steps))
+    span = max(1, total_steps - warmup_steps)
+    progress = min(1.0, max(0.0, (current_step - warmup_steps) / span))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return floor + (1.0 - floor) * cosine
+
+
 def resume_batches_for_world(global_step, gradient_accumulation_steps):
     """Micro-batches one rank has consumed by `global_step`, on *this* world.
 
@@ -1437,7 +1459,8 @@ def train():
         warmup_steps, accelerator.num_processes, accelerator.split_batches
     )
     accelerator.print(
-        f"LR schedule: {args.lr_schedule}, warmup {warmup_steps:,} / total "
+        f"LR schedule: {args.lr_schedule}, floor={args.min_lr_ratio:g}, "
+        f"warmup {warmup_steps:,} / total "
         f"{total_steps:,} optimizer steps, built as {schedule_warmup:,} / "
         f"{schedule_total:,} scheduler steps for "
         f"{accelerator.num_processes} process(es)"
@@ -1448,6 +1471,16 @@ def train():
         scheduler = get_constant_schedule_with_warmup(
             optimizer,
             num_warmup_steps=schedule_warmup,
+        )
+    elif args.min_lr_ratio > 0:
+        scheduler = LambdaLR(
+            optimizer,
+            lambda step: cosine_with_floor_lambda(
+                step,
+                warmup_steps=schedule_warmup,
+                total_steps=schedule_total,
+                floor=args.min_lr_ratio,
+            ),
         )
     else:
         scheduler = get_cosine_schedule_with_warmup(

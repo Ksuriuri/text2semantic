@@ -29,6 +29,7 @@ from finetuning.train import (
     build_dataset,
     build_optimizer,
     check_fused_linear_attention,
+    cosine_with_floor_lambda,
     decide_checkpoint,
     evaluate,
     fetch_remote_checkpoint,
@@ -117,6 +118,8 @@ def test_parse_args_accepts_fresh_finetune_checkpoint_and_controls(monkeypatch):
             "emotion.v3.json",
             "--emotion_synonym_prob",
             "0.7",
+            "--min_lr_ratio",
+            "0.25",
         ),
     )
     args = parse_args()
@@ -124,6 +127,7 @@ def test_parse_args_accepts_fresh_finetune_checkpoint_and_controls(monkeypatch):
     assert args.language_tag_prob == pytest.approx(0.6)
     assert args.emotion_conditioning is True
     assert args.emotion_synonyms == "emotion.v3.json"
+    assert args.min_lr_ratio == pytest.approx(0.25)
 
 
 def _run_length_argv(*extra):
@@ -193,6 +197,26 @@ def test_schedule_steps_for_accelerate_scales_by_processes():
     assert schedule_steps_for_accelerate(0, 32, False) == 0
     with pytest.raises(ValueError):
         schedule_steps_for_accelerate(-1, 8, False)
+
+
+def test_cosine_with_floor_starts_at_peak_and_ends_at_floor():
+    fn = lambda step: cosine_with_floor_lambda(
+        step, warmup_steps=0, total_steps=100, floor=0.25
+    )
+    assert fn(0) == pytest.approx(1.0)
+    assert fn(50) == pytest.approx(0.625)
+    assert fn(100) == pytest.approx(0.25)
+    assert fn(150) == pytest.approx(0.25)
+
+
+def test_cosine_with_floor_preserves_warmup():
+    fn = lambda step: cosine_with_floor_lambda(
+        step, warmup_steps=10, total_steps=110, floor=0.25
+    )
+    assert fn(0) == pytest.approx(0.0)
+    assert fn(5) == pytest.approx(0.5)
+    assert fn(10) == pytest.approx(1.0)
+    assert fn(110) == pytest.approx(0.25)
     with pytest.raises(ValueError):
         schedule_steps_for_accelerate(10, 0, False)
 
