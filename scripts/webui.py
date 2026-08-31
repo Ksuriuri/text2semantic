@@ -408,7 +408,6 @@ def build_ui(app: InferenceApp):
     example_dir = Path(app.args.examples_dir) if app.args.examples_dir else None
     example_wavs = sorted(str(p) for p in example_dir.glob("*.wav")) if example_dir and example_dir.is_dir() else []
     text_examples = [
-        ["今天天气真不错，我们一起去公园走走吧。"],
         ["The weather is lovely today. Shall we take a walk in the park?"],
         ["今日はいい天気ですね。一緒に公園を散歩しませんか。"],
         ["오늘 날씨가 정말 좋네요. 공원에 같이 산책하러 갈까요?"],
@@ -417,15 +416,10 @@ def build_ui(app: InferenceApp):
         ["Il fait très beau aujourd'hui. On se promène au parc ?"],
         ["Сегодня прекрасная погода. Давайте прогуляемся в парке."],
         ["Heute ist wirklich schönes Wetter. Gehen wir im Park spazieren?"],
+        ["今天天气真不错，我们一起去公园走走吧。"],
     ]
-    with gr.Blocks(title="Noiz TTS v0.1") as demo:
-        gr.Markdown(
-            "## Noiz TTS v0.1\n"
-            "小规模数据测试版 · 约 1 万小时训练（合计 9258h）。中文仅 332h，占比很低。\n\n"
-            "| | EN | JA | PT | KO | ES | FR | RU | DE | ZH | AR |\n"
-            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
-            "| Hours | 2523 | 1135 | 1087 | 1060 | 1015 | 731 | 677 | 556 | 332 | 142 |"
-        )
+    with gr.Blocks(title="Noiz TTS v0.x") as demo:
+        gr.Markdown("## Noiz TTS v0.x")
         with gr.Row():
             with gr.Column():
                 text = gr.Textbox(
@@ -462,7 +456,7 @@ def build_ui(app: InferenceApp):
         )
         with gr.Row():
             with gr.Column():
-                gr.Markdown("### 文本示例（中英日韩西葡法俄德）")
+                gr.Markdown("### 文本示例（英日韩西葡法俄德中）")
                 gr.Examples(
                     examples=text_examples,
                     inputs=[text],
@@ -479,13 +473,6 @@ def build_ui(app: InferenceApp):
                     )
                 else:
                     gr.Markdown("_未配置参考音频示例目录（`--examples-dir` / `WEBUI_EXAMPLES_DIR`）_")
-        gr.Markdown(
-            f"checkpoint: `{app.args.checkpoint}`  \n"
-            f"device: `{app.device}`  \n"
-            f"codec: `{app.args.codec_dir}`  \n"
-            f"vocoder default: `{app.default_vocoder}`; loaded: `{','.join(app.vocoders)}`  \n"
-            f"t2s replicas: `{getattr(app.args, 't2s_replicas', 2)}`"
-        )
     return demo
 
 
@@ -499,7 +486,7 @@ def create_app(app: InferenceApp) -> FastAPI:
         return {
             "status": "ok",
             "device": str(app.device),
-            "model": "Noiz TTS v0.1",
+            "model": "Noiz TTS v0.x",
             "t2s_replicas": int(getattr(app.args, "t2s_replicas", 2)),
             "vocoder_default": app.default_vocoder,
             "vocoder_backends": list(app.vocoders),
