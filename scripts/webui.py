@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Gradio WebUI & REST API for the text2semantic + IndexTTS-2.5 wav pipeline.
 
-Loads the AR model, EnhancedCodec, s2mel and BigVGAN once at startup, then
-serves text + reference-audio -> 22.05 kHz wav.
+Loads the AR model and the configured s2vae/s2mel acoustic backends once at
+startup. The default is s2vae (48 kHz); s2mel remains selectable (22.05 kHz).
 Provides:
   - Gradio WebUI at /
   - Native REST API at POST /api/tts (multipart/form-data)
@@ -68,16 +68,41 @@ class InferenceApp:
             )
             stream = torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
             self.t2s_pool.put((t2s, stream))
-        print("loading IndexTTS-2.5 codec + s2mel + BigVGAN", flush=True)
-        self.vocoder = t2s_infer.IndexTTS25Vocoder(
-            indextts_root=args.indextts_root,
-            codec_dir=args.codec_dir,
-            bigvgan_dir=args.bigvgan_dir,
-            device=self.device,
-            diffusion_steps=args.diffusion_steps,
-            cfg_rate=args.cfg_rate,
-            duration_factor=args.duration_factor,
-        )
+        requested = [item.strip() for item in args.vocoder_backends.split(",") if item.strip()]
+        unknown = sorted(set(requested) - {"s2vae", "s2mel"})
+        if unknown:
+            raise ValueError(f"unknown vocoder backends: {unknown}")
+        if not requested:
+            raise ValueError("at least one vocoder backend must be configured")
+        if args.default_vocoder not in requested:
+            raise ValueError("--default-vocoder must be included in --vocoder-backends")
+        self.default_vocoder = args.default_vocoder
+        self.vocoders = {}
+        if "s2vae" in requested:
+            print("loading s2vae step checkpoint + dots.tts AudioVAE", flush=True)
+            self.vocoders["s2vae"] = t2s_infer.S2VAEVocoder(
+                semantic2any_root=args.semantic2any_root,
+                config_path=args.s2vae_config,
+                checkpoint_path=args.s2vae_checkpoint,
+                dots_tts_dir=args.dots_tts_dir,
+                indextts_root=args.indextts_root,
+                codec_dir=args.codec_dir,
+                device=self.device,
+                diffusion_steps=args.diffusion_steps,
+                cfg_rate=args.cfg_rate,
+                temperature=args.s2vae_temperature,
+            )
+        if "s2mel" in requested:
+            print("loading IndexTTS-2.5 codec + s2mel + BigVGAN", flush=True)
+            self.vocoders["s2mel"] = t2s_infer.IndexTTS25Vocoder(
+                indextts_root=args.indextts_root,
+                codec_dir=args.codec_dir,
+                bigvgan_dir=args.bigvgan_dir,
+                device=self.device,
+                diffusion_steps=args.diffusion_steps,
+                cfg_rate=args.cfg_rate,
+                duration_factor=args.duration_factor,
+            )
         self.out_dir = Path(args.out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         print(f"ready on {self.device}", flush=True)
@@ -92,6 +117,7 @@ class InferenceApp:
         repetition_penalty: float = 10.0,
         seed: int = -1,
         language: str | None = None,
+        vocoder_backend: str | None = None,
         emotion: str | None = None,
     ):
         text = (text or "").strip()
@@ -100,6 +126,13 @@ class InferenceApp:
         ref_path = _as_audio_path(ref_audio)
         if not ref_path:
             raise ValueError("请上传参考音频")
+
+        backend = (vocoder_backend or self.default_vocoder).strip().lower()
+        if backend not in self.vocoders:
+            raise ValueError(
+                f"vocoder backend {backend!r} is unavailable; "
+                f"choose one of {sorted(self.vocoders)}"
+            )
 
         t2s, stream = self.t2s_pool.get()
         try:
@@ -116,10 +149,11 @@ class InferenceApp:
             t0 = time.time()
             if stream is not None:
                 with torch.cuda.stream(stream):
-                    codes = t2s_infer.generate_codes(
+                    generated = t2s_infer.generate_codes(
                         t2s,
                         text,
                         ref_path,
+                        return_prompt_features=backend == "s2vae",
                         language=language or None,
                         emotion=(emotion or "").strip() or None,
                         max_new_tokens=int(max_new_tokens),
@@ -129,10 +163,11 @@ class InferenceApp:
                     )
                 stream.synchronize()
             else:
-                codes = t2s_infer.generate_codes(
+                generated = t2s_infer.generate_codes(
                     t2s,
                     text,
                     ref_path,
+                    return_prompt_features=backend == "s2vae",
                     language=language or None,
                     emotion=(emotion or "").strip() or None,
                     max_new_tokens=int(max_new_tokens),
@@ -143,20 +178,42 @@ class InferenceApp:
         finally:
             self.t2s_pool.put((t2s, stream))
 
+        if backend == "s2vae":
+            codes, prompt_features, prompt_feature_length = generated
+        else:
+            codes = generated
+
         with self.vocoder_lock:
             if self.vocoder_stream is not None:
                 with torch.cuda.stream(self.vocoder_stream):
-                    wav, info = self.vocoder.vocode(codes, ref_path)
+                    if backend == "s2vae":
+                        wav, info = self.vocoders[backend].vocode(
+                            codes,
+                            ref_path,
+                            prompt_features=prompt_features,
+                            prompt_feature_length=prompt_feature_length,
+                        )
+                    else:
+                        wav, info = self.vocoders[backend].vocode(codes, ref_path)
                 self.vocoder_stream.synchronize()
             else:
-                wav, info = self.vocoder.vocode(codes, ref_path)
+                if backend == "s2vae":
+                    wav, info = self.vocoders[backend].vocode(
+                        codes,
+                        ref_path,
+                        prompt_features=prompt_features,
+                        prompt_feature_length=prompt_feature_length,
+                    )
+                else:
+                    wav, info = self.vocoders[backend].vocode(codes, ref_path)
+            info.setdefault("backend", backend)
             elapsed = time.time() - t0
             stamp = time.strftime("%Y%m%d_%H%M%S")
             out_path = self.out_dir / f"webui_{stamp}_{threading.get_ident()}.wav"
             t2s_infer.save_wav(str(out_path), wav, info["sample_rate"])
 
         status = (
-            f"ok  {info['n_codes']} codes ({info['code_seconds']:.2f}s @ 25Hz)  "
+            f"ok [{backend}]  {info['n_codes']} codes ({info['code_seconds']:.2f}s @ 25Hz)  "
             f"wav {info['wav_seconds']:.2f}s  wall {elapsed:.1f}s\n"
             f"{out_path}"
         )
@@ -194,6 +251,21 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--indextts-root", default=t2s_infer.DEFAULT_INDEXTTS_ROOT)
     p.add_argument("--codec-dir", default=t2s_infer.DEFAULT_CODEC_DIR)
     p.add_argument("--bigvgan-dir", default=t2s_infer.DEFAULT_BIGVGAN_DIR)
+    p.add_argument(
+        "--vocoder-backends",
+        default=os.environ.get("VOCODER_BACKENDS", "s2vae,s2mel"),
+        help="comma-separated backends to load: s2vae,s2mel",
+    )
+    p.add_argument(
+        "--default-vocoder",
+        choices=("s2vae", "s2mel"),
+        default=os.environ.get("DEFAULT_VOCODER", "s2vae"),
+    )
+    p.add_argument("--semantic2any-root", default=t2s_infer.DEFAULT_SEMANTIC2ANY_ROOT)
+    p.add_argument("--s2vae-config", default=t2s_infer.DEFAULT_S2VAE_CONFIG)
+    p.add_argument("--s2vae-checkpoint", default=t2s_infer.DEFAULT_S2VAE_CHECKPOINT)
+    p.add_argument("--dots-tts-dir", default=t2s_infer.DEFAULT_DOTS_TTS_DIR)
+    p.add_argument("--s2vae-temperature", type=float, default=0.7)
     p.add_argument("--w2v-bert-path", default=t2s_infer.DEFAULT_W2V_BERT)
     p.add_argument("--stats-path", default=t2s_infer.DEFAULT_STATS)
     p.add_argument("--device", default="cuda:0")
@@ -261,6 +333,11 @@ def build_ui(app: InferenceApp):
                     value="auto",
                     label="语言控制（auto = 不加标签）",
                 )
+                vocoder_backend = gr.Dropdown(
+                    choices=list(app.vocoders),
+                    value=app.default_vocoder,
+                    label="声学后端（s2vae = 48kHz，s2mel = 22.05kHz）",
+                )
                 with gr.Accordion("生成参数", open=False):
                     temperature = gr.Slider(0.1, 1.5, value=0.5, step=0.05, label="temperature")
                     top_k = gr.Slider(1, 200, value=8, step=1, label="top_k")
@@ -275,7 +352,7 @@ def build_ui(app: InferenceApp):
             fn=app.generate,
             inputs=[
                 text, ref, temperature, top_k, max_new_tokens,
-                repetition_penalty, seed, language,
+                repetition_penalty, seed, language, vocoder_backend,
             ],
             outputs=[audio_out, status],
         )
@@ -302,6 +379,7 @@ def build_ui(app: InferenceApp):
             f"checkpoint: `{app.args.checkpoint}`  \n"
             f"device: `{app.device}`  \n"
             f"codec: `{app.args.codec_dir}`  \n"
+            f"vocoder default: `{app.default_vocoder}`; loaded: `{','.join(app.vocoders)}`  \n"
             f"t2s replicas: `{getattr(app.args, 't2s_replicas', 2)}`"
         )
     return demo
@@ -319,6 +397,9 @@ def create_app(app: InferenceApp) -> FastAPI:
             "device": str(app.device),
             "model": "Noiz TTS v0.1",
             "t2s_replicas": int(getattr(app.args, "t2s_replicas", 2)),
+            "vocoder_default": app.default_vocoder,
+            "vocoder_backends": list(app.vocoders),
+            "checkpoint": app.args.checkpoint,
             "default_params": {
                 "temperature": 0.5,
                 "top_k": 8,
@@ -340,6 +421,7 @@ def create_app(app: InferenceApp) -> FastAPI:
         seed: int = Form(-1, description="随机种子，默认 -1 随机"),
         language: str | None = Form(None, description="可选语言控制码"),
         emotion: str | None = Form(None, description="可选情绪/气声描述"),
+        vocoder_backend: str | None = Form(None, description="s2vae 或 s2mel"),
     ):
         text = (text or "").strip()
         if not text:
@@ -362,6 +444,7 @@ def create_app(app: InferenceApp) -> FastAPI:
                 repetition_penalty,
                 seed,
                 language,
+                vocoder_backend,
                 emotion,
             )
         except Exception as exc:
@@ -406,6 +489,16 @@ def main(argv=None) -> int:
     ):
         if not path or not os.path.exists(path):
             raise SystemExit(f"{label} not found: {path}")
+    requested = {item.strip() for item in args.vocoder_backends.split(",") if item.strip()}
+    if "s2vae" in requested:
+        for label, path in (
+            ("semantic2any-root", args.semantic2any_root),
+            ("s2vae-config", args.s2vae_config),
+            ("s2vae-checkpoint", args.s2vae_checkpoint),
+            ("dots-tts-dir", args.dots_tts_dir),
+        ):
+            if not path or not os.path.exists(path):
+                raise SystemExit(f"{label} not found: {path}")
     app = InferenceApp(args)
     fastapi_app = create_app(app)
     uvicorn.run(fastapi_app, host=args.host, port=args.port, log_level="info")

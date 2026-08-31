@@ -14,7 +14,9 @@ text2semantic AR step):
 3. s2mel prompt / reference = raw w2v-bert layer-17 features (never the
    codec). Target = the decoded 50 Hz features. ``target_lengths`` uses the
    official ``1.72`` ratio on the **decoded** time axis.
-4. CAMPPlus style + CFM (25 steps, cfg 0.7) + BigVGAN → 22.05 kHz wav.
+4. Selectable acoustic backend:
+   - s2mel: CAMPPlus + CFM + BigVGAN → 22.05 kHz wav.
+   - s2vae: CFM predicts frozen dots.tts AudioVAE latents → 48 kHz wav.
 
 This project previously only had ``Text2SemanticModel.generate()`` (codes
 only) and a leftover MaskGCT-50 Hz vocoder script. That old path is **not**
@@ -72,6 +74,18 @@ DEFAULT_STATS = _first_existing(
     os.path.join(DEFAULT_CODEC_DIR, "wav2vec2bert_stats.pt"),
     "/hunshan/hhy/models/IndexTTS-2-vLLM/wav2vec2bert_stats.pt",
 )
+DEFAULT_SEMANTIC2ANY_ROOT = _first_existing(
+    "/mnt/data_sdd/hhy/noiz-tts/semantic2any",
+    "/home/babysor00/t2s/semantic2any",
+)
+DEFAULT_S2VAE_CONFIG = os.path.join(
+    DEFAULT_SEMANTIC2ANY_ROOT, "configs/s2vae_dit_indextts25_hf_equalized5k.yaml"
+)
+DEFAULT_S2VAE_CHECKPOINT = os.path.join(
+    DEFAULT_SEMANTIC2ANY_ROOT,
+    "exp/s2vae_dit_indextts25_hf_equalized5k/s2mel_step311673.pth",
+)
+DEFAULT_DOTS_TTS_DIR = os.path.join(DEFAULT_SEMANTIC2ANY_ROOT, "checkpoints/dots-tts")
 
 # Official infer_v2_5.py constants. length_regulator sees *decoded* 50 Hz
 # features, so this is the same 1.72 used by the old 50 Hz codec — decode()
@@ -328,6 +342,153 @@ class IndexTTS25Vocoder:
         return wav, info
 
 
+class S2VAEVocoder:
+    """IndexTTS-2.5 codes to dots.tts AudioVAE latents and 48 kHz audio.
+
+    Prompt and target codes are decoded independently because EnhancedCodec's
+    decoder is context dependent. The flow model must stay in float32; fp16
+    Euler sampling collapses the VAE latents to near-silence.
+    """
+
+    def __init__(
+        self,
+        *,
+        semantic2any_root: str,
+        config_path: str,
+        checkpoint_path: str,
+        dots_tts_dir: str,
+        indextts_root: str,
+        codec_dir: str,
+        device: torch.device,
+        diffusion_steps: int = DIFFUSION_STEPS,
+        cfg_rate: float = INFERENCE_CFG_RATE,
+        temperature: float = 0.7,
+        prompt_max_seconds: float = PROMPT_MAX_SECONDS,
+    ):
+        root = os.path.abspath(semantic2any_root)
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from omegaconf import OmegaConf
+        from semantic2any.models import Semantic2MelModel
+        from semantic2any.utils.checkpoint import load_compatible_checkpoint
+        from semantic2any.utils.dots_audiovae import DotsAudioVAE
+
+        self.device = device
+        self.diffusion_steps = int(diffusion_steps)
+        self.cfg_rate = float(cfg_rate)
+        self.temperature = float(temperature)
+        self.prompt_max_seconds = min(float(prompt_max_seconds), 30.0)
+
+        cfg = OmegaConf.load(config_path)
+        model = Semantic2MelModel(cfg.s2mel)
+        load_compatible_checkpoint(model, checkpoint_path, strict=True)
+        self.model = model.to(device=device, dtype=torch.float32).eval()
+        self.model.requires_grad_(False)
+        self.model.models["cfm"].setup_estimator_caches(
+            max_batch_size=2 if self.cfg_rate > 0 else 1,
+            max_seq_length=int(cfg.s2mel.DiT.block_size),
+        )
+        self.audio_vae = DotsAudioVAE.from_pretrained(dots_tts_dir).to(device).eval()
+
+        mods = _import_indextts(indextts_root)
+        codec_cfg = mods["OmegaConf"].load(os.path.join(codec_dir, "config.yaml"))
+        codec = mods["EnhancedCodec"](
+            **codec_cfg.semantic_codec, cfg=codec_cfg.semantic_codec
+        )
+        codec.load_checkpoint(os.path.join(codec_dir, "codec.pth"))
+        self.semantic_codec = codec.to(device).eval()
+        self.semantic_codec.requires_grad_(False)
+
+    def _load_prompt_wav(self, ref_audio: str) -> tuple[torch.Tensor, int]:
+        import librosa
+
+        audio, sr = librosa.load(ref_audio, sr=None, mono=True)
+        audio = torch.from_numpy(np.asarray(audio, dtype=np.float32)).unsqueeze(0)
+        max_n = int(self.prompt_max_seconds * sr)
+        audio = audio[:, :max_n]
+        audio = torchaudio.functional.resample(audio, sr, int(self.audio_vae.sample_rate))
+        sample_count = int(audio.shape[-1])
+        hop = int(self.audio_vae.hop_size)
+        if sample_count // hop < 75:
+            raise ValueError("s2vae reference audio must be at least 3 seconds")
+        return audio.to(self.device), sample_count
+
+    @torch.no_grad()
+    def _prompt_codes(self, prompt_features: torch.Tensor, prompt_feature_length: int):
+        feature = prompt_features[:, : int(prompt_feature_length)].to(
+            self.device, dtype=torch.float32
+        )
+        codes, _ = self.semantic_codec.quantize(feature)
+        return _strip_special_codes(codes)
+
+    @torch.no_grad()
+    def vocode(
+        self,
+        codes: torch.Tensor,
+        ref_audio: str,
+        *,
+        prompt_features: torch.Tensor,
+        prompt_feature_length: int,
+    ) -> tuple[torch.Tensor, dict]:
+        target_codes = _strip_special_codes(codes).to(self.device)
+        if target_codes.numel() < 8:
+            raise ValueError("s2vae target must contain at least 8 codes")
+        if target_codes.numel() > 750:
+            raise ValueError("s2vae target exceeds the trained 30-second limit (750 codes)")
+
+        prompt_wav, prompt_samples = self._load_prompt_wav(ref_audio)
+        prompt_latent = self.audio_vae.encode_mean(
+            prompt_wav.unsqueeze(0),
+            sample_lengths=[prompt_samples],
+            normalize=True,
+        )
+        prompt_codes = self._prompt_codes(prompt_features, prompt_feature_length)
+        prompt_frames = min(int(prompt_latent.shape[-1]), int(prompt_codes.numel()))
+        if prompt_frames < 75:
+            raise ValueError("s2vae aligned reference prompt is shorter than 3 seconds")
+        prompt_latent = prompt_latent[:, :, :prompt_frames].float()
+        prompt_codes = prompt_codes[:prompt_frames]
+
+        # Never decode across the prompt/target seam: EnhancedCodec mixes context.
+        prompt_sem = self.semantic_codec.decode(prompt_codes.unsqueeze(0)).float()
+        target_sem = self.semantic_codec.decode(target_codes.unsqueeze(0)).float()
+        semantic = torch.cat([prompt_sem, target_sem], dim=1)
+        target_frames = int(target_codes.numel())
+        total_frames = prompt_frames + target_frames
+        x_lens = torch.tensor([total_frames], device=self.device, dtype=torch.long)
+        semantic_lens = torch.tensor(
+            [semantic.shape[1]], device=self.device, dtype=torch.long
+        )
+        mu = self.model.build_condition(
+            semantic, x_lens, semantic_lens=semantic_lens
+        )
+        latent = self.model.models["cfm"].inference(
+            mu=mu,
+            x_lens=x_lens,
+            prompt=prompt_latent,
+            style=torch.zeros(1, 192, device=self.device),
+            f0=None,
+            n_timesteps=self.diffusion_steps,
+            temperature=self.temperature,
+            inference_cfg_rate=self.cfg_rate,
+            drop_style=True,
+        )
+        target_latent = latent[:, :, prompt_frames:total_frames]
+        wav = self.audio_vae.decode(target_latent.float(), normalized=True)[0]
+        wav = torch.clamp(wav, -1.0, 1.0).cpu()
+        sample_rate = int(self.audio_vae.sample_rate)
+        info = {
+            "backend": "s2vae",
+            "n_codes": target_frames,
+            "code_seconds": float(target_frames / CODE_FPS),
+            "prompt_codes": prompt_frames,
+            "target_latent_frames": target_frames,
+            "wav_seconds": float(wav.shape[-1] / sample_rate),
+            "sample_rate": sample_rate,
+        }
+        return wav, info
+
+
 def load_t2s(
     checkpoint: str,
     *,
@@ -349,9 +510,25 @@ def load_t2s(
     )
 
 
-def generate_codes(t2s, text: str, ref_audio: str, **gen_kwargs) -> torch.Tensor:
-    codes_list = t2s.generate(text, ref_audio, **gen_kwargs)
-    return _strip_special_codes(codes_list[0].detach().cpu())
+def generate_codes(
+    t2s,
+    text: str,
+    ref_audio: str,
+    *,
+    return_prompt_features: bool = False,
+    **gen_kwargs,
+):
+    result = t2s.generate(
+        text,
+        ref_audio,
+        return_speaker_features=return_prompt_features,
+        **gen_kwargs,
+    )
+    if not return_prompt_features:
+        return _strip_special_codes(result[0].detach().cpu())
+    codes_list, features, lengths = result
+    codes = _strip_special_codes(codes_list[0].detach().cpu())
+    return codes, features[0:1].detach(), int(lengths[0].item())
 
 
 def save_wav(path: str, wav: torch.Tensor, sr: int) -> None:
@@ -391,6 +568,12 @@ def parse_args(argv=None):
     p.add_argument("--indextts-root", default=DEFAULT_INDEXTTS_ROOT)
     p.add_argument("--codec-dir", default=DEFAULT_CODEC_DIR)
     p.add_argument("--bigvgan-dir", default=DEFAULT_BIGVGAN_DIR)
+    p.add_argument("--vocoder-backend", choices=("s2vae", "s2mel"), default="s2vae")
+    p.add_argument("--semantic2any-root", default=DEFAULT_SEMANTIC2ANY_ROOT)
+    p.add_argument("--s2vae-config", default=DEFAULT_S2VAE_CONFIG)
+    p.add_argument("--s2vae-checkpoint", default=DEFAULT_S2VAE_CHECKPOINT)
+    p.add_argument("--dots-tts-dir", default=DEFAULT_DOTS_TTS_DIR)
+    p.add_argument("--s2vae-temperature", type=float, default=0.7)
     p.add_argument("--w2v-bert-path", default=DEFAULT_W2V_BERT)
     p.add_argument("--stats-path", default=DEFAULT_STATS)
     p.add_argument("--device", default="cuda:0")
@@ -431,16 +614,21 @@ def main(argv=None) -> int:
             attn_implementation=args.attn_implementation,
         )
         print(f"generating 25Hz codes for: {args.text}")
-        codes = generate_codes(
+        generated = generate_codes(
             t2s,
             args.text,
             args.ref_audio,
+            return_prompt_features=args.vocoder_backend == "s2vae",
             language=args.language,
             emotion=args.emotion,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
         )
+        if args.vocoder_backend == "s2vae":
+            codes, prompt_features, prompt_feature_length = generated
+        else:
+            codes = generated
         print(f"  {codes.numel()} codes ({codes.numel()/CODE_FPS:.2f}s @ 25Hz)")
         del t2s
         if device.type == "cuda":
@@ -451,17 +639,41 @@ def main(argv=None) -> int:
         np.save(args.save_codes, codes.cpu().numpy().astype(np.int32))
         print(f"saved codes → {args.save_codes}")
 
-    print("loading IndexTTS-2.5 codec + s2mel + BigVGAN")
-    vocoder = IndexTTS25Vocoder(
-        indextts_root=args.indextts_root,
-        codec_dir=args.codec_dir,
-        bigvgan_dir=args.bigvgan_dir,
-        device=device,
-        diffusion_steps=args.diffusion_steps,
-        cfg_rate=args.cfg_rate,
-        duration_factor=args.duration_factor,
-    )
-    wav, info = vocoder.vocode(codes, args.ref_audio)
+    if args.vocoder_backend == "s2vae":
+        if args.codes_npy:
+            raise SystemExit("--codes-npy with s2vae is unsupported: prompt features are required")
+        print("loading S2VAE step checkpoint + dots.tts AudioVAE")
+        vocoder = S2VAEVocoder(
+            semantic2any_root=args.semantic2any_root,
+            config_path=args.s2vae_config,
+            checkpoint_path=args.s2vae_checkpoint,
+            dots_tts_dir=args.dots_tts_dir,
+            indextts_root=args.indextts_root,
+            codec_dir=args.codec_dir,
+            device=device,
+            diffusion_steps=args.diffusion_steps,
+            cfg_rate=args.cfg_rate,
+            temperature=args.s2vae_temperature,
+        )
+        wav, info = vocoder.vocode(
+            codes,
+            args.ref_audio,
+            prompt_features=prompt_features,
+            prompt_feature_length=prompt_feature_length,
+        )
+    else:
+        print("loading IndexTTS-2.5 codec + s2mel + BigVGAN")
+        vocoder = IndexTTS25Vocoder(
+            indextts_root=args.indextts_root,
+            codec_dir=args.codec_dir,
+            bigvgan_dir=args.bigvgan_dir,
+            device=device,
+            diffusion_steps=args.diffusion_steps,
+            cfg_rate=args.cfg_rate,
+            duration_factor=args.duration_factor,
+        )
+        wav, info = vocoder.vocode(codes, args.ref_audio)
+        info["backend"] = "s2mel"
     save_wav(args.out, wav, info["sample_rate"])
     print(json.dumps(info, ensure_ascii=False, indent=2))
     print(f"saved wav → {args.out}")

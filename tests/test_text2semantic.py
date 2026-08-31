@@ -567,6 +567,15 @@ def test_inference_wrapper_broadcasts_reference_audio():
     result = wrapper.generate(["first", "second"], ref_audio="ref.wav")
     assert [tokens.tolist() for tokens in result] == [[1], [2]]
 
+    result, features, lengths = wrapper.generate(
+        ["first", "second"],
+        ref_audio="ref.wav",
+        return_speaker_features=True,
+    )
+    assert [tokens.tolist() for tokens in result] == [[1], [2]]
+    assert features.shape == (2, 4, 8)
+    assert lengths.tolist() == [4, 4]
+
 
 def test_repcodec_indices_are_in_range():
     codec = RepCodec(

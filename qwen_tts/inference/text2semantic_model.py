@@ -71,6 +71,7 @@ class Text2SemanticModel:
         *,
         language=None,
         emotion=None,
+        return_speaker_features=False,
         **generation_kwargs,
     ):
         texts = [text] if isinstance(text, str) else list(text)
@@ -131,10 +132,13 @@ class Text2SemanticModel:
                 max_audio_seconds=self.max_ref_seconds,
             )
         )
-        return self.model.generate_semantic(
+        generated = self.model.generate_semantic(
             input_ids,
             text_attention_mask=attention_mask,
             speaker_features=speaker_features,
             speaker_feature_lengths=speaker_feature_lengths,
             **generation_kwargs,
         )
+        if return_speaker_features:
+            return generated, speaker_features, speaker_feature_lengths
+        return generated
