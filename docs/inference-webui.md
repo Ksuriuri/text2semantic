@@ -145,6 +145,10 @@ POST /api/generate    # 别名
 | `repetition_penalty` | | 10.0 |
 | `seed` | | -1（随机） |
 
+长文本会先切段再拼接：中文/日韩非空白字 >50 按句末标点切，单段 >100 强制切；英语类词数 >30 按句末标点切，单段 >50 词强制切。
+
+`speaker_sim_boost` 默认关。打开后 Whisper 切参考（>10s 取前 10 秒内最后一个停顿 + 约 120ms 静音；≤10s 整段），切片文本拼在目标前面，切片 codes 作为 AR prefix，只保留新生成的 codes。speaker 特征仍用整段参考。
+
 成功返回 `audio/wav`，状态在 `X-TTS-Status`。
 
 ## 环境变量
