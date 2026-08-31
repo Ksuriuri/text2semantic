@@ -427,7 +427,8 @@ class Text2SemanticForCausalLM(PreTrainedModel):
         speech_bos_embeds = speech_bos_embeds.to(dtype=text_embeds.dtype)
 
         text_lengths = text_attention_mask.sum(dim=1).long()
-        prompt_lengths = text_lengths + speaker_embeds.size(1) + 1
+        speech_prompt_len = speech_bos_ids.size(1)
+        prompt_lengths = text_lengths + speaker_embeds.size(1) + speech_prompt_len
         max_prompt_length = int(prompt_lengths.max().item())
         prompt_embeds = text_embeds.new_zeros(
             text_input_ids.size(0),
@@ -544,8 +545,9 @@ class Text2SemanticForCausalLM(PreTrainedModel):
         temperature=1.0,
         top_k=0,
         do_sample=True,
+        prefix_speech_ids=None,
     ):
-        """Generate semantic codec indices, excluding BOS and EOS."""
+        """Generate semantic codec indices, excluding BOS, prefix, and EOS."""
         if max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be positive.")
         if temperature <= 0:
@@ -560,6 +562,18 @@ class Text2SemanticForCausalLM(PreTrainedModel):
             dtype=torch.long,
             device=text_input_ids.device,
         )
+        prefix_len = 0
+        if prefix_speech_ids is not None:
+            prefix = prefix_speech_ids
+            if not torch.is_tensor(prefix):
+                prefix = torch.tensor(prefix, dtype=torch.long)
+            prefix = prefix.long().reshape(-1)
+            if prefix.numel():
+                prefix = prefix.unsqueeze(0).expand(batch_size, -1).to(
+                    device=text_input_ids.device
+                )
+                generated = torch.cat((generated, prefix), dim=1)
+                prefix_len = int(prefix.size(1))
         finished = torch.zeros(
             batch_size, dtype=torch.bool, device=text_input_ids.device
         )
@@ -625,7 +639,7 @@ class Text2SemanticForCausalLM(PreTrainedModel):
             ).float()
 
         results = []
-        for sequence in generated[:, 1:]:
+        for sequence in generated[:, 1 + prefix_len :]:
             eos = (sequence == self.config.speech_eos_token_id).nonzero(
                 as_tuple=False
             )

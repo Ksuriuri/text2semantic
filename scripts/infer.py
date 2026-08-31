@@ -253,6 +253,21 @@ class IndexTTS25Vocoder:
         codes = _strip_special_codes(codes).unsqueeze(0).to(self.device)
         return self.semantic_codec.decode(codes)
 
+    @torch.no_grad()
+    def encode_wav_codes(self, wav_path: str) -> torch.Tensor:
+        """Reference wav → 25 Hz EnhancedCodec ids (same get_emb + quantize as training)."""
+        import librosa
+
+        audio, sr = librosa.load(wav_path, sr=None, mono=True)
+        if audio.size == 0:
+            raise RuntimeError(f"empty wav: {wav_path}")
+        audio = torch.from_numpy(np.asarray(audio, dtype=np.float32)).unsqueeze(0)
+        audio_16k = torchaudio.functional.resample(audio, sr, 16000).to(self.device)
+        feat = self.get_emb(audio_16k)
+        indices, _ = self.semantic_codec.quantize(feat)
+        codes = indices.reshape(-1).long().cpu()
+        return _strip_special_codes(codes)
+
     def _load_ref(self, ref_audio: str):
         import librosa
 
@@ -350,6 +365,12 @@ def load_t2s(
 
 
 def generate_codes(t2s, text: str, ref_audio: str, **gen_kwargs) -> torch.Tensor:
+    prefix = gen_kwargs.pop("prefix_codes", None)
+    if prefix is not None:
+        if not torch.is_tensor(prefix):
+            prefix = torch.tensor(prefix, dtype=torch.long)
+        prefix = _strip_special_codes(prefix.detach().cpu().long())
+        gen_kwargs["prefix_speech_ids"] = prefix
     codes_list = t2s.generate(text, ref_audio, **gen_kwargs)
     return _strip_special_codes(codes_list[0].detach().cpu())
 
