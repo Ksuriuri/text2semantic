@@ -107,33 +107,29 @@ class InferenceApp:
         self.out_dir.mkdir(parents=True, exist_ok=True)
         print(f"ready on {self.device}", flush=True)
 
-    def generate(
-        self,
-        text: str,
-        ref_audio,
-        temperature: float = 0.5,
-        top_k: int = 8,
-        max_new_tokens: int = 1500,
-        repetition_penalty: float = 10.0,
-        seed: int = -1,
-        language: str | None = None,
-        vocoder_backend: str | None = None,
-        emotion: str | None = None,
-    ):
+    def _validate_request(self, text: str, ref_audio) -> tuple[str, str]:
         text = (text or "").strip()
         if not text:
             raise ValueError("请输入要合成的文本")
         ref_path = _as_audio_path(ref_audio)
         if not ref_path:
             raise ValueError("请上传参考音频")
+        return text, ref_path
 
-        backend = (vocoder_backend or self.default_vocoder).strip().lower()
-        if backend not in self.vocoders:
-            raise ValueError(
-                f"vocoder backend {backend!r} is unavailable; "
-                f"choose one of {sorted(self.vocoders)}"
-            )
-
+    def _generate_semantics(
+        self,
+        *,
+        text: str,
+        ref_path: str,
+        temperature: float,
+        top_k: int,
+        max_new_tokens: int,
+        repetition_penalty: float,
+        seed: int,
+        language: str | None,
+        emotion: str | None,
+        need_prompt_features: bool,
+    ):
         t2s, stream = self.t2s_pool.get()
         try:
             if seed is not None and int(seed) >= 0:
@@ -146,14 +142,14 @@ class InferenceApp:
                 if torch.cuda.is_available():
                     torch.cuda.manual_seed_all(rnd)
 
-            t0 = time.time()
+            started = time.time()
             if stream is not None:
                 with torch.cuda.stream(stream):
                     generated = t2s_infer.generate_codes(
                         t2s,
                         text,
                         ref_path,
-                        return_prompt_features=backend == "s2vae",
+                        return_prompt_features=need_prompt_features,
                         language=language or None,
                         emotion=(emotion or "").strip() or None,
                         max_new_tokens=int(max_new_tokens),
@@ -167,7 +163,7 @@ class InferenceApp:
                     t2s,
                     text,
                     ref_path,
-                    return_prompt_features=backend == "s2vae",
+                    return_prompt_features=need_prompt_features,
                     language=language or None,
                     emotion=(emotion or "").strip() or None,
                     max_new_tokens=int(max_new_tokens),
@@ -177,12 +173,23 @@ class InferenceApp:
                 )
         finally:
             self.t2s_pool.put((t2s, stream))
-
-        if backend == "s2vae":
+        elapsed = time.time() - started
+        if need_prompt_features:
             codes, prompt_features, prompt_feature_length = generated
-        else:
-            codes = generated
+            return codes, prompt_features, prompt_feature_length, elapsed
+        return generated, None, None, elapsed
 
+    def _vocode(
+        self,
+        *,
+        backend: str,
+        codes: torch.Tensor,
+        ref_path: str,
+        prompt_features: torch.Tensor | None,
+        prompt_feature_length: int | None,
+        t2s_elapsed: float,
+    ) -> tuple[str, str]:
+        started = time.time()
         with self.vocoder_lock:
             if self.vocoder_stream is not None:
                 with torch.cuda.stream(self.vocoder_stream):
@@ -191,7 +198,7 @@ class InferenceApp:
                             codes,
                             ref_path,
                             prompt_features=prompt_features,
-                            prompt_feature_length=prompt_feature_length,
+                            prompt_feature_length=int(prompt_feature_length),
                         )
                     else:
                         wav, info = self.vocoders[backend].vocode(codes, ref_path)
@@ -202,22 +209,115 @@ class InferenceApp:
                         codes,
                         ref_path,
                         prompt_features=prompt_features,
-                        prompt_feature_length=prompt_feature_length,
+                        prompt_feature_length=int(prompt_feature_length),
                     )
                 else:
                     wav, info = self.vocoders[backend].vocode(codes, ref_path)
             info.setdefault("backend", backend)
-            elapsed = time.time() - t0
+            backend_elapsed = time.time() - started
             stamp = time.strftime("%Y%m%d_%H%M%S")
-            out_path = self.out_dir / f"webui_{stamp}_{threading.get_ident()}.wav"
+            out_path = self.out_dir / (
+                f"webui_{stamp}_{threading.get_ident()}_{backend}.wav"
+            )
             t2s_infer.save_wav(str(out_path), wav, info["sample_rate"])
 
         status = (
             f"ok [{backend}]  {info['n_codes']} codes ({info['code_seconds']:.2f}s @ 25Hz)  "
-            f"wav {info['wav_seconds']:.2f}s  wall {elapsed:.1f}s\n"
+            f"wav {info['wav_seconds']:.2f}s  "
+            f"t2s {t2s_elapsed:.1f}s + backend {backend_elapsed:.1f}s\n"
             f"{out_path}"
         )
         return str(out_path), status
+
+    def generate(
+        self,
+        text: str,
+        ref_audio,
+        temperature: float = 0.5,
+        top_k: int = 8,
+        max_new_tokens: int = 1500,
+        repetition_penalty: float = 10.0,
+        seed: int = -1,
+        language: str | None = None,
+        vocoder_backend: str | None = None,
+        emotion: str | None = None,
+    ):
+        text, ref_path = self._validate_request(text, ref_audio)
+        backend = (vocoder_backend or self.default_vocoder).strip().lower()
+        if backend not in self.vocoders:
+            raise ValueError(
+                f"vocoder backend {backend!r} is unavailable; "
+                f"choose one of {sorted(self.vocoders)}"
+            )
+        codes, prompt_features, prompt_feature_length, t2s_elapsed = (
+            self._generate_semantics(
+                text=text,
+                ref_path=ref_path,
+                temperature=temperature,
+                top_k=top_k,
+                max_new_tokens=max_new_tokens,
+                repetition_penalty=repetition_penalty,
+                seed=seed,
+                language=language,
+                emotion=emotion,
+                need_prompt_features=backend == "s2vae",
+            )
+        )
+        return self._vocode(
+            backend=backend,
+            codes=codes,
+            ref_path=ref_path,
+            prompt_features=prompt_features,
+            prompt_feature_length=prompt_feature_length,
+            t2s_elapsed=t2s_elapsed,
+        )
+
+    def generate_comparison(
+        self,
+        text: str,
+        ref_audio,
+        temperature: float = 0.5,
+        top_k: int = 8,
+        max_new_tokens: int = 1500,
+        repetition_penalty: float = 10.0,
+        seed: int = -1,
+        language: str | None = None,
+    ):
+        missing = [name for name in ("s2vae", "s2mel") if name not in self.vocoders]
+        if missing:
+            raise ValueError(f"comparison requires both backends; missing {missing}")
+        text, ref_path = self._validate_request(text, ref_audio)
+        codes, prompt_features, prompt_feature_length, t2s_elapsed = (
+            self._generate_semantics(
+                text=text,
+                ref_path=ref_path,
+                temperature=temperature,
+                top_k=top_k,
+                max_new_tokens=max_new_tokens,
+                repetition_penalty=repetition_penalty,
+                seed=seed,
+                language=language,
+                emotion=None,
+                need_prompt_features=True,
+            )
+        )
+        s2vae = self._vocode(
+            backend="s2vae",
+            codes=codes,
+            ref_path=ref_path,
+            prompt_features=prompt_features,
+            prompt_feature_length=prompt_feature_length,
+            t2s_elapsed=t2s_elapsed,
+        )
+        s2mel = self._vocode(
+            backend="s2mel",
+            codes=codes,
+            ref_path=ref_path,
+            prompt_features=None,
+            prompt_feature_length=None,
+            t2s_elapsed=t2s_elapsed,
+        )
+        return s2vae[0], s2vae[1], s2mel[0], s2mel[1]
 
 
 def _as_audio_path(ref_audio) -> str | None:
@@ -333,28 +433,26 @@ def build_ui(app: InferenceApp):
                     value="auto",
                     label="语言控制（auto = 不加标签）",
                 )
-                vocoder_backend = gr.Dropdown(
-                    choices=list(app.vocoders),
-                    value=app.default_vocoder,
-                    label="声学后端（s2vae = 48kHz，s2mel = 22.05kHz）",
-                )
                 with gr.Accordion("生成参数", open=False):
                     temperature = gr.Slider(0.1, 1.5, value=0.5, step=0.05, label="temperature")
                     top_k = gr.Slider(1, 200, value=8, step=1, label="top_k")
                     max_new_tokens = gr.Slider(64, 2000, value=1500, step=16, label="max_new_tokens")
                     repetition_penalty = gr.Slider(1.0, 10.0, value=10.0, step=0.05, label="repetition_penalty")
                     seed = gr.Number(value=-1, precision=0, label="seed（-1 为随机）")
-                btn = gr.Button("生成", variant="primary")
+                btn = gr.Button("生成 S2VAE + S2Mel 对比", variant="primary")
             with gr.Column():
-                audio_out = gr.Audio(label="合成结果", type="filepath")
-                status = gr.Textbox(label="状态", lines=3)
+                audio_s2vae = gr.Audio(label="S2VAE（48kHz）", type="filepath")
+                status_s2vae = gr.Textbox(label="S2VAE 状态", lines=3)
+            with gr.Column():
+                audio_s2mel = gr.Audio(label="S2Mel（22.05kHz）", type="filepath")
+                status_s2mel = gr.Textbox(label="S2Mel 状态", lines=3)
         btn.click(
-            fn=app.generate,
+            fn=app.generate_comparison,
             inputs=[
                 text, ref, temperature, top_k, max_new_tokens,
-                repetition_penalty, seed, language, vocoder_backend,
+                repetition_penalty, seed, language,
             ],
-            outputs=[audio_out, status],
+            outputs=[audio_s2vae, status_s2vae, audio_s2mel, status_s2mel],
         )
         with gr.Row():
             with gr.Column():
