@@ -2,6 +2,8 @@ from pathlib import Path
 from unittest.mock import Mock, call
 import sys
 
+import numpy as np
+import pytest
 import torch
 
 
@@ -10,6 +12,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from webui import InferenceApp  # noqa: E402
+import infer as t2s_infer  # noqa: E402
 
 
 def test_comparison_reuses_one_semantic_generation_for_both_backends():
@@ -56,3 +59,28 @@ def test_comparison_reuses_one_semantic_generation_for_both_backends():
             t2s_elapsed=1.25,
         ),
     ]
+
+
+def test_s2vae_prompt_minimum_is_two_seconds(monkeypatch):
+    vocoder = t2s_infer.S2VAEVocoder.__new__(t2s_infer.S2VAEVocoder)
+    vocoder.device = torch.device("cpu")
+    vocoder.prompt_min_seconds = 2.0
+    vocoder.prompt_max_seconds = 15.0
+    vocoder.audio_vae = type(
+        "AudioVAE", (), {"sample_rate": 48000, "hop_size": 1920}
+    )()
+
+    monkeypatch.setattr(
+        "librosa.load",
+        lambda *args, **kwargs: (np.zeros(32000, dtype=np.float32), 16000),
+    )
+    audio, sample_count = vocoder._load_prompt_wav("ref.wav")
+    assert audio.shape == (1, 96000)
+    assert sample_count == 96000
+
+    monkeypatch.setattr(
+        "librosa.load",
+        lambda *args, **kwargs: (np.zeros(31900, dtype=np.float32), 16000),
+    )
+    with pytest.raises(ValueError, match="at least 2 seconds"):
+        vocoder._load_prompt_wav("too-short.wav")

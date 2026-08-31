@@ -94,6 +94,7 @@ TARGET_LENGTH_RATIO = 1.72
 DIFFUSION_STEPS = 25
 INFERENCE_CFG_RATE = 0.7
 PROMPT_MAX_SECONDS = 15.0
+S2VAE_PROMPT_MIN_SECONDS = 2.0
 CODE_FPS = 25.0
 FEATURE_FPS = 50.0
 CODEBOOK_SIZE = 8192
@@ -363,6 +364,7 @@ class S2VAEVocoder:
         diffusion_steps: int = DIFFUSION_STEPS,
         cfg_rate: float = INFERENCE_CFG_RATE,
         temperature: float = 0.7,
+        prompt_min_seconds: float = S2VAE_PROMPT_MIN_SECONDS,
         prompt_max_seconds: float = PROMPT_MAX_SECONDS,
     ):
         root = os.path.abspath(semantic2any_root)
@@ -377,7 +379,13 @@ class S2VAEVocoder:
         self.diffusion_steps = int(diffusion_steps)
         self.cfg_rate = float(cfg_rate)
         self.temperature = float(temperature)
+        self.prompt_min_seconds = float(prompt_min_seconds)
         self.prompt_max_seconds = min(float(prompt_max_seconds), 30.0)
+        if self.prompt_min_seconds <= 0 or self.prompt_min_seconds > self.prompt_max_seconds:
+            raise ValueError(
+                "s2vae prompt_min_seconds must be positive and no greater than "
+                f"prompt_max_seconds ({self.prompt_min_seconds} vs {self.prompt_max_seconds})"
+            )
 
         cfg = OmegaConf.load(config_path)
         model = Semantic2MelModel(cfg.s2mel)
@@ -409,8 +417,12 @@ class S2VAEVocoder:
         audio = torchaudio.functional.resample(audio, sr, int(self.audio_vae.sample_rate))
         sample_count = int(audio.shape[-1])
         hop = int(self.audio_vae.hop_size)
-        if sample_count // hop < 75:
-            raise ValueError("s2vae reference audio must be at least 3 seconds")
+        min_frames = int(np.ceil(self.prompt_min_seconds * CODE_FPS))
+        if sample_count // hop < min_frames:
+            raise ValueError(
+                "s2vae reference audio must be at least "
+                f"{self.prompt_min_seconds:g} seconds"
+            )
         return audio.to(self.device), sample_count
 
     @torch.no_grad()
@@ -444,8 +456,12 @@ class S2VAEVocoder:
         )
         prompt_codes = self._prompt_codes(prompt_features, prompt_feature_length)
         prompt_frames = min(int(prompt_latent.shape[-1]), int(prompt_codes.numel()))
-        if prompt_frames < 75:
-            raise ValueError("s2vae aligned reference prompt is shorter than 3 seconds")
+        min_frames = int(np.ceil(self.prompt_min_seconds * CODE_FPS))
+        if prompt_frames < min_frames:
+            raise ValueError(
+                "s2vae aligned reference prompt is shorter than "
+                f"{self.prompt_min_seconds:g} seconds"
+            )
         prompt_latent = prompt_latent[:, :, :prompt_frames].float()
         prompt_codes = prompt_codes[:prompt_frames]
 
@@ -574,6 +590,11 @@ def parse_args(argv=None):
     p.add_argument("--s2vae-checkpoint", default=DEFAULT_S2VAE_CHECKPOINT)
     p.add_argument("--dots-tts-dir", default=DEFAULT_DOTS_TTS_DIR)
     p.add_argument("--s2vae-temperature", type=float, default=0.7)
+    p.add_argument(
+        "--s2vae-prompt-min-seconds",
+        type=float,
+        default=S2VAE_PROMPT_MIN_SECONDS,
+    )
     p.add_argument("--w2v-bert-path", default=DEFAULT_W2V_BERT)
     p.add_argument("--stats-path", default=DEFAULT_STATS)
     p.add_argument("--device", default="cuda:0")
@@ -654,6 +675,7 @@ def main(argv=None) -> int:
             diffusion_steps=args.diffusion_steps,
             cfg_rate=args.cfg_rate,
             temperature=args.s2vae_temperature,
+            prompt_min_seconds=args.s2vae_prompt_min_seconds,
         )
         wav, info = vocoder.vocode(
             codes,

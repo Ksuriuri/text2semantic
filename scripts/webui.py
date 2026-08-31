@@ -91,6 +91,7 @@ class InferenceApp:
                 diffusion_steps=args.diffusion_steps,
                 cfg_rate=args.cfg_rate,
                 temperature=args.s2vae_temperature,
+                prompt_min_seconds=args.s2vae_prompt_min_seconds,
             )
         if "s2mel" in requested:
             print("loading IndexTTS-2.5 codec + s2mel + BigVGAN", flush=True)
@@ -366,6 +367,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--s2vae-checkpoint", default=t2s_infer.DEFAULT_S2VAE_CHECKPOINT)
     p.add_argument("--dots-tts-dir", default=t2s_infer.DEFAULT_DOTS_TTS_DIR)
     p.add_argument("--s2vae-temperature", type=float, default=0.7)
+    p.add_argument(
+        "--s2vae-prompt-min-seconds",
+        type=float,
+        default=t2s_infer.S2VAE_PROMPT_MIN_SECONDS,
+    )
     p.add_argument("--w2v-bert-path", default=t2s_infer.DEFAULT_W2V_BERT)
     p.add_argument("--stats-path", default=t2s_infer.DEFAULT_STATS)
     p.add_argument("--device", default="cuda:0")
@@ -498,6 +504,7 @@ def create_app(app: InferenceApp) -> FastAPI:
             "vocoder_default": app.default_vocoder,
             "vocoder_backends": list(app.vocoders),
             "checkpoint": app.args.checkpoint,
+            "s2vae_prompt_min_seconds": app.args.s2vae_prompt_min_seconds,
             "default_params": {
                 "temperature": 0.5,
                 "top_k": 8,
