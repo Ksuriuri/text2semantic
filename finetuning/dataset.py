@@ -93,9 +93,9 @@ class Text2SemanticDataset(Dataset):
         self.ref_max_seconds = ref_max_seconds
         # Packed refs are read out of the shard and decoded here, in the
         # DataLoader worker, so no ref ever lands on disk.
-        self.ref_audio_in_memory = ref_store is not None and hasattr(
-            ref_store, "read_ref"
-        )
+        self.ref_audio_in_memory = (
+            ref_store is not None and hasattr(ref_store, "read_ref")
+        ) or speaker_mel_extractor is not None
         if not 0.0 <= punctuation_dropout_prob <= 1.0:
             raise ValueError("punctuation_dropout_prob must be in [0, 1].")
         self.punctuation_dropout_prob = punctuation_dropout_prob
@@ -320,6 +320,9 @@ class Text2SemanticDataset(Dataset):
             if explicit == self._target_audio_path(item):
                 return None
             return self._decode_audio(explicit, explicit)
+        if self.ref_store is None:
+            path = self._speaker_audio_path(item, index)
+            return None if path is None else self._decode_audio(path, path)
         speaker_key = self._speaker_key(item)
         if speaker_key is None:
             return None
@@ -545,8 +548,8 @@ class Text2SemanticDataset(Dataset):
             "speech_attention_mask": speech_mask,
             "labels": labels,
         }
-        # In-memory refs travel as waveforms; the loose-file path still sends
-        # paths for the encoder to open itself.
+        # Packed and loose refs both travel as features when worker-side
+        # preprocessing is enabled; no file opening is left for the GPU rank.
         if samples[0].get("speaker_audio") is not None:
             waveforms = [sample["speaker_audio"] for sample in samples]
             if self.speaker_mel_extractor is None:
