@@ -305,6 +305,39 @@ def parse_args():
         default=2,
         help="Maximum span replacements inside one freeform description.",
     )
+    parser.add_argument(
+        "--drop_leading_tag_prob",
+        type=float,
+        default=0.4,
+        help=(
+            "Train-only: probability of dropping the leading closed-marker "
+            "span, and only when a later non-pause tag exists. Eval keeps it."
+        ),
+    )
+    parser.add_argument(
+        "--alt_min_confidence",
+        type=float,
+        default=0.3,
+        help=(
+            "Include an annotation alternative in the same control span when "
+            "its confidence is at least this value."
+        ),
+    )
+    parser.add_argument(
+        "--pause_drop_all_prob",
+        type=float,
+        default=0.25,
+        help="Train-only: drop every pause event in the sentence.",
+    )
+    parser.add_argument(
+        "--pause_drop_partial_prob",
+        type=float,
+        default=0.35,
+        help=(
+            "Train-only: drop a proper subset of pause events (keep at least "
+            "one). Remainder probability keeps all pauses. Eval keeps all."
+        ),
+    )
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--eval_steps", type=int, default=1000)
@@ -1353,9 +1386,14 @@ def train():
             synonym_table=synonym_table,
             deterministic=False,
             seed=args.seed,
+            drop_leading_tag_prob=args.drop_leading_tag_prob,
+            alt_min_confidence=args.alt_min_confidence,
+            pause_drop_all_prob=args.pause_drop_all_prob,
+            pause_drop_partial_prob=args.pause_drop_partial_prob,
         )
         # Eval follows the same 60/40 language-tag distribution, but the draw is
-        # stable by row id and synonym augmentation is off.
+        # stable by row id and synonym augmentation is off. Leading closed
+        # markers stay so the eval curve measures the full conditioned text.
         eval_conditioner = TextConditioner(
             language_tag_prob=args.language_tag_prob,
             emotion_conditioning=args.emotion_conditioning,
@@ -1364,6 +1402,10 @@ def train():
             synonym_table=synonym_table,
             deterministic=True,
             seed=args.seed,
+            drop_leading_tag_prob=0.0,
+            alt_min_confidence=args.alt_min_confidence,
+            pause_drop_all_prob=0.0,
+            pause_drop_partial_prob=0.0,
         )
     train_dataset = build_dataset(
         train_data,
@@ -1404,7 +1446,11 @@ def train():
         "Text conditioning: language_tag_prob="
         f"{args.language_tag_prob}, emotion={args.emotion_conditioning}, "
         f"train_synonym_prob={args.emotion_synonym_prob if args.emotion_conditioning else 0}, "
-        "eval_synonym_prob=0"
+        "eval_synonym_prob=0, "
+        f"drop_leading_tag_prob={args.drop_leading_tag_prob if args.emotion_conditioning else 0}, "
+        f"alt_min_confidence={args.alt_min_confidence}, "
+        f"pause_drop_all={args.pause_drop_all_prob if args.emotion_conditioning else 0}, "
+        f"pause_drop_partial={args.pause_drop_partial_prob if args.emotion_conditioning else 0}"
     )
     train_generator = torch.Generator()
     train_generator.manual_seed(args.seed)

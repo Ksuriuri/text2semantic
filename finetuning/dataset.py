@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import io
+import os
 import random
+import subprocess
 
 import librosa
 import numpy as np
@@ -328,13 +330,54 @@ class Text2SemanticDataset(Dataset):
         name, payload = picked
         return self._decode_audio(io.BytesIO(payload), name)
 
+    def _is_opus_ref(self, source, name):
+        for candidate in (name, source):
+            if isinstance(candidate, (str, os.PathLike)):
+                if str(candidate).lower().endswith(".opus"):
+                    return True
+        return False
+
+    def _decode_opus_ffmpeg(self, source, name):
+        """Decode opus via ffmpeg. E0904 libsndfile cannot read opus."""
+        ffmpeg = os.environ.get("FFMPEG_BIN", "ffmpeg")
+        cmd = [
+            ffmpeg,
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+        ]
+        input_bytes = None
+        if isinstance(source, (str, os.PathLike)):
+            cmd.extend(["-i", os.fspath(source)])
+        else:
+            if hasattr(source, "seek"):
+                source.seek(0)
+            input_bytes = source.read()
+            cmd.extend(["-i", "pipe:0"])
+        duration = getattr(self, "ref_max_seconds", None)
+        if duration is not None and float(duration) > 0:
+            cmd.extend(["-t", f"{float(duration):.3f}"])
+        cmd.extend(["-ac", "1", "-ar", "16000", "-f", "f32le", "pipe:1"])
+        proc = subprocess.run(cmd, input=input_bytes, capture_output=True, check=False)
+        if proc.returncode != 0:
+            err = (proc.stderr or b"").decode("utf-8", "replace").strip()[-400:]
+            raise ValueError(f"opus decode failed for {name}: {err or proc.returncode}")
+        audio = np.frombuffer(proc.stdout, dtype=np.float32)
+        if audio.size == 0:
+            raise ValueError(f"ref audio decoded to nothing: {name}")
+        return np.ascontiguousarray(audio, dtype=np.float32)
+
     def _decode_audio(self, source, name):
-        audio, _ = librosa.load(
-            source,
-            sr=16000,
-            mono=True,
-            duration=self.ref_max_seconds,
-        )
+        if self._is_opus_ref(source, name):
+            audio = self._decode_opus_ffmpeg(source, name)
+        else:
+            audio, _ = librosa.load(
+                source,
+                sr=16000,
+                mono=True,
+                duration=self.ref_max_seconds,
+            )
         if audio.size == 0:
             raise ValueError(f"ref audio decoded to nothing: {name}")
         return np.ascontiguousarray(audio, dtype=np.float32)
