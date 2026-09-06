@@ -279,18 +279,22 @@ def _keep(row, params, speaker_counts, ref_probe):
     if not isinstance(text, str) or not text.strip():
         return False
     key = _speaker_key(row, params.speaker_key_fields)
+    explicit = row.get("ref_audio") or row.get("ref_audio_path")
+    target = row.get("audio") or row.get("audio_path")
+    has_explicit_ref = explicit is not None and explicit != target
     if ref_probe is not None:
         target_id = row.get("id")
         if not ref_probe.usable(
             key, None if target_id is None else str(target_id)
         ):
             return False
-    elif key is None:
+    elif key is None and not has_explicit_ref:
         return False
     if (
         key is not None
         and params.min_speaker_records > 1
         and speaker_counts.get(key, 0) < params.min_speaker_records
+        and not has_explicit_ref
     ):
         return False
     duration = row.get("duration")

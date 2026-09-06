@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import io
+from collections import OrderedDict
 import os
 import random
 import subprocess
@@ -82,6 +83,10 @@ class Text2SemanticDataset(Dataset):
                     else self._collect_speaker_audio_paths(data)
                 )
             )
+        # loose_refs + ManifestIndex used to leave this map empty, so every
+        # train row without explicit ref_audio failed in the DataLoader.
+        if self.ref_store is None and not self.speaker_audio_paths_by_id:
+            self.speaker_audio_paths_by_id = self._collect_speaker_audio_paths(data)
         self.min_speaker_records = min_speaker_records
         self.max_target_seconds = max_target_seconds
         self.min_target_seconds = min_target_seconds
@@ -105,7 +110,7 @@ class Text2SemanticDataset(Dataset):
         # instead of walking the whole dataset per sample.
         self.ref_substitution_attempts = 8
         self.substituted_rows = 0
-        self._semantic_code_cache = {}
+        self._semantic_code_cache = OrderedDict()
         if self.prefiltered:
             self.data = data
         else:
@@ -368,9 +373,43 @@ class Text2SemanticDataset(Dataset):
             raise ValueError(f"ref audio decoded to nothing: {name}")
         return np.ascontiguousarray(audio, dtype=np.float32)
 
+    def _decode_opus_av(self, source, name):
+        """Decode in this worker; close the container even on early truncation."""
+        import av
+
+        if isinstance(source, os.PathLike):
+            source = os.fspath(source)
+        elif hasattr(source, "seek"):
+            source.seek(0)
+        duration = getattr(self, "ref_max_seconds", None)
+        limit = round(float(duration) * 16000) if duration and duration > 0 else None
+        chunks = []
+        size = 0
+        with av.open(source, mode="r") as container:
+            stream = container.streams.audio[0]
+            stream.codec_context.thread_count = 1
+            resampler = av.AudioResampler(format="flt", layout="mono", rate=16000)
+            for frame in container.decode(stream):
+                for converted in resampler.resample(frame):
+                    chunk = converted.to_ndarray().reshape(-1)
+                    chunks.append(chunk)
+                    size += chunk.size
+                if limit is not None and size >= limit:
+                    break
+            else:
+                # Include the resampler's delayed tail for short/full clips.
+                for converted in resampler.resample(None):
+                    chunks.append(converted.to_ndarray().reshape(-1))
+        if not chunks:
+            raise ValueError(f"ref audio decoded to nothing: {name}")
+        audio = np.concatenate(chunks)
+        if limit is not None:
+            audio = audio[:limit]
+        return np.ascontiguousarray(audio, dtype=np.float32)
+
     def _decode_audio(self, source, name):
         if self._is_opus_ref(source, name):
-            audio = self._decode_opus_ffmpeg(source, name)
+            audio = self._decode_opus_av(source, name)
         else:
             audio, _ = librosa.load(
                 source,
@@ -449,10 +488,15 @@ class Text2SemanticDataset(Dataset):
                 "Each sample needs 'semantic_codes' or compact semantic code fields."
             )
         path = item["semantic_code_path"]
-        codes = self._semantic_code_cache.get(path)
+        codes = self._semantic_code_cache.pop(path, None)
         if codes is None:
             codes = np.memmap(path, dtype="<u2", mode="r")
-            self._semantic_code_cache[path] = codes
+        self._semantic_code_cache[path] = codes
+        # Persistent workers must not retain one open mmap per corpus shard.
+        if len(self._semantic_code_cache) > 128:
+            oldest = next(iter(self._semantic_code_cache))
+            evicted = self._semantic_code_cache.pop(oldest)
+            evicted._mmap.close()
         offset = int(item["semantic_code_offset"])
         length = int(item["semantic_code_length"])
         if offset < 0 or length <= 0 or offset + length > len(codes):

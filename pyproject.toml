@@ -12,6 +12,7 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 dependencies = [
     "accelerate==1.12.0",
+    "av>=14,<17",
     "einops>=0.8.1",
     # Not optional, despite the name. Qwen3.5 is a hybrid model: 18 of its 24
     # layers are linear attention (gated delta rule), and without this package

@@ -339,6 +339,11 @@ def parse_args():
         ),
     )
     parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--prefetch_factor", type=int, default=4)
+    parser.add_argument(
+        "--persistent_workers", action=argparse.BooleanOptionalAction, default=True,
+        help="Keep loader workers alive across evals/epochs (when num_workers > 0).",
+    )
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--eval_steps", type=int, default=1000)
     parser.add_argument(
@@ -996,6 +1001,18 @@ def wandb_init_kwargs(run_name, run_id):
     return kwargs
 
 
+def loader_worker_options(args):
+    if args.num_workers < 0 or args.prefetch_factor < 1:
+        raise ValueError("num_workers must be >= 0 and prefetch_factor must be >= 1")
+    options = {"num_workers": args.num_workers}
+    if args.num_workers > 0:
+        options.update(
+            persistent_workers=args.persistent_workers,
+            prefetch_factor=args.prefetch_factor,
+        )
+    return options
+
+
 def steps_for_epochs(
     num_batches, num_processes, gradient_accumulation_steps, num_epochs
 ):
@@ -1454,12 +1471,13 @@ def train():
     )
     train_generator = torch.Generator()
     train_generator.manual_seed(args.seed)
+    worker_options = loader_worker_options(args)
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=train_dataset.collate_fn,
-        num_workers=args.num_workers,
+        **worker_options,
         pin_memory=True,
         generator=train_generator,
     )
@@ -1468,7 +1486,7 @@ def train():
         batch_size=args.eval_batch_size,
         shuffle=False,
         collate_fn=eval_dataset.collate_fn,
-        num_workers=args.num_workers,
+        **worker_options,
         pin_memory=True,
     )
 
