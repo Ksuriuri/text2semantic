@@ -235,10 +235,15 @@ def test_conditioner_uses_annotations_and_can_drop_leading():
         drop_leading_tag_prob=0.0,
         deterministic=True,
     )
-    assert keep(item) == (
-        "<|emo_start|>calm, sigh, chuckles<|emo_end|>Hello"
-        "<|emo_start|>gentle<|emo_end|>there."
-    )
+    kept = keep(item)
+    assert kept.endswith("<|emo_start|>gentle<|emo_end|>there.")
+    assert kept.startswith("<|emo_start|>")
+    leading = kept.split("<|emo_end|>", 1)[0].removeprefix("<|emo_start|>")
+    assert set(part.strip() for part in leading.split(",")) == {
+        "calm",
+        "sigh",
+        "chuckles",
+    }
     drop = TextConditioner(
         emotion_conditioning=True,
         drop_leading_tag_prob=1.0,
@@ -263,6 +268,25 @@ def test_leading_tag_stays_when_only_later_tags_are_pause():
     assert render_closed_markers(text, only_lead, drop_leading=True).startswith(
         "<|emo_start|>calm, sigh<|emo_end|>"
     )
+
+
+def test_same_index_emotion_and_event_order_is_random():
+    text = "Hello there."
+    annotations = [
+        {"type": "emotion", "label": "calm", "insert_char_index": 0, "alternatives": []},
+        {"type": "event", "label": "sigh", "insert_char_index": 0, "alternatives": []},
+    ]
+    assert render_closed_markers(text, annotations).startswith(
+        "<|emo_start|>calm, sigh<|emo_end|>"
+    )
+    seen = {
+        render_closed_markers(text, annotations, rng=random.Random(seed)).split(
+            "<|emo_end|>", 1
+        )[0]
+        for seed in range(80)
+    }
+    assert "<|emo_start|>calm, sigh" in seen
+    assert "<|emo_start|>sigh, calm" in seen
 
 
 def test_pause_dropout_has_three_distinct_modes():

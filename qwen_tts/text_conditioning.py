@@ -271,20 +271,34 @@ def marker_labels(marker, alt_min_confidence=ALT_MIN_CONFIDENCE):
     return _dedupe_labels(labels)
 
 
-def group_adjacent_markers(annotations, transcript):
+def _order_same_index_markers(markers, rng):
+    """Order markers that share one character index.
+
+    Training passes an rng so emotion vs event is not fixed. Callers without
+    an rng (tests, offline render) keep emotion before event.
+    """
+    items = list(markers)
+    if len(items) <= 1:
+        return items
+    if rng is not None:
+        rng.shuffle(items)
+        return items
+    type_rank = {"emotion": 0, "event": 1}
+    items.sort(key=lambda marker: type_rank.get(str(marker.get("type") or ""), 2))
+    return items
+
+
+def group_adjacent_markers(annotations, transcript, rng=None):
     """Cluster markers that share an index or have only whitespace between them."""
-    items = []
+    buckets = {}
     for marker in annotations or []:
         if not str(marker.get("label") or "").strip():
             continue
-        items.append(marker)
-    type_rank = {"emotion": 0, "event": 1}
-    items.sort(
-        key=lambda marker: (
-            int(marker.get("insert_char_index") or 0),
-            type_rank.get(str(marker.get("type") or ""), 2),
-        )
-    )
+        index = int(marker.get("insert_char_index") or 0)
+        buckets.setdefault(index, []).append(marker)
+    items = []
+    for index in sorted(buckets):
+        items.extend(_order_same_index_markers(buckets[index], rng))
     groups = []
     for marker in items:
         index = int(marker.get("insert_char_index") or 0)
@@ -412,10 +426,11 @@ def render_closed_markers(
     *,
     alt_min_confidence=ALT_MIN_CONFIDENCE,
     drop_leading=False,
+    rng=None,
 ):
     """Insert closed-vocab spans at their character indices."""
     text = transcript if isinstance(transcript, str) else ""
-    groups = group_adjacent_markers(annotations, text)
+    groups = group_adjacent_markers(annotations, text, rng=rng)
     if (
         drop_leading
         and groups
@@ -505,6 +520,7 @@ class TextConditioner:
                 annotations,
                 alt_min_confidence=self.alt_min_confidence,
                 drop_leading=drop_leading,
+                rng=rng,
             )
             used_closed_markers = True
         elif tags:
