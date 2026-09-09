@@ -59,7 +59,7 @@ class InferenceApp:
         self.t2s_pool: queue.Queue = queue.Queue()
         self.vocoder_lock = threading.Lock()
         self.vocoder_stream = torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
-        for i in range(n):
+        for i in range(0 if getattr(args, "ar_backend", "hf") == "vllm" else n):
             print(f"loading text2semantic replica {i + 1}/{n} from {args.checkpoint}", flush=True)
             t2s = t2s_infer.load_t2s(
                 args.checkpoint,
@@ -91,6 +91,7 @@ class InferenceApp:
                 indextts_root=args.indextts_root,
                 codec_dir=args.codec_dir,
                 device=self.device,
+                max_batch_size=getattr(args, "acoustic_batch_size", 1),
                 diffusion_steps=args.diffusion_steps,
                 cfg_rate=args.cfg_rate,
                 temperature=args.s2vae_temperature,
@@ -103,6 +104,7 @@ class InferenceApp:
                 codec_dir=args.codec_dir,
                 bigvgan_dir=args.bigvgan_dir,
                 device=self.device,
+                max_batch_size=getattr(args, "acoustic_batch_size", 1),
                 diffusion_steps=args.diffusion_steps,
                 cfg_rate=args.cfg_rate,
                 duration_factor=args.duration_factor,
@@ -393,8 +395,16 @@ def _as_audio_path(ref_audio) -> str | None:
     return None
 
 
-def parse_args(argv=None) -> argparse.Namespace:
+def parse_args(argv=None, *, api=False) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--ar-backend", choices=["hf", "vllm"], default="hf")
+    p.add_argument("--vllm-model", help="Directory produced by vllm_export")
+    p.add_argument("--vllm-memory-fraction", type=float, default=0.35)
+    p.add_argument("--acoustic-batch-size", type=int, default=8 if api else 1)
+    p.add_argument("--batch-wait-ms", type=float, default=5)
+    p.add_argument("--max-concurrent", type=int, default=16)
+    p.add_argument("--warmup-ref", help="Local reference for startup warmup and deep health")
+    p.add_argument("--request-timeout", type=float, default=180)
     p.add_argument("--checkpoint", required=True, help="HF checkpoint dir (model.safetensors + tokenizer)")
     p.add_argument("--indextts-root", default=t2s_infer.DEFAULT_INDEXTTS_ROOT)
     p.add_argument("--codec-dir", default=t2s_infer.DEFAULT_CODEC_DIR)
@@ -428,7 +438,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--duration-factor", type=float, default=1.0)
     p.add_argument("--host", default=os.environ.get("WEBUI_HOST", "0.0.0.0"))
     p.add_argument("--port", type=int, default=int(os.environ.get("WEBUI_PORT", "7860")))
-    p.add_argument("--t2s-replicas", type=int, default=int(os.environ.get("T2S_REPLICAS", "2")),
+    p.add_argument("--t2s-replicas", type=int, default=int(os.environ.get("T2S_REPLICAS", "1" if api else "2")),
                    help="parallel AR copies; vocoder stays shared")
     p.add_argument(
         "--examples-dir",
@@ -625,6 +635,8 @@ def create_app(app: InferenceApp) -> FastAPI:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.ar_backend != "hf":
+        raise SystemExit("Use scripts/api_server.py for the asynchronous vLLM backend")
     for label, path in (
         ("checkpoint", args.checkpoint),
         ("indextts-root", args.indextts_root),
