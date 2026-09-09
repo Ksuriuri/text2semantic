@@ -8,6 +8,34 @@ from torch.nn.utils.rnn import pad_sequence
 
 @torch.inference_mode()
 def flow_batch(cfm, items, *, steps, cfg_rate, temperature=1.0, drop_style=False):
+    # Upstream WaveNet uses reflection padding. Every convolution must reflect
+    # around each request's true end, not the padded batch end.
+    wavenet = getattr(cfm.estimator, "wavenet", None)
+    handles = []
+    if wavenet is not None and len({item["mu"].shape[1] for item in items}) > 1:
+        frame_counts = [item["mu"].shape[1] for item in items]
+        if cfg_rate > 0:
+            frame_counts *= 2
+        lengths = torch.tensor(frame_counts, device=items[0]["mu"].device)[:, None]
+        period = (2 * lengths - 2).clamp_min(1)
+        positions = torch.arange(max(frame_counts), device=lengths.device)[None, :]
+        folded = positions % period
+        indices = torch.minimum(folded, period - folded).clamp_min(0)[:, None, :]
+        def reflect_input(module, args):
+            x = args[0]
+            return (x.gather(-1, indices.expand(-1, x.shape[1], -1)), *args[1:])
+        for layer in getattr(wavenet, "in_layers", []):
+            if getattr(layer, "pad_mode", None) == "reflect":
+                handles.append(layer.register_forward_pre_hook(reflect_input))
+    try:
+        return _flow_batch(cfm, items, steps=steps, cfg_rate=cfg_rate,
+                           temperature=temperature, drop_style=drop_style)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+def _flow_batch(cfm, items, *, steps, cfg_rate, temperature=1.0, drop_style=False):
     if not items or steps < 1:
         raise ValueError("A nonempty batch and positive steps are required")
     mu = pad_sequence([item["mu"][0] for item in items], batch_first=True)

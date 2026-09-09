@@ -88,3 +88,34 @@ def test_bad_reference_does_not_fail_other_batch_members():
         assert isinstance(values[1], tuple)
         await queue.close()
     asyncio.run(run())
+
+
+def test_padded_query_states_preserve_reflection_boundaries():
+    class ReflectConv(torch.nn.Module):
+        pad_mode = "reflect"
+        def forward(self, x):
+            return torch.nn.functional.avg_pool1d(torch.nn.functional.pad(x,(1,1),mode='reflect'),3,stride=1)
+    class WaveNet(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.in_layers = torch.nn.ModuleList([ReflectConv(), ReflectConv()])
+        def forward(self, x, mask):
+            for layer in self.in_layers:
+                x = layer(x) * mask
+            return x
+    class ConvEstimator(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.wavenet = WaveNet()
+        def forward(self, x, prompt, lens, t, style, mu):
+            mask = torch.arange(x.shape[-1])[None, None, :] < lens[:, None, None]
+            return self.wavenet(x + 1, mask)
+    estimator = ConvEstimator()
+    cfm = SimpleNamespace(in_channels=2, estimator=estimator, zero_prompt_speech_token=False)
+    items = [item(7, 2, 1), item(11, 3, 2)]
+    batch = flow_batch(cfm, items, steps=3, cfg_rate=0)
+    for row, wave in zip(items, batch):
+        single = flow_batch(cfm, [row], steps=3, cfg_rate=0)[0]
+        torch.testing.assert_close(wave, single, atol=0, rtol=0)
+    assert not estimator.wavenet._forward_pre_hooks
+    assert all(not layer._forward_pre_hooks for layer in estimator.wavenet.in_layers)

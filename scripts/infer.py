@@ -300,9 +300,8 @@ class IndexTTS25Vocoder:
         audio_16k = torchaudio.functional.resample(audio, sr, 16000)
         return audio_22k, audio_16k
 
-    @torch.no_grad()
     @torch.inference_mode()
-    def prepare(self, codes: torch.Tensor, ref_audio: str) -> tuple[torch.Tensor, dict]:
+    def prepare(self, codes: torch.Tensor, ref_audio: str) -> dict:
         audio_22k, audio_16k = self._load_ref(ref_audio)
         audio_22k = audio_22k.to(self.device)
         audio_16k = audio_16k.to(self.device)
@@ -512,7 +511,6 @@ class S2VAEVocoder:
         codes, _ = self.semantic_codec.quantize(feature)
         return _strip_special_codes(codes)
 
-    @torch.no_grad()
     @torch.inference_mode()
     def prepare(
         self,
@@ -521,7 +519,7 @@ class S2VAEVocoder:
         *,
         prompt_features: torch.Tensor,
         prompt_feature_length: int,
-    ) -> tuple[torch.Tensor, dict]:
+    ) -> dict:
         target_codes = _strip_special_codes(codes).to(self.device)
         if target_codes.numel() < 8:
             raise ValueError("s2vae target must contain at least 8 codes")

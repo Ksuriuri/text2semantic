@@ -50,6 +50,9 @@ class MicrobatchQueue:
                 return [error] * len(payloads)
             if len(payloads) == 1:
                 return [error]
+            # Drop failed forward frames before retrying smaller batches; an
+            # OOM traceback can otherwise retain their GPU intermediates.
+            error.__traceback__ = None
             middle = len(payloads) // 2
             return self._execute(payloads[:middle]) + self._execute(payloads[middle:])
 
@@ -87,7 +90,8 @@ class MicrobatchQueue:
                         results = await asyncio.to_thread(self._execute, [e[0] for e in live])
                         if len(results) != len(live):
                             raise RuntimeError("Acoustic result count mismatch")
-                        self.last_batch_size = len(live)
+                        self.last_batch_size = max((r[1].get("acoustic_batch_size", len(live))
+                            for r in results if not isinstance(r, Exception)), default=0)
                         for (_, future, arrived, _), result in zip(live, results):
                             if not future.done():
                                 if isinstance(result, Exception):
