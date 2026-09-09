@@ -63,8 +63,9 @@ class VLLMSemanticBackend:
         directory = Path(directory)
         if not (directory / "READY").is_file():
             raise ValueError("Run vllm_export before starting the engine")
-        ModelRegistry.register_model("SpeechQwen35ForCausalLM",
-            "qwen_tts.inference.vllm_model:SpeechQwen35ForCausalLM")
+        if "SpeechQwen35ForCausalLM" not in ModelRegistry.get_supported_archs():
+            ModelRegistry.register_model("SpeechQwen35ForCausalLM",
+                "qwen_tts.inference.vllm_model:SpeechQwen35ForCausalLM")
         self.engine = AsyncLLM.from_engine_args(AsyncEngineArgs(
             model=str(directory), skip_tokenizer_init=True,
             enable_prompt_embeds=True, dtype="bfloat16",
