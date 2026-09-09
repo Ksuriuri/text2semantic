@@ -170,8 +170,12 @@ class IndexTTS25Vocoder:
         cfg_rate: float = INFERENCE_CFG_RATE,
         duration_factor: float = 1.0,
         prompt_max_seconds: float = PROMPT_MAX_SECONDS,
+        max_batch_size: int = 8,
     ):
         mods = _import_indextts(indextts_root)
+        self.max_batch_size = int(max_batch_size)
+        if self.max_batch_size < 1:
+            raise ValueError("max_batch_size must be positive")
         self.device = device
         self.diffusion_steps = int(diffusion_steps)
         self.cfg_rate = float(cfg_rate)
@@ -218,9 +222,10 @@ class IndexTTS25Vocoder:
             ignore_modules=[],
             is_distributed=False,
         )
+        self.max_sequence_length = 8192
         self.s2mel = s2mel.to(device).eval()
         self.s2mel.models["cfm"].estimator.setup_caches(
-            max_batch_size=1, max_seq_length=8192
+            max_batch_size=self.max_batch_size * (2 if self.cfg_rate > 0 else 1), max_seq_length=8192
         )
 
         campplus_ckpt = os.path.join(codec_dir, "campplus_cn_common.bin")
@@ -294,6 +299,60 @@ class IndexTTS25Vocoder:
         audio_22k = torchaudio.functional.resample(audio, sr, self.mel_sr)
         audio_16k = torchaudio.functional.resample(audio, sr, 16000)
         return audio_22k, audio_16k
+
+    @torch.no_grad()
+    @torch.inference_mode()
+    def prepare(self, codes: torch.Tensor, ref_audio: str) -> tuple[torch.Tensor, dict]:
+        audio_22k, audio_16k = self._load_ref(ref_audio)
+        audio_22k = audio_22k.to(self.device)
+        audio_16k = audio_16k.to(self.device)
+
+        # Official path: s2mel / codec stay in FP32 (infer_v2_5 sets dtype=None).
+        spk_cond_emb = self.get_emb(audio_16k)
+        ref_mel = self.mel_fn(audio_22k.float())
+        ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(self.device)
+        prompt_condition = self.s2mel.models["length_regulator"](
+            spk_cond_emb,
+            ylens=ref_target_lengths,
+            n_quantizers=3,
+            f0=None,
+        )[0]
+
+        feat = torchaudio.compliance.kaldi.fbank(
+            audio_16k,
+            num_mel_bins=80,
+            dither=0,
+            sample_frequency=16000,
+        )
+        feat = feat - feat.mean(dim=0, keepdim=True)
+        style = self.campplus(feat.unsqueeze(0))
+
+        S_infer = self.decode_codes(codes)
+        target_lengths = torch.LongTensor(
+            [int(S_infer.shape[1] * TARGET_LENGTH_RATIO * self.duration_factor)]
+        ).to(self.device)
+        cond = self.s2mel.models["length_regulator"](
+            S_infer,
+            ylens=target_lengths,
+            n_quantizers=3,
+            f0=None,
+        )[0]
+
+        cat_condition = torch.cat([prompt_condition, cond], dim=1)
+        info = {
+            "n_codes": int(_strip_special_codes(codes).numel()),
+            "code_seconds": float(_strip_special_codes(codes).numel() / CODE_FPS),
+            "decoded_frames": int(S_infer.shape[1]),
+            "decoded_seconds": float(S_infer.shape[1] / FEATURE_FPS),
+            "target_mel_frames": int(target_lengths.item()),
+            "sample_rate": self.mel_sr,
+        }
+        return dict(mu=cat_condition, prompt=ref_mel, style=style, info=info)
+
+    @torch.inference_mode()
+    def vocode_batch(self, requests):
+        from qwen_tts.inference.acoustic_batch import vocode_batch
+        return vocode_batch(self, requests, backend="s2mel")
 
     @torch.no_grad()
     def vocode(self, codes: torch.Tensor, ref_audio: str) -> tuple[torch.Tensor, dict]:
@@ -381,6 +440,7 @@ class S2VAEVocoder:
         temperature: float = 0.7,
         prompt_min_seconds: float = S2VAE_PROMPT_MIN_SECONDS,
         prompt_max_seconds: float = PROMPT_MAX_SECONDS,
+        max_batch_size: int = 8,
     ):
         root = os.path.abspath(semantic2any_root)
         if root not in sys.path:
@@ -390,6 +450,9 @@ class S2VAEVocoder:
         from semantic2any.utils.checkpoint import load_compatible_checkpoint
         from semantic2any.utils.dots_audiovae import DotsAudioVAE
 
+        self.max_batch_size = int(max_batch_size)
+        if self.max_batch_size < 1:
+            raise ValueError("max_batch_size must be positive")
         self.device = device
         self.diffusion_steps = int(diffusion_steps)
         self.cfg_rate = float(cfg_rate)
@@ -405,10 +468,11 @@ class S2VAEVocoder:
         cfg = OmegaConf.load(config_path)
         model = Semantic2MelModel(cfg.s2mel)
         load_compatible_checkpoint(model, checkpoint_path, strict=True)
+        self.max_sequence_length = int(cfg.s2mel.DiT.block_size)
         self.model = model.to(device=device, dtype=torch.float32).eval()
         self.model.requires_grad_(False)
         self.model.models["cfm"].setup_estimator_caches(
-            max_batch_size=2 if self.cfg_rate > 0 else 1,
+            max_batch_size=self.max_batch_size * (2 if self.cfg_rate > 0 else 1),
             max_seq_length=int(cfg.s2mel.DiT.block_size),
         )
         self.audio_vae = DotsAudioVAE.from_pretrained(dots_tts_dir).to(device).eval()
@@ -447,6 +511,68 @@ class S2VAEVocoder:
         )
         codes, _ = self.semantic_codec.quantize(feature)
         return _strip_special_codes(codes)
+
+    @torch.no_grad()
+    @torch.inference_mode()
+    def prepare(
+        self,
+        codes: torch.Tensor,
+        ref_audio: str,
+        *,
+        prompt_features: torch.Tensor,
+        prompt_feature_length: int,
+    ) -> tuple[torch.Tensor, dict]:
+        target_codes = _strip_special_codes(codes).to(self.device)
+        if target_codes.numel() < 8:
+            raise ValueError("s2vae target must contain at least 8 codes")
+        if target_codes.numel() > 750:
+            raise ValueError("s2vae target exceeds the trained 30-second limit (750 codes)")
+
+        prompt_wav, prompt_samples = self._load_prompt_wav(ref_audio)
+        prompt_latent = self.audio_vae.encode_mean(
+            prompt_wav.unsqueeze(0),
+            sample_lengths=[prompt_samples],
+            normalize=True,
+        )
+        prompt_codes = self._prompt_codes(prompt_features, prompt_feature_length)
+        prompt_frames = min(int(prompt_latent.shape[-1]), int(prompt_codes.numel()))
+        min_frames = int(np.ceil(self.prompt_min_seconds * CODE_FPS))
+        if prompt_frames < min_frames:
+            raise ValueError(
+                "s2vae aligned reference prompt is shorter than "
+                f"{self.prompt_min_seconds:g} seconds"
+            )
+        prompt_latent = prompt_latent[:, :, :prompt_frames].float()
+        prompt_codes = prompt_codes[:prompt_frames]
+
+        # Never decode across the prompt/target seam: EnhancedCodec mixes context.
+        prompt_sem = self.semantic_codec.decode(prompt_codes.unsqueeze(0)).float()
+        target_sem = self.semantic_codec.decode(target_codes.unsqueeze(0)).float()
+        semantic = torch.cat([prompt_sem, target_sem], dim=1)
+        target_frames = int(target_codes.numel())
+        total_frames = prompt_frames + target_frames
+        x_lens = torch.tensor([total_frames], device=self.device, dtype=torch.long)
+        semantic_lens = torch.tensor(
+            [semantic.shape[1]], device=self.device, dtype=torch.long
+        )
+        mu = self.model.build_condition(
+            semantic, x_lens, semantic_lens=semantic_lens
+        )
+        sample_rate = int(self.audio_vae.sample_rate)
+        info = {
+            "backend": "s2vae",
+            "n_codes": target_frames,
+            "code_seconds": float(target_frames / CODE_FPS),
+            "prompt_codes": prompt_frames,
+            "target_latent_frames": target_frames,
+            "sample_rate": sample_rate,
+        }
+        return dict(mu=mu, prompt=prompt_latent, style=torch.zeros(1, 192, device=self.device), info=info)
+
+    @torch.inference_mode()
+    def vocode_batch(self, requests):
+        from qwen_tts.inference.acoustic_batch import vocode_batch
+        return vocode_batch(self, requests, backend="s2vae")
 
     @torch.no_grad()
     def vocode(
