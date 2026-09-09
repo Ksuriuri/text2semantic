@@ -54,3 +54,13 @@ def test_auth(monkeypatch):
         assert c.get('/health').status_code==200
         assert c.post('/tts',json={}).status_code==401
         assert c.post('/tts',json={'synthesis_text':'hello','wav_base64':'YQ=='},headers={'Authorization':'Bearer test-key'}).status_code==200
+
+
+def test_spawn_import_ignores_external_webui(tmp_path):
+    import subprocess
+    (tmp_path / 'webui.py').write_text("raise RuntimeError('wrong external webui')\n")
+    script = Path(__file__).resolve().parents[1] / 'scripts' / 'api_server.py'
+    code = ("import sys,runpy; sys.path.insert(0," + repr(str(tmp_path)) + "); "
+            "runpy.run_path(" + repr(str(script)) + ",run_name='spawn_probe')")
+    result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr

@@ -10,6 +10,7 @@ import logging
 import os
 from pathlib import Path
 import secrets
+import sys
 import tempfile
 import time
 import uuid
@@ -20,6 +21,12 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+# vLLM spawn inherits sys.path after acoustic repositories were added. Those
+# repositories also contain webui.py; resolve our sibling before importing it.
+_scripts_dir = str(Path(__file__).resolve().parent)
+if _scripts_dir in sys.path:
+    sys.path.remove(_scripts_dir)
+sys.path.insert(0, _scripts_dir)
 import webui
 from qwen_tts.inference.batch_queue import MicrobatchQueue
 from qwen_tts.inference.async_utils import offload
@@ -29,14 +36,15 @@ class SynthesisRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     synthesis_text: str = Field(min_length=1, max_length=20000)
     wav_base64: str
-    vocoder_backend: str = "s2vae"
+    vocoder_backend: str | None = None
     language: str | None = None
     emotion: str | None = None
     temperature: float = Field(default=0.5, gt=0)
-    top_k: int = Field(default=30, ge=0)
-    max_new_tokens: int = Field(default=750, ge=1, le=750)
-    repetition_penalty: float = Field(default=1.1, ge=1)
-    seed: int = Field(default=0, ge=0, le=2**32-1)
+    top_k: int = Field(default=8, ge=0)
+    max_new_tokens: int = Field(default=1500, ge=1, le=1500)
+    repetition_penalty: float = Field(default=10.0, ge=1)
+    speaker_sim_boost: bool = False
+    seed: int = Field(default=-1, ge=-1, le=2**32-1)
 
 
 class Pipeline:
@@ -65,6 +73,10 @@ class Pipeline:
             self.ar is None or not self.ar.engine.errored)
 
     async def synthesize(self, item):
+        item = item.model_copy(update={
+            "vocoder_backend": item.vocoder_backend or self.models.default_vocoder,
+            "emotion": (item.emotion or "").strip() or None,
+            "seed": secrets.randbits(32) if item.seed < 0 else item.seed})
         if item.vocoder_backend not in self.queues:
             raise ValueError("Requested acoustic backend is not loaded")
         if not self.healthy():
@@ -83,15 +95,22 @@ class Pipeline:
                 text = webui.ttn.normalize(item.synthesis_text).strip()
                 if not text:
                     raise ValueError("Text is empty after normalization")
-                segments = webui.split_tts_text.plan_segments(text) or [text]
+                if item.speaker_sim_boost:
+                    async with self.hf_lock:
+                        segments, prefix, _ = await offload(self.models._plan_segments,
+                            text, str(ref), True)
+                else:
+                    segments = webui.split_tts_text.plan_segments(text) or [text]
+                    prefix = None
                 async def segment(index, value):
+                    segment_seed = (item.seed + index) % 2**32
                     before_ar = time.monotonic()
                     if self.ar is not None:
                         codes, features, length = await self.ar.generate(value, ref,
                             language=item.language, emotion=item.emotion,
                             temperature=item.temperature, top_k=item.top_k,
                             max_new_tokens=item.max_new_tokens,
-                            repetition_penalty=item.repetition_penalty, seed=item.seed+index)
+                            repetition_penalty=item.repetition_penalty, seed=segment_seed, prefix_codes=prefix)
                     else:
                         # Baseline HF uses process-global RNG, so serialize it.
                         async with self.hf_lock:
@@ -99,13 +118,13 @@ class Pipeline:
                                 self.models._generate_semantics, text=value, ref_path=str(ref),
                                 temperature=item.temperature, top_k=item.top_k,
                                 max_new_tokens=item.max_new_tokens,
-                                repetition_penalty=item.repetition_penalty, seed=item.seed+index,
+                                repetition_penalty=item.repetition_penalty, seed=segment_seed,
                                 language=item.language, emotion=item.emotion,
-                                need_prompt_features=item.vocoder_backend == "s2vae", segments=[value])
+                                need_prompt_features=item.vocoder_backend == "s2vae", segments=[value], prefix_codes=prefix)
                     ar_ms = (time.monotonic()-before_ar)*1000
                     wave, info = await self.queues[item.vocoder_backend].submit(dict(
                         codes=codes, ref_audio=str(ref), prompt_features=features,
-                        prompt_feature_length=length, seed=item.seed+index))
+                        prompt_feature_length=length, seed=segment_seed))
                     return wave, dict(info, ar_ms=ar_ms)
                 # Bound the number of active segments per request while allowing
                 # multiple requests to join the same acoustic batch.
@@ -256,7 +275,8 @@ def create_app(args, pipeline_factory=Pipeline):
                 count = int(payload.pop("repeat_num", 3))
                 if not 1 <= count <= 16:
                     raise ValueError("repeat_num must be between 1 and 16")
-                items = [dict(payload, seed=int(payload.get("seed", 0))+i) for i in range(count)]
+                base_seed = int(payload.get("seed", -1))
+                items = [dict(payload, seed=-1 if base_seed < 0 else (base_seed+i) % 2**32) for i in range(count)]
             if not isinstance(items, list) or not 1 <= len(items) <= 16:
                 raise ValueError("Batch must contain 1–16 items")
             validated = [SynthesisRequest.model_validate(item) for item in items]

@@ -6,13 +6,23 @@ HF baseline. Training checkpoints are unchanged; vLLM uses a separate export.
 ## Install and export
 
 Use a separate environment with `pip install -e '.[infer,vllm]'`.
+The example uses the native sampler so startup does not require nvcc for
+FlashInfer JIT. With a CUDA developer toolkit, FlashInfer sampling may be enabled
+and measured separately. Install Python development headers for Triton JIT.
+
+The external IndexTTS2.5 and semantic2any repositories and their acoustic
+dependencies must also be installed. The L4 validation used descript-audiotools
+0.7.2 with the newer protobuf required by vLLM; audiotools declares an older
+protobuf pin, so this is a tested runtime override, not a conflict-free dependency
+resolution. Preserve a separate inference environment and its package snapshot.
+
 The adapter targets **vLLM 0.21.0** and registers a text-only speech Qwen3.5
 class through its plugin entrypoint. Use one visible GPU per process initially;
 select it with `CUDA_VISIBLE_DEVICES`, and keep `--device cuda:0`.
 
 ```bash
 python -m qwen_tts.inference.vllm_export /models/training-checkpoint /models/vllm-speech
-python scripts/api_server.py \
+VLLM_USE_FLASHINFER_SAMPLER=0 python scripts/api_server.py \
   --checkpoint /models/training-checkpoint \
   --ar-backend vllm --vllm-model /models/vllm-speech \
   --indextts-root /models/indextts-2.5 --codec-dir /models/indextts-2.5/checkpoints \
@@ -45,12 +55,15 @@ curl http://localhost:8081/tts \
 `/api/tts` and `/api/generate` accept the same request; multipart `text` and
 `ref_audio` are accepted aliases. JSON uses `synthesis_text`, `wav_base64`,
 `vocoder_backend`, optional `language`, `emotion`, `temperature`, `top_k`,
-`max_new_tokens`, `repetition_penalty`, and `seed`. Single responses are WAV,
+`max_new_tokens`, `repetition_penalty`, `speaker_sim_boost`, and `seed`.
+Defaults retain the existing API values: top_k=8, repetition_penalty=10,
+max_new_tokens=1500 and seed=-1 (fresh per-request random seed).
+Acoustic length validation still enforces each backend's supported target length. Single responses are WAV,
 with `X-Sample-Rate`, `X-Inference-Ms` and `X-Request-ID` headers. This returns a
 completed waveform, not incremental streaming audio.
 
 `POST /tts_batch` accepts either a single synthesis payload plus `repeat_num`
-(1–16; seed increments per repetition), or `{"items": [payload, ...]}` for
+(1–16; explicit seed increments per repetition, seed=-1 stays random), or `{"items": [payload, ...]}` for
 independent texts/references. Modes cannot be mixed. Returns ordered `results`
 with `index`, `audio_base64`, sample rate, timing and per-segment measurements;
 failed items contain `error` and `status_code`. Do not assume this schema is
@@ -76,11 +89,14 @@ CFM is truly batched. Codec/reference preprocessing remains individual to preser
 context and normalization. BigVGAN/AudioVAE decoding batches equal-length outputs;
 other lengths form separate groups because padding can change convolutional
 boundaries. It is not claimed that every decoder invocation contains every item.
+WaveNet reflection padding is restored at each request's true end before
+every convolution; padded query states are not used as boundary context.
 Flow/BigVGAN remain FP32. No quantization is introduced. Cancellation stops AR;
 an already-running acoustic/CPU worker finishes before request files are removed.
 Thus cleanup can outlast the configured request deadline.
 
 The weight export preserves speech IDs, output head, and speaker/text prefill.
+The initial engine uses eager execution; CUDA graphs are not enabled.
 Random sampling across HF/vLLM is not promised bit-identical despite equal seeds.
 Performance and waveform parity require real checkpoint tests on the selected
 hardware; CPU unit tests alone are insufficient evidence of speedup.
