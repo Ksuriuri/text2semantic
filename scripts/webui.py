@@ -46,6 +46,9 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import infer as t2s_infer  # noqa: E402
+import speaker_sim_boost as ssb  # noqa: E402
+import split_tts_text  # noqa: E402
+import t2s_text_normalizer as ttn  # noqa: E402
 
 
 class InferenceApp:
@@ -109,13 +112,34 @@ class InferenceApp:
         print(f"ready on {self.device}", flush=True)
 
     def _validate_request(self, text: str, ref_audio) -> tuple[str, str]:
-        text = (text or "").strip()
+        text = ttn.normalize(text or "").strip()
         if not text:
             raise ValueError("请输入要合成的文本")
         ref_path = _as_audio_path(ref_audio)
         if not ref_path:
             raise ValueError("请上传参考音频")
         return text, ref_path
+
+    def _plan_segments(self, text: str, ref_path: str, speaker_sim_boost=False):
+        boost = ssb._truthy(speaker_sim_boost)
+        prefix_codes = None
+        boost_meta = None
+        if boost:
+            boost_meta = ssb.prepare_ref(ref_path)
+            prefix_text = boost_meta.get("clip_text") or ""
+            segments = split_tts_text.plan_segments_with_prefix(prefix_text, text)
+            encoder = self.vocoders.get("s2mel")
+            if encoder is None or not hasattr(encoder, "encode_wav_codes"):
+                raise RuntimeError("speaker-sim boost 需要已加载的 s2mel（encode_wav_codes）")
+            with self.vocoder_lock:
+                prefix_codes = encoder.encode_wav_codes(boost_meta["clip_path"])
+            if prefix_codes.numel() == 0:
+                raise RuntimeError("speaker-sim boost: empty prefix codes")
+        else:
+            segments = split_tts_text.plan_segments(text)
+        if not segments:
+            segments = [text]
+        return segments, prefix_codes, boost_meta
 
     def _generate_semantics(
         self,
@@ -130,55 +154,74 @@ class InferenceApp:
         language: str | None,
         emotion: str | None,
         need_prompt_features: bool,
+        prefix_codes=None,
+        segments: list[str] | None = None,
+        speaker_sim_boost: bool = False,
     ):
+        if segments is None:
+            segments, prefix_codes, _boost_meta = self._plan_segments(
+                text, ref_path, speaker_sim_boost
+            )
         t2s, stream = self.t2s_pool.get()
+        codes_list = []
+        prompt_features = None
+        prompt_feature_length = None
+        started = time.time()
         try:
-            if seed is not None and int(seed) >= 0:
-                torch.manual_seed(int(seed))
+            for i, seg in enumerate(segments):
+                if seed is not None and int(seed) >= 0:
+                    use_seed = int(seed) + i
+                else:
+                    use_seed = int(time.time() * 1_000_000) % (2**31)
+                torch.manual_seed(use_seed)
                 if torch.cuda.is_available():
-                    torch.cuda.manual_seed_all(int(seed))
-            else:
-                rnd = int(time.time() * 1_000_000) % (2**31)
-                torch.manual_seed(rnd)
-                if torch.cuda.is_available():
-                    torch.cuda.manual_seed_all(rnd)
-
-            started = time.time()
-            if stream is not None:
-                with torch.cuda.stream(stream):
+                    torch.cuda.manual_seed_all(use_seed)
+                extra = {}
+                if prefix_codes is not None:
+                    extra["prefix_codes"] = prefix_codes
+                need = bool(need_prompt_features) and i == 0
+                if stream is not None:
+                    with torch.cuda.stream(stream):
+                        generated = t2s_infer.generate_codes(
+                            t2s,
+                            seg,
+                            ref_path,
+                            return_prompt_features=need,
+                            language=language or None,
+                            emotion=(emotion or "").strip() or None,
+                            max_new_tokens=int(max_new_tokens),
+                            temperature=float(temperature),
+                            top_k=int(top_k),
+                            repetition_penalty=float(repetition_penalty),
+                            **extra,
+                        )
+                    stream.synchronize()
+                else:
                     generated = t2s_infer.generate_codes(
                         t2s,
-                        text,
+                        seg,
                         ref_path,
-                        return_prompt_features=need_prompt_features,
+                        return_prompt_features=need,
                         language=language or None,
                         emotion=(emotion or "").strip() or None,
                         max_new_tokens=int(max_new_tokens),
                         temperature=float(temperature),
                         top_k=int(top_k),
                         repetition_penalty=float(repetition_penalty),
+                        **extra,
                     )
-                stream.synchronize()
-            else:
-                generated = t2s_infer.generate_codes(
-                    t2s,
-                    text,
-                    ref_path,
-                    return_prompt_features=need_prompt_features,
-                    language=language or None,
-                    emotion=(emotion or "").strip() or None,
-                    max_new_tokens=int(max_new_tokens),
-                    temperature=float(temperature),
-                    top_k=int(top_k),
-                    repetition_penalty=float(repetition_penalty),
-                )
+                if need:
+                    codes, prompt_features, prompt_feature_length = generated
+                else:
+                    codes = generated
+                if codes.numel() == 0:
+                    raise RuntimeError("text2semantic produced no target codes")
+                codes_list.append(codes)
         finally:
             self.t2s_pool.put((t2s, stream))
         elapsed = time.time() - started
-        if need_prompt_features:
-            codes, prompt_features, prompt_feature_length = generated
-            return codes, prompt_features, prompt_feature_length, elapsed
-        return generated, None, None, elapsed
+        codes = codes_list[0] if len(codes_list) == 1 else torch.cat(codes_list, dim=-1)
+        return codes, prompt_features, prompt_feature_length, elapsed
 
     def _vocode(
         self,
@@ -242,6 +285,7 @@ class InferenceApp:
         language: str | None = None,
         vocoder_backend: str | None = None,
         emotion: str | None = None,
+        speaker_sim_boost: bool = False,
     ):
         text, ref_path = self._validate_request(text, ref_audio)
         backend = (vocoder_backend or self.default_vocoder).strip().lower()
@@ -262,6 +306,7 @@ class InferenceApp:
                 language=language,
                 emotion=emotion,
                 need_prompt_features=backend == "s2vae",
+                speaker_sim_boost=speaker_sim_boost,
             )
         )
         return self._vocode(
@@ -283,6 +328,7 @@ class InferenceApp:
         repetition_penalty: float = 10.0,
         seed: int = -1,
         language: str | None = None,
+        speaker_sim_boost: bool = False,
     ):
         missing = [name for name in ("s2vae", "s2mel") if name not in self.vocoders]
         if missing:
@@ -300,6 +346,7 @@ class InferenceApp:
                 language=language,
                 emotion=None,
                 need_prompt_features=True,
+                speaker_sim_boost=speaker_sim_boost,
             )
         )
         s2vae = self._vocode(
@@ -433,6 +480,7 @@ def build_ui(app: InferenceApp):
                     value="auto",
                     label="语言控制（auto = 不加标签）",
                 )
+                sim_boost = gr.Checkbox(value=False, label="说话人相似度增强（默认关）")
                 with gr.Accordion("生成参数", open=False):
                     temperature = gr.Slider(0.1, 1.5, value=0.5, step=0.05, label="temperature")
                     top_k = gr.Slider(1, 200, value=8, step=1, label="top_k")
@@ -450,7 +498,7 @@ def build_ui(app: InferenceApp):
             fn=app.generate_comparison,
             inputs=[
                 text, ref, temperature, top_k, max_new_tokens,
-                repetition_penalty, seed, language,
+                repetition_penalty, seed, language, sim_boost,
             ],
             outputs=[audio_s2vae, status_s2vae, audio_s2mel, status_s2mel],
         )
@@ -498,6 +546,7 @@ def create_app(app: InferenceApp) -> FastAPI:
                 "max_new_tokens": 1500,
                 "repetition_penalty": 10.0,
                 "seed": -1,
+                "speaker_sim_boost": False,
             },
         }
 
@@ -514,6 +563,7 @@ def create_app(app: InferenceApp) -> FastAPI:
         language: str | None = Form(None, description="可选语言控制码"),
         emotion: str | None = Form(None, description="可选情绪/气声描述"),
         vocoder_backend: str | None = Form(None, description="s2vae 或 s2mel"),
+        speaker_sim_boost: str = Form("false", description="说话人相似度增强，默认关"),
     ):
         text = (text or "").strip()
         if not text:
@@ -538,6 +588,7 @@ def create_app(app: InferenceApp) -> FastAPI:
                 language,
                 vocoder_backend,
                 emotion,
+                speaker_sim_boost,
             )
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
