@@ -14,6 +14,8 @@ from qwen_tts.text_conditioning import (
     add_conditioning_tokens,
     augment_description,
     condition_inference_text,
+    drop_pause_markers,
+    render_closed_markers,
     resize_text_embeddings,
     validate_conditioning_tokens,
 )
@@ -62,8 +64,8 @@ def test_conditioner_adds_atomic_language_and_fish_event_without_speaking_bracke
         deterministic=True,
     )
     assert conditioner(item) == (
-        "<|lang_en|><|emo_start|>laughter<|emo_end|> Hello  "
-        "<|emo_start|>laughter<|emo_end|> world."
+        "<|lang_en|><|emo_start|>laughter<|emo_end|>Hello"
+        "<|emo_start|>laughter<|emo_end|>world."
     )
 
 
@@ -82,7 +84,7 @@ def test_fish_surface_tag_uses_canonical_event_synonyms():
     )
     value = conditioner(item)
     assert value == (
-        "I tried. <|emo_start|>a light laugh<|emo_end|> It did not work."
+        "I tried.<|emo_start|>a light laugh<|emo_end|>It did not work."
     )
     assert "[stifled laugh]" not in value
 
@@ -100,8 +102,8 @@ def test_multiple_fish_tags_keep_their_original_order_and_positions():
         synonym_table=TABLE,
     )
     assert conditioner(item) == (
-        "A. <|emo_start|>laughter<|emo_end|> B. "
-        "<|emo_start|>sighing<|emo_end|> C."
+        "A.<|emo_start|>laughter<|emo_end|>B."
+        "<|emo_start|>sighing<|emo_end|>C."
     )
 
 
@@ -165,9 +167,155 @@ def test_inline_emotion_stays_at_its_original_position():
     assert condition_inference_text(
         "The weather is lovely today. [sighing]Shall we take a walk?"
     ) == (
-        "The weather is lovely today. "
+        "The weather is lovely today."
         "<|emo_start|>sighing<|emo_end|>Shall we take a walk?"
     )
+
+
+def test_inference_strips_tag_spaces_and_merges_adjacent_brackets():
+    assert condition_inference_text("[ 平静 ][ sigh ]hello") == (
+        "<|emo_start|>平静, sigh<|emo_end|>hello"
+    )
+    assert condition_inference_text("A. [calm] [pause] B.") == (
+        "A.<|emo_start|>calm, pause<|emo_end|>B."
+    )
+
+
+def test_closed_markers_merge_whitespace_neighbors_and_keep_alts():
+    text = "I came to discuss it but it is not the right time yet."
+    annotations = [
+        {
+            "type": "emotion",
+            "label": "serious",
+            "insert_char_index": 0,
+            "confidence": 0.52,
+            "alternatives": [
+                {"label": "intense", "confidence": 0.28},
+                {"label": "dramatic", "confidence": 0.16},
+            ],
+        },
+        {"type": "event", "label": "pause", "insert_char_index": 20, "confidence": 0.9, "alternatives": []},
+        {
+            "type": "emotion",
+            "label": "disappointed",
+            "insert_char_index": 21,
+            "confidence": 0.51,
+            "alternatives": [
+                {"label": "serious", "confidence": 0.32},
+                {"label": "calm", "confidence": 0.12},
+            ],
+        },
+    ]
+    kept = render_closed_markers(text, annotations, drop_leading=False)
+    assert kept.startswith("<|emo_start|>serious<|emo_end|>")
+    assert "<|emo_start|>pause, disappointed, serious<|emo_end|>" in kept
+    dropped = render_closed_markers(text, annotations, drop_leading=True)
+    assert not dropped.startswith("<|emo_start|>serious<|emo_end|>")
+    assert "<|emo_start|>pause, disappointed, serious<|emo_end|>" in dropped
+
+
+def test_conditioner_uses_annotations_and_can_drop_leading():
+    item = {
+        "id": "sr-1",
+        "text": "Hello there.",
+        "language": "en",
+        "annotations": [
+            {"type": "emotion", "label": "calm", "insert_char_index": 0, "alternatives": []},
+            {
+                "type": "event",
+                "label": "sigh",
+                "insert_char_index": 0,
+                "alternatives": [{"label": "chuckles", "confidence": 0.35}],
+            },
+            {"type": "emotion", "label": "gentle", "insert_char_index": 6, "alternatives": []},
+        ],
+    }
+    keep = TextConditioner(
+        emotion_conditioning=True,
+        drop_leading_tag_prob=0.0,
+        deterministic=True,
+    )
+    kept = keep(item)
+    assert kept.endswith("<|emo_start|>gentle<|emo_end|>there.")
+    assert kept.startswith("<|emo_start|>")
+    leading = kept.split("<|emo_end|>", 1)[0].removeprefix("<|emo_start|>")
+    assert set(part.strip() for part in leading.split(",")) == {
+        "calm",
+        "sigh",
+        "chuckles",
+    }
+    drop = TextConditioner(
+        emotion_conditioning=True,
+        drop_leading_tag_prob=1.0,
+        deterministic=True,
+    )
+    assert drop(item) == "Hello<|emo_start|>gentle<|emo_end|>there."
+
+
+def test_leading_tag_stays_when_only_later_tags_are_pause():
+    text = "Hello there."
+    only_pause = [
+        {"type": "emotion", "label": "calm", "insert_char_index": 0, "alternatives": []},
+        {"type": "event", "label": "pause", "insert_char_index": 5, "alternatives": []},
+    ]
+    assert render_closed_markers(text, only_pause, drop_leading=True).startswith(
+        "<|emo_start|>calm<|emo_end|>"
+    )
+    only_lead = [
+        {"type": "emotion", "label": "calm", "insert_char_index": 0, "alternatives": []},
+        {"type": "event", "label": "sigh", "insert_char_index": 0, "alternatives": []},
+    ]
+    assert render_closed_markers(text, only_lead, drop_leading=True).startswith(
+        "<|emo_start|>calm, sigh<|emo_end|>"
+    )
+
+
+def test_same_index_emotion_and_event_order_is_random():
+    text = "Hello there."
+    annotations = [
+        {"type": "emotion", "label": "calm", "insert_char_index": 0, "alternatives": []},
+        {"type": "event", "label": "sigh", "insert_char_index": 0, "alternatives": []},
+    ]
+    assert render_closed_markers(text, annotations).startswith(
+        "<|emo_start|>calm, sigh<|emo_end|>"
+    )
+    seen = {
+        render_closed_markers(text, annotations, rng=random.Random(seed)).split(
+            "<|emo_end|>", 1
+        )[0]
+        for seed in range(80)
+    }
+    assert "<|emo_start|>calm, sigh" in seen
+    assert "<|emo_start|>sigh, calm" in seen
+
+
+def test_pause_dropout_has_three_distinct_modes():
+    annotations = [
+        {"type": "emotion", "label": "calm", "insert_char_index": 0},
+        {"type": "event", "label": "pause", "insert_char_index": 4},
+        {"type": "event", "label": "pause", "insert_char_index": 10},
+        {"type": "emotion", "label": "sad", "insert_char_index": 11},
+    ]
+    none = drop_pause_markers(
+        annotations, random.Random(0), drop_all_prob=1.0, drop_partial_prob=0.0
+    )
+    assert [item["label"] for item in none] == ["calm", "sad"]
+    kept = drop_pause_markers(
+        annotations, random.Random(0), drop_all_prob=0.0, drop_partial_prob=0.0
+    )
+    assert sum(item["label"] == "pause" for item in kept) == 2
+    partial = drop_pause_markers(
+        annotations, random.Random(1), drop_all_prob=0.0, drop_partial_prob=1.0
+    )
+    n_pause = sum(item["label"] == "pause" for item in partial)
+    assert 1 <= n_pause <= 2
+    single = [
+        {"type": "emotion", "label": "calm", "insert_char_index": 0},
+        {"type": "event", "label": "pause", "insert_char_index": 3},
+    ]
+    assert drop_pause_markers(
+        single, random.Random(0), drop_all_prob=0.0, drop_partial_prob=1.0
+    ) == single
 
 
 class TinyTokenizer:

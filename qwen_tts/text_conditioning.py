@@ -22,6 +22,10 @@ LANGUAGE_TOKENS = {language: f"<|lang_{language}|>" for language in LANGUAGES}
 EMOTION_START_TOKEN = "<|emo_start|>"
 EMOTION_END_TOKEN = "<|emo_end|>"
 INLINE_EMOTION_RE = re.compile(r"\[([^\[\]\r\n]+)\]")
+ALT_MIN_CONFIDENCE = 0.3
+DROP_LEADING_TAG_PROB = 0.4
+PAUSE_DROP_ALL_PROB = 0.25
+PAUSE_DROP_PARTIAL_PROB = 0.35
 CONDITIONING_SPECIAL_TOKENS = (
     *LANGUAGE_TOKENS.values(),
     EMOTION_START_TOKEN,
@@ -243,6 +247,209 @@ def emotion_text(item, table, rng, *, synonym_prob=0.7, max_replacements=2):
     return "; ".join(parts)
 
 
+def _dedupe_labels(labels):
+    seen = set()
+    out = []
+    for label in labels:
+        value = str(label or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def marker_labels(marker, alt_min_confidence=ALT_MIN_CONFIDENCE):
+    """Primary label plus alternatives at or above the confidence floor."""
+    labels = [str(marker.get("label") or "").strip()]
+    for alt in marker.get("alternatives") or []:
+        if not isinstance(alt, dict):
+            continue
+        if float(alt.get("confidence") or 0.0) < alt_min_confidence:
+            continue
+        labels.append(str(alt.get("label") or "").strip())
+    return _dedupe_labels(labels)
+
+
+def _order_same_index_markers(markers, rng):
+    """Order markers that share one character index.
+
+    Training passes an rng so emotion vs event is not fixed. Callers without
+    an rng (tests, offline render) keep emotion before event.
+    """
+    items = list(markers)
+    if len(items) <= 1:
+        return items
+    if rng is not None:
+        rng.shuffle(items)
+        return items
+    type_rank = {"emotion": 0, "event": 1}
+    items.sort(key=lambda marker: type_rank.get(str(marker.get("type") or ""), 2))
+    return items
+
+
+def group_adjacent_markers(annotations, transcript, rng=None):
+    """Cluster markers that share an index or have only whitespace between them."""
+    buckets = {}
+    for marker in annotations or []:
+        if not str(marker.get("label") or "").strip():
+            continue
+        index = int(marker.get("insert_char_index") or 0)
+        buckets.setdefault(index, []).append(marker)
+    items = []
+    for index in sorted(buckets):
+        items.extend(_order_same_index_markers(buckets[index], rng))
+    groups = []
+    for marker in items:
+        index = int(marker.get("insert_char_index") or 0)
+        if not groups:
+            groups.append({"index": index, "markers": [marker]})
+            continue
+        previous = groups[-1]["index"]
+        between = transcript[previous:index] if 0 <= previous <= index <= len(transcript) else "x"
+        if between == "" or between.isspace():
+            groups[-1]["markers"].append(marker)
+        else:
+            groups.append({"index": index, "markers": [marker]})
+    return groups
+
+
+def format_emotion_span(labels):
+    return f"{EMOTION_START_TOKEN}{', '.join(labels)}{EMOTION_END_TOKEN}"
+
+
+def merge_adjacent_emotion_spans(text):
+    """Join control spans that have no non-space text between them."""
+    text = re.sub(
+        rf"({re.escape(EMOTION_END_TOKEN)})[ \t]*({re.escape(EMOTION_START_TOKEN)})",
+        r"\1\2",
+        text,
+    )
+    pattern = re.compile(
+        rf"(?:{re.escape(EMOTION_START_TOKEN)}.*?{re.escape(EMOTION_END_TOKEN)}){{2,}}"
+    )
+
+    def replace(match):
+        inners = re.findall(
+            re.escape(EMOTION_START_TOKEN) + r"(.*?)" + re.escape(EMOTION_END_TOKEN),
+            match.group(0),
+        )
+        labels = []
+        for inner in inners:
+            labels.extend(part.strip() for part in inner.split(","))
+        return format_emotion_span(_dedupe_labels(labels))
+
+    return pattern.sub(replace, text)
+
+
+def strip_spaces_around_emotion_spans(text):
+    return re.sub(
+        rf"[ \t]*({re.escape(EMOTION_START_TOKEN)}.*?{re.escape(EMOTION_END_TOKEN)})[ \t]*",
+        r"\1",
+        text,
+    )
+
+
+def normalize_emotion_spans(text):
+    return strip_spaces_around_emotion_spans(merge_adjacent_emotion_spans(text))
+
+
+def normalize_bracket_tags(text):
+    """Strip spaces inside/around real ``[tag]`` cues and merge neighbors.
+
+    Empty ``[]`` / ``[ ]`` stay literal so they are not treated as labels.
+    """
+
+    def normalize_inner(match):
+        value = match.group(1).strip()
+        return f"[{value}]" if value else match.group(0)
+
+    text = re.sub(r"\[([^\[\]\r\n]*)\]", normalize_inner, text)
+    nonempty = r"\[[^\[\]\s][^\[\]]*\]"
+    text = re.sub(rf"[ \t]+({nonempty})", r"\1", text)
+    text = re.sub(rf"({nonempty})[ \t]+", r"\1", text)
+
+    def merge(match):
+        labels = []
+        for inner in re.findall(r"\[([^\[\]]+)\]", match.group(0)):
+            labels.extend(part.strip() for part in inner.split(","))
+        return "[" + ", ".join(_dedupe_labels(labels)) + "]"
+
+    return re.sub(rf"(?:{nonempty}){{2,}}", merge, text)
+
+
+def drop_pause_markers(
+    annotations,
+    rng,
+    *,
+    drop_all_prob=PAUSE_DROP_ALL_PROB,
+    drop_partial_prob=PAUSE_DROP_PARTIAL_PROB,
+    partial_rate=0.5,
+):
+    """Three-way pause dropout: drop all, drop a subset, or keep all.
+
+    Partial mode keeps at least one pause when the sentence has any, so it
+    stays distinct from the all-drop mode on single-pause rows.
+    """
+    if not 0.0 <= drop_all_prob + drop_partial_prob <= 1.0:
+        raise ValueError("pause drop probabilities must sum to at most 1")
+    items = list(annotations or [])
+    draw = rng.random()
+    if draw < drop_all_prob:
+        return [item for item in items if str(item.get("label") or "") != "pause"]
+    if draw < drop_all_prob + drop_partial_prob:
+        pauses = [item for item in items if str(item.get("label") or "") == "pause"]
+        others = [item for item in items if str(item.get("label") or "") != "pause"]
+        if len(pauses) <= 1:
+            return items
+        kept = [item for item in pauses if rng.random() >= partial_rate]
+        if not kept:
+            kept = [rng.choice(pauses)]
+        kept_ids = {id(item) for item in kept}
+        return others + [item for item in pauses if id(item) in kept_ids]
+    return items
+
+
+def has_inline_non_pause(groups, alt_min_confidence=ALT_MIN_CONFIDENCE):
+    """True when a later group still has a real emotion/event, not only pause."""
+    for group in groups[1:]:
+        for marker in group["markers"]:
+            for label in marker_labels(marker, alt_min_confidence):
+                if label != "pause":
+                    return True
+    return False
+
+
+def render_closed_markers(
+    transcript,
+    annotations,
+    *,
+    alt_min_confidence=ALT_MIN_CONFIDENCE,
+    drop_leading=False,
+    rng=None,
+):
+    """Insert closed-vocab spans at their character indices."""
+    text = transcript if isinstance(transcript, str) else ""
+    groups = group_adjacent_markers(annotations, text, rng=rng)
+    if (
+        drop_leading
+        and groups
+        and groups[0]["index"] == 0
+        and has_inline_non_pause(groups, alt_min_confidence)
+    ):
+        groups = groups[1:]
+    for group in reversed(groups):
+        labels = []
+        for marker in group["markers"]:
+            labels.extend(marker_labels(marker, alt_min_confidence))
+        labels = _dedupe_labels(labels)
+        if not labels:
+            continue
+        index = max(0, min(group["index"], len(text)))
+        text = text[:index] + format_emotion_span(labels) + text[index:]
+    return normalize_emotion_spans(text)
+
+
 class TextConditioner:
     def __init__(
         self,
@@ -254,13 +461,23 @@ class TextConditioner:
         synonym_table=None,
         deterministic=False,
         seed=42,
+        drop_leading_tag_prob=0.0,
+        alt_min_confidence=ALT_MIN_CONFIDENCE,
+        pause_drop_all_prob=0.0,
+        pause_drop_partial_prob=0.0,
     ):
         for name, value in (
             ("language_tag_prob", language_tag_prob),
             ("emotion_synonym_prob", emotion_synonym_prob),
+            ("drop_leading_tag_prob", drop_leading_tag_prob),
+            ("alt_min_confidence", alt_min_confidence),
+            ("pause_drop_all_prob", pause_drop_all_prob),
+            ("pause_drop_partial_prob", pause_drop_partial_prob),
         ):
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1]")
+        if pause_drop_all_prob + pause_drop_partial_prob > 1.0:
+            raise ValueError("pause drop probabilities must sum to at most 1")
         self.language_tag_prob = language_tag_prob
         self.emotion_conditioning = emotion_conditioning
         self.emotion_synonym_prob = emotion_synonym_prob
@@ -268,6 +485,10 @@ class TextConditioner:
         self.synonym_table = synonym_table
         self.deterministic = deterministic
         self.seed = seed
+        self.drop_leading_tag_prob = drop_leading_tag_prob
+        self.alt_min_confidence = alt_min_confidence
+        self.pause_drop_all_prob = pause_drop_all_prob
+        self.pause_drop_partial_prob = pause_drop_partial_prob
 
     def _rng(self, item, index):
         if not self.deterministic:
@@ -279,9 +500,30 @@ class TextConditioner:
         rng = self._rng(item, index)
         language = str(item.get("language") or "").lower()
         text = item["text"]
+        annotations = item.get("annotations")
         emotion = item.get("emotion") or {}
         tags = emotion.get("tags") if isinstance(emotion, dict) else None
-        if tags:
+        used_closed_markers = False
+        if self.emotion_conditioning and isinstance(annotations, list) and annotations:
+            transcript = item.get("official_transcript")
+            if not isinstance(transcript, str) or not transcript:
+                transcript = text
+            annotations = drop_pause_markers(
+                annotations,
+                rng,
+                drop_all_prob=self.pause_drop_all_prob,
+                drop_partial_prob=self.pause_drop_partial_prob,
+            )
+            drop_leading = rng.random() < self.drop_leading_tag_prob
+            text = render_closed_markers(
+                transcript,
+                annotations,
+                alt_min_confidence=self.alt_min_confidence,
+                drop_leading=drop_leading,
+                rng=rng,
+            )
+            used_closed_markers = True
+        elif tags:
             if self.emotion_conditioning:
                 text = _condition_fish_tags(
                     text,
@@ -300,7 +542,7 @@ class TextConditioner:
             if token is None:
                 raise ValueError(f"unsupported language for conditioning: {language!r}")
             prefix += token
-        if self.emotion_conditioning:
+        if self.emotion_conditioning and not used_closed_markers:
             prefix_item = item
             if tags:
                 prefix_emotion = dict(emotion)
@@ -316,6 +558,7 @@ class TextConditioner:
             )
             if value:
                 prefix += f"{EMOTION_START_TOKEN}{value}{EMOTION_END_TOKEN}"
+        text = normalize_emotion_spans(text) if self.emotion_conditioning else text
         return prefix + text
 
 
@@ -334,7 +577,8 @@ def _replace_inline_emotions(text):
 def condition_inference_text(text, *, language=None, emotion=None):
     if not isinstance(text, str) or not text:
         raise ValueError("text must be a non-empty string")
-    text = _replace_inline_emotions(text)
+    text = _replace_inline_emotions(normalize_bracket_tags(text))
+    text = normalize_emotion_spans(text)
     prefix = ""
     if language is not None:
         language = str(language).strip().lower()
