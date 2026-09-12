@@ -101,7 +101,7 @@ def test_parse_args_defaults_match_dataset_limits(monkeypatch):
     assert args.init_model_path is None
     assert args.language_tag_prob == 0.0
     assert args.emotion_conditioning is False
-    assert args.drop_leading_tag_prob == pytest.approx(0.4)
+    assert args.drop_leading_tag_prob == pytest.approx(0.0)
     assert args.alt_min_confidence == pytest.approx(0.3)
     assert args.pause_drop_all_prob == pytest.approx(0.25)
     assert args.pause_drop_partial_prob == pytest.approx(0.35)

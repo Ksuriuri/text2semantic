@@ -308,10 +308,11 @@ def parse_args():
     parser.add_argument(
         "--drop_leading_tag_prob",
         type=float,
-        default=0.4,
+        default=0.0,
         help=(
             "Train-only: probability of dropping the leading closed-marker "
-            "span, and only when a later non-pause tag exists. Eval keeps it."
+            "span, and only when a later non-pause tag exists. "
+            "Disabled by default; eval keeps it."
         ),
     )
     parser.add_argument(
