@@ -275,7 +275,7 @@ def test_dataset_reads_refs_without_writing_them_out(tmp_path):
     root, train = _build_trainset(tmp_path, [_row("keep-1"), _row("keep-2")])
     store = _store(root)
     index = manifest_index.load(train, params=_params(), ref_store=store, log=None)
-    dataset = Text2SemanticDataset(index, _Tok(), ref_store=store)
+    dataset = Text2SemanticDataset(index, _Tok(), ref_store=store, ref_min_seconds=0.0)
 
     assert dataset.prefiltered
     assert dataset.ref_audio_in_memory
@@ -323,7 +323,7 @@ def _substitution_trainset(tmp_path):
 
 def test_a_row_whose_refs_are_all_gone_trains_on_another_row(tmp_path):
     _, index, store = _substitution_trainset(tmp_path)
-    dataset = Text2SemanticDataset(index, _Tok(), ref_store=store)
+    dataset = Text2SemanticDataset(index, _Tok(), ref_store=store, ref_min_seconds=0.0)
 
     sample = dataset[0]
     assert sample["speaker_audio"].size == 16000
@@ -342,8 +342,8 @@ def test_a_row_whose_refs_are_all_gone_trains_on_another_row(tmp_path):
 
 def test_the_substituted_row_is_the_same_on_every_rank(tmp_path):
     root, index, store = _substitution_trainset(tmp_path)
-    first = Text2SemanticDataset(index, _Tok(), ref_store=store)
-    second = Text2SemanticDataset(index, _Tok(), ref_store=_store(root))
+    first = Text2SemanticDataset(index, _Tok(), ref_store=store, ref_min_seconds=0.0)
+    second = Text2SemanticDataset(index, _Tok(), ref_store=_store(root), ref_min_seconds=0.0)
     # The draw is seeded from the row index, not from process state, so two ranks
     # must land on the same substitute -- otherwise they would disagree about what
     # the batch was while averaging gradients over it.
@@ -355,7 +355,7 @@ def test_nothing_readable_anywhere_still_fails(tmp_path):
     _drop_speaker_from_shard(root, keep=["spkB/000.wav"])
     store = _store(root)
     index = manifest_index.load(train, params=_params(), ref_store=store, log=None)
-    dataset = Text2SemanticDataset(index, _Tok(), ref_store=store)
+    dataset = Text2SemanticDataset(index, _Tok(), ref_store=store, ref_min_seconds=0.0)
     # No amount of substitution helps when no row has a readable ref, and
     # silently training on nothing would be worse than stopping.
     with pytest.raises(ValueError, match="broken manifest"):
@@ -391,6 +391,7 @@ def test_a_mel_extractor_moves_the_log_mel_into_collate(tmp_path):
         ref_store=store,
         ref_max_seconds=7.5,
         speaker_mel_extractor=mel_extractor,
+        ref_min_seconds=0.0,
     )
     batch = dataset.collate_fn([dataset[0], dataset[1]])
 

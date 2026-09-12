@@ -29,7 +29,7 @@ def test_loose_refs_decode_and_preprocess_inside_workers(monkeypatch):
         assert path.endswith('.opus')
         return np.zeros(160,dtype=np.float32)
     monkeypatch.setattr(Text2SemanticDataset,'_decode_audio',decode)
-    ds=Text2SemanticDataset(rows,Tok(),speaker_mel_extractor=Mel())
+    ds=Text2SemanticDataset(rows,Tok(),speaker_mel_extractor=Mel(), ref_min_seconds=0.0)
     dl=DataLoader(ds,batch_size=2,num_workers=1,collate_fn=ds.collate_fn)
     batch=next(iter(dl))
     assert 'speaker_audio_paths' not in batch
@@ -41,7 +41,7 @@ def test_loose_refs_decode_and_preprocess_inside_workers(monkeypatch):
 def test_loose_explicit_ref_also_uses_worker_features(monkeypatch):
     rows=[dict(text='hello',duration=1.0,ref_audio='ref.opus',audio='target.opus',semantic_codes=[1,2])]
     monkeypatch.setattr(Text2SemanticDataset,'_decode_audio',lambda self,p,n:np.zeros(160,dtype=np.float32))
-    ds=Text2SemanticDataset(rows,Tok(),speaker_mel_extractor=Mel(),min_speaker_records=1)
+    ds=Text2SemanticDataset(rows,Tok(),speaker_mel_extractor=Mel(),min_speaker_records=1, ref_min_seconds=0.0)
     batch=ds.collate_fn([ds[0]])
     assert 'speaker_input_features' in batch
     assert 'speaker_audio_paths' not in batch

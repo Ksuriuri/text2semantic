@@ -476,7 +476,7 @@ def test_two_datasets_sharing_a_speaker_id_never_swap_refs(tmp_path):
         ref_store=store,
         log=None,
     )
-    dataset = Text2SemanticDataset(index, _Tok(), ref_store=store)
+    dataset = Text2SemanticDataset(index, _Tok(), ref_store=store, ref_min_seconds=0.0)
 
     assert dataset.speaker_key_fields == KEY_FIELDS
     assert len(dataset) == 4

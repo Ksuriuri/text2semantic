@@ -92,8 +92,10 @@ def test_parse_args_defaults_match_dataset_limits(monkeypatch):
     assert args.checkpoint_total_limit == 2
     assert args.keep_checkpointing_steps == 5000
     assert args.seed == 42
-    assert args.max_ref_seconds == 20.0
-    assert args.max_target_seconds == 30.0
+    assert args.min_ref_seconds == 2.0
+    assert args.max_ref_seconds == 30.0
+    assert args.min_target_seconds == 0.5
+    assert args.max_target_seconds == 60.0
     assert args.min_speaker_records == 2
     assert args.punctuation_dropout_prob == 0.1
     assert args.punctuation_dropout_keep_word_spaces is True

@@ -70,7 +70,7 @@ class FilterParams:
     """
 
     min_target_seconds: float | None = 0.5
-    max_target_seconds: float | None = 30.0
+    max_target_seconds: float | None = 60.0
     max_semantic_tokens: int | None = None
     min_speaker_records: int = 2
     refs_per_speaker: int = 0
@@ -504,7 +504,7 @@ def main(argv=None):
     parser.add_argument("manifest")
     parser.add_argument("--index_dir", default=None)
     parser.add_argument("--min_target_seconds", type=float, default=0.5)
-    parser.add_argument("--max_target_seconds", type=float, default=30.0)
+    parser.add_argument("--max_target_seconds", type=float, default=60.0)
     parser.add_argument("--max_semantic_tokens", type=int, default=None)
     parser.add_argument("--min_speaker_records", type=int, default=2)
     parser.add_argument("--refs_per_speaker", type=int, default=0)

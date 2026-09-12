@@ -174,12 +174,11 @@ class SpeakerRefStore:
             # compared against that name's id and not against the whole path --
             # otherwise nothing ever matches and a clip can end up as its own
             # ref, which teaches the model to copy.
-            exclude = str(exclude)
+            excluded = {str(x) for x in exclude} if isinstance(exclude, (set, list, tuple)) else {str(exclude)}
             names = [
-                name
-                for name in names
-                if name != exclude
-                and ref_member_index.member_row_id(name) != exclude
+                name for name in names
+                if name not in excluded
+                and ref_member_index.member_row_id(name) not in excluded
             ]
         if not names:
             return []

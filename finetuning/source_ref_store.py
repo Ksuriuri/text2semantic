@@ -225,6 +225,8 @@ class SourceTarRefStore:
 
     @staticmethod
     def _excluded(row_id, exclude):
+        if isinstance(exclude, (set, list, tuple)):
+            return row_id in {str(x) for x in exclude}
         return exclude is not None and row_id == str(exclude)
 
     def _lookup(self, key):

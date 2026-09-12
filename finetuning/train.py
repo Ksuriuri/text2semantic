@@ -82,7 +82,8 @@ def parse_args():
     parser.add_argument("--eval_jsonl", required=True)
     parser.add_argument("--w2v_bert_path", required=True)
     parser.add_argument("--stats_path", required=True)
-    parser.add_argument("--max_ref_seconds", type=float, default=20.0)
+    parser.add_argument("--min_ref_seconds", type=float, default=2.0)
+    parser.add_argument("--max_ref_seconds", type=float, default=30.0)
     parser.add_argument(
         "--speaker_encoder_dtype",
         default="bfloat16",
@@ -119,7 +120,7 @@ def parse_args():
             "otherwise idle. Needs --num_workers > 0."
         ),
     )
-    parser.add_argument("--max_target_seconds", type=float, default=30.0)
+    parser.add_argument("--max_target_seconds", type=float, default=60.0)
     parser.add_argument("--min_target_seconds", type=float, default=0.5)
     parser.add_argument("--min_speaker_records", type=int, default=2)
     parser.add_argument(
@@ -483,6 +484,10 @@ def parse_args():
         parser.error("--logging_steps must be positive.")
     if args.eval_steps <= 0:
         parser.error("--eval_steps must be positive.")
+    if not 0 <= args.min_ref_seconds <= args.max_ref_seconds:
+        parser.error("reference duration must satisfy 0 <= min_ref_seconds <= max_ref_seconds.")
+    if args.min_target_seconds > args.max_target_seconds:
+        parser.error("min_target_seconds must not exceed max_target_seconds.")
     if args.max_ref_seconds <= 0:
         parser.error("--max_ref_seconds must be positive.")
     if args.max_target_seconds <= 0:
@@ -752,7 +757,8 @@ def build_dataset(
         min_speaker_records=args.min_speaker_records,
         max_target_seconds=args.max_target_seconds,
         min_target_seconds=getattr(args, "min_target_seconds", 0.5),
-        ref_max_seconds=getattr(args, "max_ref_seconds", 20.0),
+        ref_max_seconds=getattr(args, "max_ref_seconds", 30.0),
+        ref_min_seconds=getattr(args, "min_ref_seconds", 2.0),
         speaker_mel_extractor=speaker_mel_extractor,
         punctuation_dropout_prob=punctuation_dropout_prob,
         punctuation_dropout_keep_word_spaces=(
@@ -803,7 +809,7 @@ def evaluate(
     dataloader,
     accelerator,
     feature_extractor=None,
-    max_ref_seconds=20.0,
+    max_ref_seconds=30.0,
 ):
     model.eval()
     totals = torch.zeros(5, dtype=torch.float64, device=accelerator.device)

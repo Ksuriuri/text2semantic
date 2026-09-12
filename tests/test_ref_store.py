@@ -88,6 +88,7 @@ def test_dataset_uses_packed_refs_without_loose_audio(tmp_path):
         speaker_counts={("en", "spkA"): 2},
         min_speaker_records=2,
         ref_store=store,
+        ref_min_seconds=0.0,
     )
     assert len(dataset) == 1
     path = dataset._speaker_audio_path(dataset.data[0], index=0)

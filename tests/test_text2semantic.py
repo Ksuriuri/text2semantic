@@ -105,6 +105,7 @@ def test_dataset_alignment_and_mask():
         speech_bos_token_id=8192,
         speech_eos_token_id=8193,
         speech_pad_token_id=8194,
+        ref_min_seconds=0.0,
     )
     batch = dataset.collate_fn([dataset[0], dataset[1]])
     assert batch["speech_input_ids"].tolist() == [
@@ -141,7 +142,7 @@ def test_dataset_reads_compact_codes_and_filters_speakers_and_duration(tmp_path)
                 "audio_path": "prompt-only.wav",
                 "text": "too long",
                 "speaker_id": "speaker-a",
-                "duration": 31.0,
+                "duration": 61.0,
                 "semantic_code_path": str(code_path),
                 "semantic_code_offset": 3,
                 "semantic_code_length": 1,
@@ -161,6 +162,7 @@ def test_dataset_reads_compact_codes_and_filters_speakers_and_duration(tmp_path)
         speech_bos_token_id=16,
         speech_eos_token_id=17,
         speech_pad_token_id=18,
+        ref_min_seconds=0.0,
     )
 
     assert len(dataset) == 1
@@ -183,6 +185,7 @@ def test_dataset_filters_overlong_semantic_targets_instead_of_truncating():
             ],
             DummyTokenizer(),
             max_semantic_tokens=2,
+            ref_min_seconds=0.0,
         )
 
 
@@ -203,6 +206,7 @@ def test_dataset_rejects_out_of_bounds_compact_code_ranges(tmp_path):
             }
         ],
         DummyTokenizer(),
+        ref_min_seconds=0.0,
     )
 
     with pytest.raises(ValueError, match="out of bounds"):
@@ -232,6 +236,7 @@ def test_dataset_filters_samples_without_independent_reference():
                 },
             ],
             DummyTokenizer(),
+            ref_min_seconds=0.0,
         )
 
 
@@ -270,6 +275,7 @@ def test_dataset_filters_samples_without_usable_text():
             },
         ],
         DummyTokenizer(),
+        ref_min_seconds=0.0,
     )
 
     assert [item["audio"] for item in dataset.data] == ["keep-1.wav", "keep-2.wav"]
@@ -291,16 +297,16 @@ def test_dataset_spreads_reference_clips_over_the_speaker():
         for index in range(12)
     ]
 
-    dataset = Text2SemanticDataset(data, DummyTokenizer())
+    dataset = Text2SemanticDataset(data, DummyTokenizer(), ref_min_seconds=0.0)
     references = [dataset[index]["speaker_audio_path"] for index in range(len(dataset))]
 
     assert len(set(references)) > 1, "reference clips must not collapse onto one path"
     for index, reference in enumerate(references):
         assert reference != data[index]["audio"]
     # Seeded, so the choice is reproducible across ranks and resumes.
-    again = Text2SemanticDataset(data, DummyTokenizer(), seed=dataset.seed)
+    again = Text2SemanticDataset(data, DummyTokenizer(), seed=dataset.seed, ref_min_seconds=0.0)
     assert [again[i]["speaker_audio_path"] for i in range(len(again))] == references
-    shifted = Text2SemanticDataset(data, DummyTokenizer(), seed=dataset.seed + 1)
+    shifted = Text2SemanticDataset(data, DummyTokenizer(), seed=dataset.seed + 1, ref_min_seconds=0.0)
     assert [shifted[i]["speaker_audio_path"] for i in range(len(shifted))] != references
 
 
@@ -711,6 +717,7 @@ def _dropout_dataset(tokenizer, text="你好，世界！", **kwargs):
         tokenizer,
         min_speaker_records=1,
         **kwargs,
+        ref_min_seconds=0.0,
     )
 
 

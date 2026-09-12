@@ -36,9 +36,10 @@ class Text2SemanticDataset(Dataset):
         speaker_audio_paths_by_id=None,
         ref_store=None,
         min_speaker_records=2,
-        max_target_seconds=30.0,
+        max_target_seconds=60.0,
         min_target_seconds=0.5,
-        ref_max_seconds=20.0,
+        ref_max_seconds=30.0,
+        ref_min_seconds=2.0,
         speaker_mel_extractor=None,
         punctuation_dropout_prob=0.0,
         punctuation_dropout_keep_word_spaces=True,
@@ -91,12 +92,15 @@ class Text2SemanticDataset(Dataset):
         self.min_speaker_records = min_speaker_records
         self.max_target_seconds = max_target_seconds
         self.min_target_seconds = min_target_seconds
+        if not 0 <= ref_min_seconds <= ref_max_seconds:
+            raise ValueError("reference duration must satisfy 0 <= min <= max")
+        self.ref_min_seconds = ref_min_seconds
         self.ref_max_seconds = ref_max_seconds
         # Packed refs are read out of the shard and decoded here, in the
         # DataLoader worker, so no ref ever lands on disk.
         self.ref_audio_in_memory = (
             ref_store is not None and hasattr(ref_store, "read_ref")
-        ) or speaker_mel_extractor is not None
+        ) or speaker_mel_extractor is not None or ref_min_seconds > 0
         if not 0.0 <= punctuation_dropout_prob <= 1.0:
             raise ValueError("punctuation_dropout_prob must be in [0, 1].")
         self.punctuation_dropout_prob = punctuation_dropout_prob
@@ -322,22 +326,38 @@ class Text2SemanticDataset(Dataset):
                 return None
             return self._decode_audio(explicit, explicit)
         if self.ref_store is None:
-            path = self._speaker_audio_path(item, index)
-            return None if path is None else self._decode_audio(path, path)
+            candidates = list(self.speaker_audio_paths_by_id.get(self._speaker_key(item), ()))
+            if candidates and index is not None:
+                start = random.Random(self.seed + index).randrange(len(candidates))
+                candidates = candidates[start:] + candidates[:start]
+            for path in candidates:
+                if path == self._target_audio_path(item):
+                    continue
+                audio = self._decode_audio(path, path)
+                if audio is not None:
+                    return audio
+            return None
         speaker_key = self._speaker_key(item)
         if speaker_key is None:
             return None
         rng = None if index is None else random.Random(self.seed + index)
         exclude = item.get("id")
-        picked = self.ref_store.read_ref(
-            speaker_key,
-            exclude=None if exclude is None else str(exclude),
-            rng=rng,
-        )
-        if picked is None:
-            return None
-        name, payload = picked
-        return self._decode_audio(io.BytesIO(payload), name)
+        excluded = set() if exclude is None else {str(exclude)}
+        while True:
+            picked = self.ref_store.read_ref(
+                speaker_key,
+                exclude=excluded if self.ref_min_seconds > 0 else exclude,
+                rng=rng,
+            )
+            if picked is None:
+                return None
+            name, payload = picked
+            audio = self._decode_audio(io.BytesIO(payload), name)
+            if audio is not None:
+                return audio
+            if name in excluded:
+                return None
+            excluded.add(name)
 
     def _is_opus_ref(self, source, name):
         for candidate in (name, source):
@@ -423,6 +443,8 @@ class Text2SemanticDataset(Dataset):
             )
         if audio.size == 0:
             raise ValueError(f"ref audio decoded to nothing: {name}")
+        if audio.size < int(self.ref_min_seconds * 16000):
+            return None
         return np.ascontiguousarray(audio, dtype=np.float32)
 
     def _has_speaker_ref(self, item):
