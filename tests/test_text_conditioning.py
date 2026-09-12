@@ -69,7 +69,7 @@ def test_conditioner_adds_atomic_language_and_fish_event_without_speaking_bracke
     )
 
 
-def test_fish_surface_tag_uses_canonical_event_synonyms():
+def test_fish_surface_tag_does_not_randomly_replace_synonyms():
     item = {
         "id": "fish-2",
         "text": "I tried. [stifled laugh] It did not work.",
@@ -84,7 +84,7 @@ def test_fish_surface_tag_uses_canonical_event_synonyms():
     )
     value = conditioner(item)
     assert value == (
-        "I tried.<|emo_start|>a light laugh<|emo_end|>It did not work."
+        "I tried.<|emo_start|>laughter<|emo_end|>It did not work."
     )
     assert "[stifled laugh]" not in value
 
@@ -159,7 +159,7 @@ def test_inference_converts_inline_brackets_and_auto_language_is_noop():
         "<|lang_zh|><|emo_start|>平静<|emo_end|>hello"
     )
     assert condition_inference_text("literal [] and [ ] stay") == (
-        "literal [] and [ ] stay"
+        "literal<|emo_start|><|emo_end|>and<|emo_start|><|emo_end|>stay"
     )
 
 
@@ -393,3 +393,29 @@ def test_special_tokens_resize_text_embedding_and_nested_saved_config():
     assert model.config.qwen_config["vocab_size"] == len(tokenizer)
     for token in (*LANGUAGE_TOKENS.values(), EMOTION_START_TOKEN, EMOTION_END_TOKEN):
         assert len(tokenizer(token, add_special_tokens=False)["input_ids"]) == 1
+
+
+def test_arbitrary_inline_controls_merge_shuffle_and_keep_description_intact():
+    item = {"text": "[brand-new] [Speak softly, then smile.] Hello [unknown] world", "language": "en"}
+    outputs = {TextConditioner(emotion_conditioning=True)(item) for _ in range(80)}
+    assert len(outputs) == 2
+    for value in outputs:
+        assert "Speak softly, then smile." in value
+        assert value.endswith("Hello<|emo_start|>unknown<|emo_end|>world")
+        assert "[" not in value
+    stable = TextConditioner(emotion_conditioning=True, deterministic=True)
+    assert stable(item) == condition_inference_text(item["text"])
+
+
+def test_inline_pause_dropout_keeps_unknown_labels_and_leading_controls():
+    item = {"text": "[novel]Hello[pause]there[pause]!"}
+    drop = TextConditioner(emotion_conditioning=True, pause_drop_all_prob=1.0)
+    assert drop(item) == "<|emo_start|>novel<|emo_end|>Hellothere!"
+    keep = TextConditioner(emotion_conditioning=True, deterministic=True)
+    assert keep(item) == condition_inference_text(item["text"])
+
+
+def test_brackets_convert_without_legacy_emotion_flag_and_empty_pairs_convert():
+    item = {"text": "A [] B [new\nlabel] C"}
+    assert TextConditioner()(item) == condition_inference_text(item["text"])
+    assert "[" not in TextConditioner()(item)

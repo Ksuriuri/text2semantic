@@ -5,7 +5,7 @@
 
 The manifest remains the source of truth: this module only changes the text
 that reaches the model. Training can therefore redraw the optional language
-tag and affect synonyms every epoch without rewriting annotations, while eval
+tag and marker order every epoch without rewriting annotations, while eval
 and inference stay deterministic.
 """
 
@@ -21,7 +21,7 @@ LANGUAGES = ("ar", "de", "en", "es", "fr", "ja", "ko", "pt", "ru", "zh")
 LANGUAGE_TOKENS = {language: f"<|lang_{language}|>" for language in LANGUAGES}
 EMOTION_START_TOKEN = "<|emo_start|>"
 EMOTION_END_TOKEN = "<|emo_end|>"
-INLINE_EMOTION_RE = re.compile(r"\[([^\[\]\r\n]+)\]")
+INLINE_EMOTION_RE = re.compile(r"\[([^\[\]]*)\]", re.DOTALL)
 ALT_MIN_CONFIDENCE = 0.3
 DROP_LEADING_TAG_PROB = 0.0
 PAUSE_DROP_ALL_PROB = 0.25
@@ -480,7 +480,7 @@ class TextConditioner:
             raise ValueError("pause drop probabilities must sum to at most 1")
         self.language_tag_prob = language_tag_prob
         self.emotion_conditioning = emotion_conditioning
-        self.emotion_synonym_prob = emotion_synonym_prob
+        self.emotion_synonym_prob = 0.0  # Legacy argument retained; augmentation disabled.
         self.emotion_max_replacements = emotion_max_replacements
         self.synonym_table = synonym_table
         self.deterministic = deterministic
@@ -558,7 +558,18 @@ class TextConditioner:
             )
             if value:
                 prefix += f"{EMOTION_START_TOKEN}{value}{EMOTION_END_TOKEN}"
-        text = normalize_emotion_spans(text) if self.emotion_conditioning else text
+        text = condition_inline_spans(
+            text,
+            rng=None if self.deterministic else rng,
+            pause_drop_all_prob=(
+                self.pause_drop_all_prob
+                if self.emotion_conditioning and not used_closed_markers else 0.0
+            ),
+            pause_drop_partial_prob=(
+                self.pause_drop_partial_prob
+                if self.emotion_conditioning and not used_closed_markers else 0.0
+            ),
+        )
         return prefix + text
 
 
@@ -567,18 +578,47 @@ def _replace_inline_emotions(text):
 
     def replace(match):
         value = match.group(1).strip()
-        if not value:
-            return match.group(0)
         return f"{EMOTION_START_TOKEN}{value}{EMOTION_END_TOKEN}"
 
     return INLINE_EMOTION_RE.sub(replace, text)
 
 
+def condition_inline_spans(
+    text, *, rng=None, pause_drop_all_prob=0.0, pause_drop_partial_prob=0.0
+):
+    """Convert every bracket pair; treat arbitrary contents as opaque labels."""
+    text = _replace_inline_emotions(text)
+    span = re.escape(EMOTION_START_TOKEN) + r"(.*?)" + re.escape(EMOTION_END_TOKEN)
+    matches = list(re.finditer(span, text, re.DOTALL))
+    drop_positions = set()
+    if rng is not None and (pause_drop_all_prob or pause_drop_partial_prob):
+        pauses = [
+            {"label": m.group(1).strip(), "position": i}
+            for i, m in enumerate(matches)
+        ]
+        kept = drop_pause_markers(
+            pauses, rng, drop_all_prob=pause_drop_all_prob,
+            drop_partial_prob=pause_drop_partial_prob,
+        )
+        drop_positions = set(range(len(matches))) - {m["position"] for m in kept}
+    for i in sorted(drop_positions, reverse=True):
+        m = matches[i]
+        text = text[:m.start()] + text[m.end():]
+    cluster = re.compile(r"(?:" + re.escape(EMOTION_START_TOKEN) + r".*?" + re.escape(EMOTION_END_TOKEN) + r"[ \t]*)+", re.DOTALL)
+    def merge(match):
+        labels = re.findall(span, match.group(0), re.DOTALL)
+        labels = list(dict.fromkeys(label.strip() for label in labels))
+        if rng is not None and len(labels) > 1:
+            rng.shuffle(labels)
+        return format_emotion_span(labels)
+    text = cluster.sub(merge, text)
+    return re.sub(r"[ \t]*(" + re.escape(EMOTION_START_TOKEN) + r".*?" + re.escape(EMOTION_END_TOKEN) + r")[ \t]*", r"\1", text, flags=re.DOTALL)
+
+
 def condition_inference_text(text, *, language=None, emotion=None):
     if not isinstance(text, str) or not text:
         raise ValueError("text must be a non-empty string")
-    text = _replace_inline_emotions(normalize_bracket_tags(text))
-    text = normalize_emotion_spans(text)
+    text = condition_inline_spans(text)
     prefix = ""
     if language is not None:
         language = str(language).strip().lower()

@@ -714,23 +714,23 @@ def _dropout_dataset(tokenizer, text="你好，世界！", **kwargs):
     )
 
 
-def test_strip_pause_marks_removes_punctuation_and_spaces():
+def test_strip_pause_marks_removes_only_allowlisted_punctuation():
     assert strip_pause_marks("你好，世界！\n真的吗？") == "你好世界\n真的吗"
-    assert strip_pause_marks("Hello, world!\tHow are you?") == "HelloworldHowareyou"
-    # Ideographic space and NBSP are separators too.
-    assert strip_pause_marks("a\u3000b\u00a0c") == "abc"
-    # Wave dashes act as prosody marks even though Unicode calls them symbols.
-    assert strip_pause_marks("好啊~好啊～") == "好啊好啊"
+    assert strip_pause_marks("Hello, world!\tHow are you?") == "Hello world\tHow are you"
+    # Whitespace is preserved verbatim.
+    assert strip_pause_marks("a\u3000b\u00a0c") == "a\u3000b\u00a0c"
+    # Unlisted wave-dash symbols are preserved.
+    assert strip_pause_marks("好啊~好啊～") == "好啊~好啊～"
     # Digits and content-bearing symbols stay: dropping them would change what
     # is spoken, not how it is paced.
-    assert strip_pause_marks("50% off, $3 + $4 = $7!") == "50%off$3+$4=$7"
-    assert strip_pause_marks("R&B, 9/11, user_name@host") == "R&B9/11user_name@host"
+    assert strip_pause_marks("50% off, $3 + $4 = $7!") == "50% off $3 + $4 = $7"
+    assert strip_pause_marks("R&B, 9/11, user_name@host") == "R&B 9/11 user_name@host"
 
 
 def test_strip_pause_marks_keeps_marks_glued_inside_a_word():
     # Orthography, not prosody: dropping these changes what is read out.
-    assert strip_pause_marks("It is 3.14, not 12:30.") == "Itis3.14not12:30"
-    assert strip_pause_marks("don't stop state-of-the-art!") == "don'tstopstate-of-the-art"
+    assert strip_pause_marks("It is 3.14, not 12:30.") == "It is 3.14 not 12:30"
+    assert strip_pause_marks("don't stop state-of-the-art!") == "don't stop state-of-the-art"
     # The exemption needs all three characters to be ASCII, so a CJK comma
     # goes whether its neighbours are hanzi or Latin letters (mixed text).
     assert strip_pause_marks("好，好") == "好好"
@@ -744,7 +744,7 @@ def test_strip_pause_marks_keeps_marks_glued_inside_a_word():
 def test_strip_pause_marks_can_keep_word_boundaries():
     assert (
         strip_pause_marks("Hello, world!\n How  are you?", keep_word_spaces=True)
-        == "Hello world\nHow are you"
+        == "Hello world\n How  are you"
     )
     assert strip_pause_marks("你好，世界。", keep_word_spaces=True) == "你好世界"
 
@@ -753,11 +753,11 @@ def test_strip_pause_marks_keeps_the_line_layout():
     # Line feeds are pauses the writer already committed to, so they stay,
     # and blank lines stay blank lines.
     assert strip_pause_marks("第一行。\n\n第二行！") == "第一行\n\n第二行"
-    # A CRLF transcript keeps the LF and loses the CR.
-    assert strip_pause_marks("one, two\r\nthree.") == "onetwo\nthree"
+    # CRLF layout is preserved.
+    assert strip_pause_marks("one, two\r\nthree.") == "one two\r\nthree"
     assert (
         strip_pause_marks("one, two\r\nthree.", keep_word_spaces=True)
-        == "one two\nthree"
+        == "one two\r\nthree"
     )
     # Only the punctuation goes on an all-punctuation line.
     assert strip_pause_marks("a\n……\nb") == "a\n\nb"
@@ -808,7 +808,7 @@ def test_punctuation_dropout_keeps_word_spaces_by_default():
     assert "\nHello world<|im_end|>" in tokenizer.prompts[-1]
 
 
-def test_punctuation_dropout_can_drop_word_spaces_too():
+def test_punctuation_dropout_preserves_spaces_with_legacy_false_option():
     tokenizer = RecordingTokenizer()
     dataset = _dropout_dataset(
         tokenizer,
@@ -817,7 +817,7 @@ def test_punctuation_dropout_can_drop_word_spaces_too():
         punctuation_dropout_keep_word_spaces=False,
     )
     dataset[0]
-    assert "\nHelloworld<|im_end|>" in tokenizer.prompts[-1]
+    assert "\nHello world<|im_end|>" in tokenizer.prompts[-1]
 
 
 def test_punctuation_dropout_keeps_text_that_would_strip_to_nothing():
@@ -1196,3 +1196,14 @@ def test_mismatched_label_shape_is_rejected_on_both_loss_paths():
                 labels=torch.tensor([[4, 5]]),
                 **speaker_inputs(),
             )
+
+
+def test_pause_dropout_protects_arbitrary_bracket_and_special_token_contents():
+    text = '[Speak softly, please!] A-B——C, [unknown] D。 <|emo_start|>x,y!<|emo_end|> E?'
+    assert strip_pause_marks(text) == '[Speak softly, please!] A-BC [unknown] D <|emo_start|>x,y!<|emo_end|> E'
+    assert strip_pause_marks('"a"; b:c (d) / e-f [g]') == '"a"; b:c (d) / e-f [g]'
+
+
+def test_dataset_converts_inline_controls_after_safe_punctuation_dropout():
+    dataset = _dropout_dataset(RecordingTokenizer(), text='[new, label!] Hello-world, [pause] yes!', punctuation_dropout_prob=1.0)
+    assert dataset._augmented_text(dataset.data[0]) == '<|emo_start|>new, label!<|emo_end|>Hello-world<|emo_start|>pause<|emo_end|>yes'

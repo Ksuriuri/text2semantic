@@ -102,6 +102,7 @@ def test_parse_args_defaults_match_dataset_limits(monkeypatch):
     assert args.language_tag_prob == 0.0
     assert args.emotion_conditioning is False
     assert args.drop_leading_tag_prob == pytest.approx(0.0)
+    assert args.emotion_synonym_prob == 0.0
     assert args.alt_min_confidence == pytest.approx(0.3)
     assert args.pause_drop_all_prob == pytest.approx(0.25)
     assert args.pause_drop_partial_prob == pytest.approx(0.35)
@@ -131,6 +132,8 @@ def test_parse_args_accepts_fresh_finetune_checkpoint_and_controls(monkeypatch):
     assert args.language_tag_prob == pytest.approx(0.6)
     assert args.emotion_conditioning is True
     assert args.emotion_synonyms == "emotion.v3.json"
+    assert args.emotion_synonym_prob == 0.0
+    assert args.emotion_max_replacements == 0
     assert args.min_lr_ratio == pytest.approx(0.25)
 
 

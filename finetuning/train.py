@@ -263,10 +263,8 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Keep single spaces between words when dropping punctuation, "
-            "so space-separated scripts keep their word boundaries.  On by "
-            "default; --no-punctuation_dropout_keep_word_spaces drops the "
-            "spaces as well."
+            "Deprecated compatibility option; whitespace is always preserved "
+            "when dropping pause punctuation."
         ),
     )
     parser.add_argument(
@@ -291,19 +289,19 @@ def parse_args():
     parser.add_argument(
         "--emotion_synonyms",
         default=None,
-        help="Path to the version-3 emotion synonym JSON table.",
+        help="Deprecated compatibility option; synonym tables are no longer loaded.",
     )
     parser.add_argument(
         "--emotion_synonym_prob",
         type=float,
-        default=0.7,
-        help="Per-description-span/event synonym probability; train only.",
+        default=0.0,
+        help="Deprecated compatibility option; synonym augmentation is disabled.",
     )
     parser.add_argument(
         "--emotion_max_replacements",
         type=int,
         default=2,
-        help="Maximum span replacements inside one freeform description.",
+        help="Deprecated compatibility option; synonym replacements are disabled.",
     )
     parser.add_argument(
         "--drop_leading_tag_prob",
@@ -505,15 +503,9 @@ def parse_args():
         parser.error("--min_lr_ratio must be in [0, 1].")
     if args.emotion_max_replacements < 0:
         parser.error("--emotion_max_replacements must be non-negative.")
-    if (
-        args.emotion_conditioning
-        and args.emotion_synonym_prob > 0
-        and not args.emotion_synonyms
-    ):
-        parser.error(
-            "--emotion_synonyms is required when emotion conditioning uses "
-            "a non-zero synonym probability."
-        )
+    # Accept old launch arguments without retaining stochastic synonym edits.
+    args.emotion_synonym_prob = 0.0
+    args.emotion_max_replacements = 0
     return args
 
 
@@ -1317,7 +1309,7 @@ def train():
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-    conditioning_enabled = args.language_tag_prob > 0 or args.emotion_conditioning
+    conditioning_enabled = True  # Inline bracket controls are always converted.
     if conditioning_enabled:
         added_tokens = add_conditioning_tokens(tokenizer)
     else:
@@ -1392,7 +1384,7 @@ def train():
         f"Manifest index: train {len(train_data):,} rows "
         f"({train_data.index_dir}), eval {len(eval_data):,} rows"
     )
-    synonym_table = load_synonym_table(args.emotion_synonyms)
+    synonym_table = None  # New data already contains its intended augmentation.
     train_conditioner = None
     eval_conditioner = None
     if conditioning_enabled:

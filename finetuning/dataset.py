@@ -14,6 +14,7 @@ from torch.utils.data import Dataset
 
 from finetuning import speaker_index
 from qwen_tts.text_augment import strip_pause_marks
+from qwen_tts.text_conditioning import condition_inline_spans
 from qwen_tts.text_template import tokenize_tts_prompt
 
 
@@ -217,7 +218,7 @@ class Text2SemanticDataset(Dataset):
             if stripped.strip():
                 text = stripped
         if self.text_conditioner is None:
-            return text
+            return condition_inline_spans(text)
         conditioned = dict(item)
         conditioned["text"] = text
         return self.text_conditioner(conditioned, index=index)
