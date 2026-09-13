@@ -35,24 +35,24 @@ def test_tab_and_indent_rules(raw: str, expected: str) -> None:
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        ("KB, MB, GB, TB", "kilobyte, megabyte, gigabyte, terabyte"),
-        ("16GB", "sixteen gigabytes"),
-        ("1 GB", "one gigabyte"),
-        ("1.5TB", "one point five terabytes"),
-        ("100MB/s", "one hundred megabytes per second"),
-        ("1 Gbps", "one gigabit per second"),
-        ("2.4GHz", "two point four gigahertz"),
-        ("89M users", "eighty-nine million users"),
-        ("5G / 4K", "5G / 4K"),
-        ("$89M", "eighty-nine million dollars"),
-        ("$30", "thirty dollars"),
-        ("$30.01", "thirty dollars and one cent"),
-        ("$30.16", "thirty dollars and sixteen cents"),
-        ("$1.16", "one dollar and sixteen cents"),
-        ("€30.01", "thirty euros and one cent"),
-        ("€1.16", "one euro and sixteen cents"),
-        ("£30.01", "thirty pounds and one penny"),
-        ("£1.16", "one pound and sixteen pence"),
+        ("KB, MB, GB, TB", 'KB, MB, GB, TB'),
+        ("16GB", '16GB'),
+        ("1 GB", '1 GB'),
+        ("1.5TB", '1.5TB'),
+        ("100MB/s", '100MB/s'),
+        ("1 Gbps", '1 Gbps'),
+        ("2.4GHz", '2.4GHz'),
+        ("89M users", '89M users'),
+        ("5G / 4K", '5G / 4K'),
+        ("$89M", '$89M'),
+        ("$30", '$30'),
+        ("$30.01", '$30.01'),
+        ("$30.16", '$30.16'),
+        ("$1.16", '$1.16'),
+        ("€30.01", '€30.01'),
+        ("€1.16", '€1.16'),
+        ("£30.01", '£30.01'),
+        ("£1.16", '£1.16'),
     ],
 )
 def test_units_and_money_rules(raw: str, expected: str) -> None:
@@ -64,22 +64,22 @@ def test_units_and_money_rules(raw: str, expected: str) -> None:
     [
         (
             "8-12只小狗，3%-5%的小猫",
-            "八到十二只小狗，百分之三到百分之五的小猫",
+            '8-12只小狗，3%-5%的小猫',
         ),
-        ("3-5天", "三到五天"),
-        ("重量10-20kg", "重量十到二十 kg"),
-        ("第3-5章", "第三到五章"),
-        ("2024-2026年", "2024年到2026年"),
-        ("9:00-10:30", "九点到十点三十分"),
-        ("范围A-Z", "范围A到Z"),
-        ("3%-5%", "百分之三到百分之五"),
-        ("3-5%", "百分之三到百分之五"),
-        ("3%~5%", "百分之三到百分之五"),
-        ("3％—5％", "百分之三到百分之五"),
-        ("3%至5%", "百分之三到百分之五"),
-        ("3.5%", "百分之三点五"),
-        ("100%", "百分之百"),
-        ("下降1%", "下降百分之一"),
+        ("3-5天", '3-5天'),
+        ("重量10-20kg", '重量10-20kg'),
+        ("第3-5章", '第3-5章'),
+        ("2024-2026年", '2024-2026年'),
+        ("9:00-10:30", '9:00-10:30'),
+        ("范围A-Z", '范围A-Z'),
+        ("3%-5%", '3%-5%'),
+        ("3-5%", '3-5%'),
+        ("3%~5%", '3%~5%'),
+        ("3％—5％", '3％—5％'),
+        ("3%至5%", '3%至5%'),
+        ("3.5%", '百分之3.5'),
+        ("100%", '百分之百'),
+        ("下降1%", '下降百分之一'),
     ],
 )
 def test_ranges_and_percentages_in_chinese(raw: str, expected: str) -> None:
@@ -89,13 +89,13 @@ def test_ranges_and_percentages_in_chinese(raw: str, expected: str) -> None:
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        ("2-1=1", "二减一等于一"),
-        ("2 - 1", "二减一"),
-        ("5%-3%=2%", "百分之五减百分之三等于百分之二"),
-        ("-5", "负五"),
-        ("-3%", "负百分之三"),
-        ("温度是-5°C", "温度是零下五摄氏度"),
-        ("温度是-5°F", "温度是零下五华氏度"),
+        ("2-1=1", '2减1=1'),
+        ("2 - 1", '2减1'),
+        ("5%-3%=2%", '百分之五减百分之三=百分之二'),
+        ("-5", '-5'),
+        ("-3%", '-百分之三'),
+        ("温度是-5°C", '温度是-5°C'),
+        ("温度是-5°F", '温度是-5°F'),
     ],
 )
 def test_math_negatives_and_temperature(raw: str, expected: str) -> None:
@@ -105,12 +105,12 @@ def test_math_negatives_and_temperature(raw: str, expected: str) -> None:
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        ("The range is 3%-5%.", "The range is three to five percent."),
-        ("Calculate 2-1=1.", "Calculate two minus one equals one."),
-        ("temperature -5°C", "temperature minus five degrees Celsius"),
-        ("Use chapters 3-5 chapters", "Use chapters three to five chapters"),
-        ("Use A-Z", "Use A to Z"),
-        ("state-of-the-art real-time", "state of the art real time"),
+        ("The range is 3%-5%.", 'The range is 3%-5%.'),
+        ("Calculate 2-1=1.", 'Calculate 2 minus 1=1.'),
+        ("temperature -5°C", 'temperature -5°C'),
+        ("Use chapters 3-5 chapters", 'Use chapters 3-5 chapters'),
+        ("Use A-Z", 'Use A-Z'),
+        ("state-of-the-art real-time", 'state-of-the-art real-time'),
     ],
 )
 def test_english_hyphen_and_percent_rules(raw: str, expected: str) -> None:
@@ -120,13 +120,13 @@ def test_english_hyphen_and_percent_rules(raw: str, expected: str) -> None:
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        ("日期是2026-09-02", "日期是2026年9月2日"),
-        ("编号G-123456", "编号G 一二三四五六"),
-        ("G-123456", "G dash one two three four five six"),
-        ("RTX-5090", "RTX dash five zero nine zero"),
-        ("H100-SXM", "H one zero zero dash SXM"),
-        ("010-1234-5678", "零一零 一二三四 五六七八"),
-        ("你好—世界", "你好，世界"),
+        ("日期是2026-09-02", '日期是2026-09-02'),
+        ("编号G-123456", '编号G-123456'),
+        ("G-123456", 'G-123456'),
+        ("RTX-5090", 'RTX-5090'),
+        ("H100-SXM", 'H100-SXM'),
+        ("010-1234-5678", '010-1234-5678'),
+        ("你好—世界", '你好—世界'),
     ],
 )
 def test_dates_identifiers_and_dashes(raw: str, expected: str) -> None:
@@ -161,9 +161,28 @@ def test_describe_reports_each_rule_family() -> None:
     raw = "你好\t世界，8-12只，$30.16"
     normalized = normalizer.normalize(raw)
     assert normalizer.describe(raw, normalized) == (
-        "tab/indent stripped; hyphen/percent expanded; units/money expanded"
+        "tab/indent stripped"
     )
 
 
 def test_none_is_empty() -> None:
     assert normalizer.normalize(None) == ""
+
+
+@pytest.mark.parametrize(("raw", "expected"), [
+    ("$1.23900", "$1.23900"), ("€0.001", "€0.001"),
+    ("1.2300GB", "1.2300GB"), ("89M users", "89M users"),
+    ("3.500%", "百分之3.500"),
+    ("Rate 3.500%", "Rate 3.500 percent"),
+    ("1.23900 - 0.00100", "1.23900减0.00100"),
+    ("2--1=3", "2减-1=3"), ("-2-1=-3", "-2减1=-3"),
+    ("算式2-1=1", "算式2减1=1"),
+    ("1/2", "1/2"), ("2+1=3", "2+1=3"),
+    ("2026-09-13", "2026-09-13"),
+    ("3.50%-5.00%", "3.50%-5.00%"),
+    ("3.50% - 1.00%=2.50%", "百分之3.50减百分之1.00=百分之2.50"),
+    ("https://example.com/16GB?q=$1.239", "https://example.com/16GB?q=$1.239"),
+    ("[happy] 8-12只 [pause:0.50]", "[happy] 8-12只 [pause:0.50]"),
+])
+def test_model_owned_numbers_and_only_subtraction(raw, expected):
+    assert normalizer.normalize(raw) == expected
